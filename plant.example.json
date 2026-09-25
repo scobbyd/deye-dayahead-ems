@@ -1,0 +1,14 @@
+{
+  "site": {"latitude": 52.0, "longitude": 5.0, "altitude_m": 0.0, "timezone": "Europe/Amsterdam"},
+  "battery": {"capacity_kwh": 48.2, "p_nom_kw": 12.5, "pack_voltage_v": 51.2, "current_max_a": 240.0,
+              "eta_charge": 0.961, "eta_discharge": 0.957,
+              "soc_min": 0.10, "soc_max": 1.00, "soc_final_target": 0.50},
+  "inverter": {"model": "Deye SUN-12K-SG04LP3", "p_nom_kw": 12.0, "eta_bridge": 0.989,
+               "q_port_kw_per_kw2": 0.003, "q_bridge_kw_per_kw2": 0.0012},
+  "grid": {"cap_w": 17250},
+  "pv": {"micro_share": 0.288, "micro_max_w": 3000.0, "p10_mix": 0.20, "curtail_soc_pct": 95.0,
+         "strings": {"A": {"tilt": 34, "azimuth": 109, "kwp": 9.8, "scale": 1.0},
+                     "B": {"tilt": 39, "azimuth": 288, "kwp": 9.8, "scale": 1.0}},
+         "solcast_sites": {"A": "xxxx-xxxx-xxxx-xxxx", "B": "xxxx-xxxx-xxxx-xxxx"}},
+  "tariff": {"energy_tax": 0.0, "supplier_fee": 0.019, "btw_pct": 21.0, "feedin_fee": 0.019}
+}

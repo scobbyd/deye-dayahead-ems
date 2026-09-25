@@ -1,0 +1,43 @@
+# EMHASS shadow planner: the 2027 tariff right now.
+#
+# Outside entities this file expects (rename to yours):
+#   sensor.nord_pool_nl_current_price   the built-in Nord Pool integration, EUR/kWh
+#
+# buy  = (day-ahead + energy tax + supplier fee) x (1 + BTW)
+# sell = (day-ahead - feed-in fee) x (1 + BTW)
+# Both sides carry BTW so the EUR figures are real money; the plan itself is
+# unaffected by the multiplier. Source: the built-in Nord Pool integration.
+
+template:
+  - sensor:
+      - name: EMHASS buy price now
+        unique_id: emhass_buy_price_now
+        unit_of_measurement: EUR/kWh
+        state_class: measurement
+        icon: mdi:cash-plus
+        availability: >
+          {{ has_value('sensor.nord_pool_nl_current_price')
+             and has_value('input_number.emhass_energy_tax_eur_kwh')
+             and has_value('input_number.emhass_supplier_fee_eur_kwh')
+             and has_value('input_number.emhass_btw_pct') }}
+        state: >
+          {% set da = states('sensor.nord_pool_nl_current_price') | float(0) %}
+          {% set tax = states('input_number.emhass_energy_tax_eur_kwh') | float(0.11) %}
+          {% set fee = states('input_number.emhass_supplier_fee_eur_kwh') | float(0.02) %}
+          {% set btw = states('input_number.emhass_btw_pct') | float(21) %}
+          {{ ((da + tax + fee) * (1 + btw / 100)) | round(5) }}
+
+      - name: EMHASS sell price now
+        unique_id: emhass_sell_price_now
+        unit_of_measurement: EUR/kWh
+        state_class: measurement
+        icon: mdi:cash-minus
+        availability: >
+          {{ has_value('sensor.nord_pool_nl_current_price')
+             and has_value('input_number.emhass_feedin_fee_eur_kwh')
+             and has_value('input_number.emhass_btw_pct') }}
+        state: >
+          {% set da = states('sensor.nord_pool_nl_current_price') | float(0) %}
+          {% set feedin = states('input_number.emhass_feedin_fee_eur_kwh') | float(0) %}
+          {% set btw = states('input_number.emhass_btw_pct') | float(21) %}
+          {{ ((da - feedin) * (1 + btw / 100)) | round(5) }}

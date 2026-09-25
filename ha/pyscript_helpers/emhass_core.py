@@ -1,0 +1,113 @@
+"""EMHASS shadow planner: native compute module (no Home Assistant imports).
+
+Loaded by pyscript/emhass_shadow.py through importlib and executed under
+task.executor, so everything here runs natively, off the event loop. Pure
+functions first (pytest-able from tests/), then HTTP to the
+add-on, the plan archive, and the scoring.
+
+Conventions
+  power W; P_grid positive = import; P_batt positive = discharge (EMHASS)
+  money EUR; positive = money out of the house
+  timestamps tz-aware; the plan grid is 15-minute steps counted from t0, and
+  every step arithmetic goes through UTC so DST days come out as 92 or 100
+  steps instead of a wall-clock 96
+
+This module is the FACADE: every name lives in the emhasscore package beside it
+(one module per concern, see emhasscore/__init__.py) and is re-exported here, so
+the wrapper's file-path import and the tests' `import emhass_core` are unchanged.
+pyscript loads this file by path, so the package directory is put on sys.path
+first, and a stale package is purged so a pyscript reload sees fresh modules.
+"""
+import os as _os
+import sys as _sys
+
+_HERE = _os.path.dirname(_os.path.abspath(__file__))
+if _HERE not in _sys.path:
+    _sys.path.insert(0, _HERE)
+for _name in [m for m in _sys.modules if m == 'emhasscore' or m.startswith('emhasscore.')]:
+    del _sys.modules[_name]
+
+from emhasscore import grid, series, objective, deye, addon, archive, repair, scoreboard, slices, planning, scoring, ab, ladder, rebalance  # noqa: E402  (the submodules, for tests that patch one)
+from emhasscore import plant  # noqa: E402
+from emhasscore.plant import PLANT  # noqa: E402  (the site: coordinates, pack, Solcast ids; the wrapper reads core.PLANT)
+from emhasscore.grid import (  # noqa: E402
+    ceil_step, expected_steps, horizon, _parse_ts, _slot, STEP_H, STEP_MIN, step_times,
+)
+from emhasscore.series import (  # noqa: E402
+    fifteen_min_series, GROWATT_SHARE, MICRO_SHARE, LOAD_MIN_REF_DAYS, LOAD_MIX_ALPHA, load_profile, LOAD_REF_DAYS,
+    load_series, MAX_PV_GAPS, _median, price_series, pv_mix, PV_P10_MIX, pv_series, pv_split, tariff,
+    window_series,
+)
+from emhasscore.objective import (  # noqa: E402
+    apply_knobs, aux_cut_decision, AUX_CUT_OFF_MIN_KWH, AUX_CUT_OFF_RATIO, AUX_CUT_ON_MIN_KWH,
+    AUX_CUT_ON_RATIO, build_payload, CAPACITY_KWH, cut_thresholds, DEFICIT_BASE, ETA_BRIDGE, GRID_CAP_W,
+    knobs, LIVE_KNOBS, loss_adjustment, METER_DRIFT_EUR, P_NOM_BATT_KW, P_NOM_INV_KW, Q_BRIDGE, Q_PORT,
+    REBALANCE_DWELL_H, REBALANCE_FULL_LEVEL, REBALANCE_PULL, rebalance_schedule, REBALANCE_TARGET_DAYS, SOC_FINAL_TARGET,
+    SOC_MAX, SOC_MIN, soc_target_timestep, step_cost, stress_costs, SURPLUS_BASE,
+)
+from emhasscore.deye import (  # noqa: E402
+    clamp_write, deye_amps, DEYE_BASELINE, DEYE_BATT_DEADBAND_W, DEYE_CLAMP_DEADBAND_A, DEYE_CLAMP_MARGIN_A,
+    DEYE_CLAMP_MARGIN_FRAC, deye_command, DEYE_CURRENT_MAX_A, DEYE_CURRENT_STEP_A, DEYE_GRID_DEADBAND_W,
+    DEYE_PACK_V, deye_response, DEYE_TIER, ETA_C, ETA_D, integrate_soc, settle_slice, settle_step, soc_dwell_h,
+    SETTLE_MARGIN, wanted_clamp, wanted_clamp_a,
+)
+from emhasscore.addon import (  # noqa: E402
+    addon_holds_plan, emhass_get, emhass_post, health, ml_action, OMITTED_CONFIG_KEYS, publish, PUBLISH_MAP,
+    solve,
+)
+from emhasscore.archive import (  # noqa: E402
+    ARCHIVE_REACH, ARCHIVE_SUFFIX, aux_cut_state, day_slice, days_since_full, _HEAD_CACHE, iter_organic_plans,
+    list_plans, load_plan, newest_plan_for_day, organic_plans, original_plan_for_day, plan_for_day,
+    plan_heads, _plan_stem, virtual_soc_at, write_plan_archive,
+)
+from emhasscore.repair import (  # noqa: E402
+    effective_load, PV_CURTAIL_SOC_PCT, PV_DAYLIGHT_W, pv_potential,
+)
+from emhasscore.scoreboard import (  # noqa: E402
+    _r2, read_scores, rolling, SCORE_COLUMNS, scoreboard_row, _TEXT_COLUMNS, upsert_score,
+)
+from emhasscore.slices import (  # noqa: E402
+    compact_slice, rehydrate, rolled_slices, virtual_day,
+)
+from emhasscore.planning import (  # noqa: E402
+    load_exact_key, run_plan,
+)
+from emhasscore.scoring import (  # noqa: E402
+    cash_in_frame, hindsight_day, lambda_for, planned_cost, replay_day, replay_plan, score_day, score_row,
+    soc_term,
+)
+from emhasscore.ladder import (  # noqa: E402
+    LADDER_COLUMNS, LANE_COLUMNS, ladder_day, ladder_earned_series, ladder_hours_fill, ladder_run,
+    ladder_shadow_series, ladder_summary, ladder_windows, hours_path, PUBLISH_HOUR, read_ladder, RUNGS,
+    today_hours, upsert_ladder, upsert_ladder_hours, upsert_tariff_hours,
+)
+from emhasscore.ab import (  # noqa: E402
+    ab_apply_plan, AB_LIST_KEYS, ab_load, AB_OWN_KEYS, _ab_payload, AB_RUNTIME_KEYS, _ab_solves, ab_store,
+    ab_summary, ab_validate, ab_walk,
+)
+
+
+def rebalance_step(path: str, settled: dict | None, dwell_h: float | None = None) -> dict:
+    """The wrapper's one call per tick for the settled rebalancing clock
+    (emhasscore.rebalance): load the state file, fold today's settled slice
+    into it, save, return the state for inp["rebalance"]. A missing or
+    unreadable file starts empty, which the schedule reads as overdue."""
+    import json as _json
+    import os as _os
+    state = None
+    try:
+        with open(path) as f:
+            state = _json.load(f)
+    except (OSError, ValueError):
+        state = None
+    if settled and settled.get("soc_pct") is not None and settled.get("slice_start"):
+        state = rebalance.update(state, settled["slice_start"], settled["soc_pct"], int(settled.get("n_past") or 0),
+                                 dwell_h=float(dwell_h) if dwell_h is not None else REBALANCE_DWELL_H)
+    else:
+        state = dict(rebalance.empty_state(), **{k: v for k, v in (state or {}).items() if k in rebalance.STATE_KEYS})
+    _os.makedirs(_os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        _json.dump(state, f)
+    _os.replace(tmp, path)
+    return state

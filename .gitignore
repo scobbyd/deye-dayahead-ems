@@ -1,0 +1,19 @@
+# private reference material used while extracting; never published
+_source/
+# golden pin DATA is real household data; the builders stay
+tests/golden/expected/
+tests/golden/plans/
+tests/golden/actuals_5min.json.gz
+tests/golden/nordpool.json
+tests/golden/scores*.csv
+# your own plant and data
+plant.json
+data/
+runs/
+.env
+# python
+__pycache__/
+*.pyc
+.pytest_cache/
+.ipynb_checkpoints/
+.venv/

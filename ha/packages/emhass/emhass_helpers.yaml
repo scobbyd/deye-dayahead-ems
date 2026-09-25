@@ -1,0 +1,300 @@
+# EMHASS shadow planner: helpers.
+#
+# No outside entities: every helper here is created by this file.
+#
+# EMHASS (official add-on, contained, latest release) plans the battery every
+# day when tomorrow's Nord Pool prices publish and is scored against what
+# the incumbent EMS actually did, both under the 2027 tariff. Nothing here actuates.
+# Design: ha/README.md
+# Code: ha/pyscript/emhass_shadow.py + ha/pyscript_helpers/emhass_core.py
+#
+# No initial: on any helper (a reboot would reset tuned values); the values
+# are seeded once by ha/scripts/seed_helpers.sh.
+
+input_boolean:
+  emhass_shadow_enabled:
+    name: EMHASS shadow planner enabled
+    icon: mdi:chart-timeline-variant
+  emhass_ml_enabled:
+    name: EMHASS ML forecaster enabled
+    icon: mdi:brain
+  # Salderen (netting) is still in force until it ends, by law, on
+  # 1 Jan 2027: Wet beeindiging salderingsregeling, Stb. 2025 nr. 17, a hard
+  # stop with no phase-out. While it is ON the planner carries NO energy tax,
+  # because an exported kWh cancels an imported one; when it ends, every
+  # imported kWh carries the levy and the buy and sell lanes separate.
+  # emhass_salderen_apply writes input_number.emhass_energy_tax_eur_kwh and
+  # turns this off by itself from 1 Jan 2027, so nobody has to remember.
+  emhass_salderen:
+    name: EMHASS salderen in force
+    icon: mdi:scale-balance
+  # Dashboard-only: the four "[+]" expanders of the EMS tuning section at the
+  # bottom of the Shadow EMS tab (same affordance as dash_ems_advanced on the
+  # Energy tab). State is cosmetic; no automation reads them.
+  dash_shadow_knobs:
+    name: Shadow EMS tab shows the planner knobs
+    icon: mdi:tune
+  dash_shadow_cut:
+    name: Shadow EMS tab shows the Growatt cut rule
+    icon: mdi:solar-power-variant
+  dash_shadow_tariff:
+    name: Shadow EMS tab shows the tariff
+    icon: mdi:cash
+  dash_shadow_ab:
+    name: Shadow EMS tab shows the A/B tester
+    icon: mdi:ab-testing
+
+input_number:
+  emhass_energy_tax_eur_kwh:
+    name: EMHASS energy tax
+    min: 0
+    max: 0.30
+    step: 0.001
+    unit_of_measurement: EUR/kWh
+    mode: box
+    icon: mdi:bank
+  emhass_supplier_fee_eur_kwh:
+    name: EMHASS supplier fee
+    min: 0
+    max: 0.10
+    step: 0.001
+    unit_of_measurement: EUR/kWh
+    mode: box
+    icon: mdi:cash
+  emhass_btw_pct:
+    name: EMHASS BTW
+    min: 0
+    max: 30
+    step: 1
+    unit_of_measurement: "%"
+    mode: box
+    icon: mdi:percent
+  # Negative = a feed-in BONUS, not a fee: sell = (day-ahead - feedin_fee) x
+  # BTW (emhasscore/series.py tariff()), so a negative value raises the sell
+  # lane. One supplier pays up to 2 ct/kWh extra on feed-in (2026-09-24) and
+  # the old floor of 0 could not express it. The incumbent supplier charges
+  # 1,9 ct. Hand-set: no preset writes the per-kWh fees any more, so a bonus
+  # cannot be clobbered by flipping a regime.
+  emhass_feedin_fee_eur_kwh:
+    name: EMHASS feed-in fee
+    min: -0.05
+    max: 0.10
+    step: 0.001
+    unit_of_measurement: EUR/kWh
+    mode: box
+    icon: mdi:transmission-tower-export
+  # Fraction of the ESE Solcast site that is the Growatt (the AC-coupled
+  # microinverter; plant.json pv.micro_share). It is must-take: the Deye's
+  # strings throttle, the gen port does not, so the solver must not be told it
+  # can curtail this part. Seeded at 0,288 from 2026-09-01..04 measured on
+  # uncurtailed steps; refit it if panels move. 0 stands the split down (set 0
+  # when you have no microinverter).
+  emhass_growatt_share:
+    name: EMHASS Growatt share of the ESE array
+    min: 0
+    max: 1
+    step: 0.001
+    mode: box
+    icon: mdi:solar-panel
+  # Hours the SETTLED pack must sit at or above 99,5 % for a full charge to
+  # reset the rebalancing clock (emhasscore/rebalance.py, 2026-09-15). The
+  # planner's pull holds the pack at the top for this long; the core's default
+  # is 2,0 h when the helper is unset. What the PACE BMS needs to top-balance.
+  emhass_rebalance_dwell_h:
+    name: EMHASS rebalance dwell at full
+    min: 0
+    max: 8
+    step: 0.25
+    mode: box
+    icon: mdi:battery-sync
+  # Share of Solcast P10 in the planner's PV number: forecast = (1 - mix) x P50
+  # + mix x P10. Seeded at 0,20 (ruling 2026-09-07). The raw P50 stays archived
+  # and remains the ceiling for the throttling repair; only the solver sees the
+  # mix. 0 is plain P50. A freshly created helper sits at its minimum (0) until
+  # seed_helpers.sh runs.
+  emhass_pv_p10_mix:
+    name: EMHASS Solcast P10 share in the planner PV
+    min: 0
+    max: 1
+    step: 0.01
+    mode: box
+    icon: mdi:weather-partly-cloudy
+  # ---- the live knob layer (core.LIVE_KNOBS, 2026-09-07) ----
+  # Every knob the A/B tester can move is a helper here, read by every solve;
+  # an unreadable helper falls back to the constant in emhass_core.py. Pushed
+  # from a tested variant by pyscript.emhass_ab_apply, copied into the tester by
+  # emhass_ab(from_live=true). Seeded by seed_helpers.sh (no initial:).
+  emhass_stress_scale:
+    name: EMHASS stress cost scale
+    min: 0
+    max: 5
+    step: 0.05
+    mode: box
+    icon: mdi:sine-wave
+  emhass_surplus_base:
+    name: EMHASS high-SOC dwell cost base
+    min: 0
+    max: 0.05
+    step: 0.0005
+    unit_of_measurement: EUR/kWh/h
+    mode: box
+    icon: mdi:battery-high
+  emhass_deficit_threshold:
+    name: EMHASS low-SOC cushion threshold
+    min: 0
+    max: 1
+    step: 0.01
+    mode: box
+    icon: mdi:battery-low
+  emhass_deficit_cost:
+    name: EMHASS low-SOC cushion cost
+    min: 0
+    max: 0.05
+    step: 0.0005
+    unit_of_measurement: EUR/kWh/h
+    mode: box
+    icon: mdi:battery-alert
+  emhass_soc_final:
+    name: EMHASS horizon-end SOC
+    min: 0.1
+    max: 1
+    step: 0.01
+    mode: box
+    icon: mdi:battery-50
+  emhass_weight_battery_discharge:
+    name: EMHASS battery discharge weight
+    min: 0
+    max: 0.2
+    step: 0.001
+    unit_of_measurement: EUR/kWh
+    mode: box
+    icon: mdi:battery-arrow-down
+  emhass_batt_power_max_w:
+    name: EMHASS battery power limit
+    min: 1000
+    max: 12500
+    step: 250
+    unit_of_measurement: W
+    mode: box
+    icon: mdi:battery-charging-high
+  emhass_soc_min:
+    name: EMHASS SOC floor
+    min: 0
+    max: 0.5
+    step: 0.01
+    mode: box
+    icon: mdi:battery-10
+  emhass_soc_max:
+    name: EMHASS SOC ceiling
+    min: 0.5
+    max: 1
+    step: 0.01
+    mode: box
+    icon: mdi:battery
+  # Intermediate SOC target: level 0 switches it off; the time is below.
+  emhass_soc_target:
+    name: EMHASS intermediate SOC target
+    min: 0
+    max: 1
+    step: 0.01
+    mode: box
+    icon: mdi:battery-check
+  emhass_aux_cut_on_ratio:
+    name: EMHASS Growatt cut on ratio
+    min: 1
+    max: 5
+    step: 0.05
+    mode: box
+    icon: mdi:solar-power-variant
+  emhass_aux_cut_on_min_kwh:
+    name: EMHASS Growatt cut on minimum
+    min: 0
+    max: 20
+    step: 0.25
+    unit_of_measurement: kWh
+    mode: box
+    icon: mdi:solar-power-variant
+  emhass_aux_cut_off_ratio:
+    name: EMHASS Growatt cut off ratio
+    min: 0.5
+    max: 5
+    step: 0.05
+    mode: box
+    icon: mdi:solar-power-variant-outline
+  emhass_aux_cut_off_min_kwh:
+    name: EMHASS Growatt cut off minimum
+    min: 0
+    max: 20
+    step: 0.25
+    unit_of_measurement: kWh
+    mode: box
+    icon: mdi:solar-power-variant-outline
+  emhass_lambda_frac:
+    name: EMHASS end-of-day SOC value fraction
+    min: 0
+    max: 1
+    step: 0.01
+    mode: box
+    icon: mdi:battery-heart-variant
+  emhass_plan_stale_hours:
+    name: EMHASS plan staleness threshold
+    min: 2
+    max: 72
+    step: 1
+    unit_of_measurement: h
+    mode: box
+    icon: mdi:clock-alert-outline
+
+  # Which period the ladder ledger shows: 0 is the one containing today, -1 the
+  # one before it, and so on. The grain (week/month/year) comes from
+  # input_select.emhass_ladder_grain. Cosmetic; no automation reads it.
+  emhass_ladder_offset:
+    name: Ladder ledger period offset
+    min: -520
+    max: 0
+    step: 1
+    mode: box
+    icon: mdi:calendar-arrow-left
+
+input_datetime:
+  emhass_soc_target_at:
+    name: EMHASS intermediate SOC target time
+    has_date: false
+    has_time: true
+    icon: mdi:clock-check-outline
+
+# Two buttons for the Shadow EMS tab (2026-09-07): test the live settings
+# on yesterday, and push the last tested variant live. Plain button cards call
+# these scripts.
+script:
+  emhass_ab_test_live_yesterday:
+    alias: "EMHASS - A/B: test the live settings on yesterday"
+    mode: single
+    icon: mdi:ab-testing
+    sequence:
+      - action: pyscript.emhass_ab
+        data:
+          start: "{{ (now() - timedelta(days=1)).date() }}"
+          label: "live-{{ (now() - timedelta(days=1)).date() }}"
+          from_live: true
+  emhass_ab_apply_last:
+    alias: "EMHASS - A/B: push the last tested variant live"
+    mode: single
+    icon: mdi:upload
+    sequence:
+      - action: pyscript.emhass_ab_apply
+
+
+input_select:
+  # Dashboard-only: which grain the ladder ledger draws, and therefore what a
+  # bar means. week = one bar per day, month = one bar per day, year = one bar
+  # per month. Paired with emhass_ladder_offset, which says WHICH week, month
+  # or year. Cosmetic; no automation reads either.
+  emhass_ladder_grain:
+    name: Ladder ledger grain
+    options:
+      - week
+      - month
+      - year
+    icon: mdi:calendar-range
+

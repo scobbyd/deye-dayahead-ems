@@ -1,0 +1,60 @@
+# EMHASS shadow planner: health.
+#
+# Outside entities this file expects (rename to yours):
+#   notify.notify   your notify target (was a per-phone target)
+#
+# Plan age comes from the plan_ts of sensor.emhass_plan_next_day (written by
+# pyscript from the archive), not from sensor.emhass_last_run, which every
+# service overwrites. binary_sensor.emhass_addon_healthy is written by
+# pyscript.emhass_health every 15 minutes (healthz + config drift).
+
+template:
+  - sensor:
+      - name: EMHASS plan age h
+        unique_id: emhass_plan_age_h
+        unit_of_measurement: h
+        state_class: measurement
+        icon: mdi:clock-outline
+        availability: "{{ state_attr('sensor.emhass_plan_next_day', 'plan_ts') is not none }}"
+        state: >
+          {{ ((as_timestamp(now()) - as_timestamp(state_attr('sensor.emhass_plan_next_day', 'plan_ts'))) / 3600)
+             | round(1) }}
+
+  - binary_sensor:
+      - name: EMHASS plan stale
+        unique_id: emhass_plan_stale
+        device_class: problem
+        icon: mdi:alert-outline
+        state: >
+          {% set age = states('sensor.emhass_plan_age_h') | float(999) %}
+          {% set limit = states('input_number.emhass_plan_stale_hours') | float(26) %}
+          {% set status = state_attr('sensor.emhass_plan_next_day', 'optim_status') %}
+          {% set tomorrow = (now() + timedelta(days=1)).date() | string %}
+          {% set late = (now().hour * 60 + now().minute) >= (15 * 60 + 30) %}
+          {{ age > limit
+             or (status is not none and status != 'Optimal')
+             or (late and states('sensor.emhass_plan_next_day') != tomorrow) }}
+
+automation:
+  - id: emhass_stale_notify
+    alias: "EMHASS - notify when the shadow plan goes stale"
+    mode: single
+    trigger:
+      - trigger: state
+        entity_id: binary_sensor.emhass_plan_stale
+        to: "on"
+        for: "00:30:00"
+    condition:
+      - condition: state
+        entity_id: input_boolean.emhass_shadow_enabled
+        state: "on"
+    action:
+      # notify.notify is HA's default target; the live system used one phone
+      - action: notify.notify
+        data:
+          title: EMHASS shadow plan stale
+          message: >
+            Plan age {{ states('sensor.emhass_plan_age_h') }} h, last status
+            {{ state_attr('sensor.emhass_plan_next_day', 'optim_status') }}, next day
+            {{ states('sensor.emhass_plan_next_day') }}. Check pyscript.emhass_plan_day
+            and the EMHASS add-on log.

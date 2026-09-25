@@ -1,0 +1,273 @@
+# EMHASS shadow planner: schedule.
+#
+# Outside entities this file expects (rename to yours):
+#   binary_sensor.nord_pool_nl_tomorrow_price_available  the built-in Nord Pool integration
+#   notify.notify                                        your notify target (was a per-phone target)
+#
+# Plan when tomorrow's Nord Pool prices publish (observed 13:00:04 local), or
+# at 15:00 if tomorrow is still unplanned (the missing steps then come from
+# epex_predictor and the plan is flagged). Refresh the plan every 30 minutes
+# at :13 and :43 (ruling 2026-09-08; :05 and :35 from 2026-09-07). The horizon
+# starts at the next quarter, so a :13 solve is in force from :15, two minutes
+# later, where a :05 solve idled ten minutes and left the :00 step on a plan
+# 25 minutes old. At :13 two of the running step's three five-minute
+# statistics buckets have landed, so the settled soc_init sees most of it.
+# It started as 15-minute, was relaxed to
+# hourly on 2026-09-02 ("barely a difference") when the hourly re-solve still
+# chained off its own predicted SOC and so had nothing to react to. Since the
+# settled chain (a6db5fb) each solve starts from what the virtual pack actually
+# holds, and on the 09-05 rolling re-solve a 30-minute loop caught the
+# late-afternoon PV dip half an hour sooner (SOC 97,9 % at 17:00 against
+# 94,9 % hourly). Go-live intent is 15 minutes, matching the step. Loads
+# drift, Solcast revises, epex's D+2 moves; scoring is immune to cadence (the
+# scored plan of record is the last solve before the scored day's midnight,
+# always post-13:00 with real prices), so the refresh sharpens the displayed
+# intent, the virtual-pack realism and the freshness of tomorrow's plan.
+# Archive cost: ~17 KB per gzipped plan, ~54 plans a day. Gated on the add-on being healthy so a
+# dead add-on is not hammered with retries. Score yesterday at 00:10. Fit the
+# load model nightly and tune it on Sundays once the ML switch is on (day 10).
+# None of these actions touches a sensor.emhass_da_* entity (check.sh actions).
+
+automation:
+  - id: emhass_plan_on_prices
+    alias: "EMHASS - plan when tomorrow's prices publish"
+    mode: single
+    trigger:
+      - trigger: state
+        entity_id: binary_sensor.nord_pool_nl_tomorrow_price_available
+        to: "on"
+    condition:
+      - condition: state
+        entity_id: input_boolean.emhass_shadow_enabled
+        state: "on"
+    action:
+      - action: pyscript.emhass_plan_day
+
+  - id: emhass_plan_fallback
+    alias: "EMHASS - plan fallback at 15:00"
+    mode: single
+    trigger:
+      - trigger: time
+        at: "15:00:00"
+    condition:
+      - condition: state
+        entity_id: input_boolean.emhass_shadow_enabled
+        state: "on"
+      - condition: template
+        value_template: >
+          {{ states('sensor.emhass_plan_next_day') != ((now() + timedelta(days=1)).date() | string) }}
+    action:
+      - action: pyscript.emhass_plan_day
+
+  - id: emhass_plan_refresh
+    alias: "EMHASS - refresh the plan every 30 minutes"
+    mode: single
+    trigger:
+      - trigger: time_pattern
+        minutes: "13"
+      - trigger: time_pattern
+        minutes: "43"
+    condition:
+      - condition: state
+        entity_id: input_boolean.emhass_shadow_enabled
+        state: "on"
+      - condition: state
+        entity_id: binary_sensor.emhass_addon_healthy
+        state: "on"
+    action:
+      - action: pyscript.emhass_plan_day
+
+  - id: emhass_score
+    alias: "EMHASS - score yesterday"
+    mode: single
+    trigger:
+      - trigger: time
+        at: "00:10:00"
+    condition:
+      - condition: state
+        entity_id: input_boolean.emhass_shadow_enabled
+        state: "on"
+    action:
+      - action: pyscript.emhass_score_day
+
+  - id: emhass_fit
+    alias: "EMHASS - fit the load forecaster"
+    mode: single
+    trigger:
+      - trigger: time
+        at: "04:00:00"
+    condition:
+      - condition: state
+        entity_id: input_boolean.emhass_shadow_enabled
+        state: "on"
+      - condition: state
+        entity_id: input_boolean.emhass_ml_enabled
+        state: "on"
+    action:
+      - action: pyscript.emhass_fit
+
+  - id: emhass_tune
+    alias: "EMHASS - tune the load forecaster (Sunday)"
+    mode: single
+    trigger:
+      - trigger: time
+        at: "03:30:00"
+    condition:
+      - condition: state
+        entity_id: input_boolean.emhass_shadow_enabled
+        state: "on"
+      - condition: state
+        entity_id: input_boolean.emhass_ml_enabled
+        state: "on"
+      - condition: time
+        weekday:
+          - sun
+    action:
+      - action: pyscript.emhass_tune
+
+  # Salderen writes the energy tax, and retires itself (2026-09-24).
+  # THE TAX GOES IN EXCLUDING BTW. series.tariff() multiplies the whole
+  # delivered price by BTW, and the levy is part of the BTW base by law:
+  # 0,09161 excl. is 0,11085 incl., the 2026 first-bracket rate. The old
+  # preset wrote 0,11 into this excl. slot, which the multiplier turned into
+  # 13,3 ct and made every imported kWh look 2,2 ct dearer than it is.
+  # The 2027 Belastingplan proposes 0,0880; the definitive table lands in
+  # December, so 2026's rate stands until then.
+  # While salderen is in force an exported kWh cancels an imported one, so
+  # the levy does not bite at the margin and the tax is 0.
+  # The per-kWh supplier and feed-in fees are NOT written here: they are
+  # hand-set knobs, and a preset that rewrote them would wipe a negative
+  # (bonus) feed-in fee.
+  - id: emhass_salderen_apply
+    alias: "EMHASS - the energy tax follows salderen"
+    mode: single
+    trigger:
+      - trigger: state
+        entity_id: input_boolean.emhass_salderen
+        to:
+          - "on"
+          - "off"
+    condition:
+      # Only a real change. A `to:`-only state trigger also fires when the
+      # helper is created, i.e. on every input_boolean reload.
+      - condition: template
+        value_template: >-
+          {{ trigger.from_state is not none
+             and trigger.from_state.state in ['on', 'off'] }}
+    action:
+      - action: input_number.set_value
+        target:
+          entity_id: input_number.emhass_energy_tax_eur_kwh
+        data:
+          value: "{{ 0 if trigger.to_state.state == 'on' else 0.09161 }}"
+
+  # Salderen ends by law on 1 Jan 2027 (Wet beeindiging salderingsregeling,
+  # Stb. 2025 nr. 17): a hard stop, no phase-out. Checked daily rather than
+  # once, so the switch also happens if HA was down that night, and so the
+  # flag cannot be left on by hand afterwards.
+  - id: emhass_salderen_end
+    alias: "EMHASS - salderen ends on 1 Jan 2027"
+    mode: single
+    trigger:
+      - trigger: time
+        at: "00:00:10"
+      - trigger: homeassistant
+        event: start
+    condition:
+      - condition: template
+        value_template: "{{ now() >= today_at('00:00').replace(year=2027, month=1, day=1) }}"
+      - condition: state
+        entity_id: input_boolean.emhass_salderen
+        state: "on"
+    action:
+      - action: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.emhass_salderen
+
+  # Health alerting. binary_sensor.emhass_addon_healthy (pyscript.emhass_health,
+  # every 15 min) is a hard condition on the half-hourly refresh above, so when it
+  # goes off the shadow EMS stops re-planning silently - on 2026-09-03 it went
+  # off at 15:30 and six refreshes were lost before anyone noticed at 22:00. An
+  # hour of continuous "off" is the alert threshold: long enough to ride out an
+  # add-on restart or one failed probe, short enough to lose a single refresh.
+  # The usual cause is config drift (the EMHASS web UI config page was saved,
+  # which overwrites the live config); ha/scripts/deploy.sh restores it.
+  #
+  # One alert per outage is not enough: swipe it away at night and a multi-day
+  # outage goes quiet again, which is the exact failure this guards. So it also
+  # re-nags at 08:00 and 20:00 while the sensor is still off - roughly two a day
+  # (three on the first day, counting the prompt one). The waking-hours times
+  # keep it off the phones overnight. The "off for an hour" state CONDITION
+  # applies to all three triggers, so a 07:30 outage cannot ping at 08:00 only
+  # half an hour in; every path waits out the same settle window.
+  - id: emhass_health_degraded
+    alias: "EMHASS - alert while the add-on health check stays off"
+    mode: single
+    trigger:
+      - trigger: state
+        entity_id: binary_sensor.emhass_addon_healthy
+        to: "off"
+        for:
+          hours: 1
+      - trigger: time
+        at: "08:00:00"
+      - trigger: time
+        at: "20:00:00"
+    condition:
+      - condition: state
+        entity_id: input_boolean.emhass_shadow_enabled
+        state: "on"
+      - condition: state
+        entity_id: binary_sensor.emhass_addon_healthy
+        state: "off"
+        for:
+          hours: 1
+    action:
+      # notify.notify is HA's default target; the live system used a group of phones
+      - action: notify.notify
+        data:
+          title: "EMHASS shadow EMS degraded - re-planning stopped"
+          message: >
+            {% set s = states.binary_sensor.emhass_addon_healthy %}
+            {% set off_h = ((now() - s.last_changed).total_seconds() / 3600) if s is not none else 0 %}
+            {% set drift = state_attr('binary_sensor.emhass_addon_healthy', 'config_drift') | default([], true) | list %}
+            {% set hz = state_attr('binary_sensor.emhass_addon_healthy', 'healthz') %}
+            {% set status = hz.get('status', 'unreachable') if hz is mapping else 'unreachable' %}
+            {% set age = state_attr('binary_sensor.emhass_addon_healthy', 'last_run_age_h') %}
+            The add-on health check has been off for
+            {{ off_h | float(0) | round(1) | string | replace('.', ',') }} h, so the half-hourly re-plan
+            is being skipped and the plan is going stale{% if age is not none %} (last solve
+            {{ age | float(0) | round(1) | string | replace('.', ',') }} h ago){% endif %}.
+            {% if drift | count > 0 %}Live config drifted on {{ drift | join(', ') }} - the EMHASS
+            web UI config page was most likely saved. Run ha/scripts/deploy.sh to restore
+            config.json.{% else %}healthz reports "{{ status }}". Check the EMHASS add-on under
+            Settings, Add-ons and restart it if it is down.{% endif %}
+
+  # All clear, paired with emhass_health_degraded above. The duration condition
+  # means it can only follow an outage long enough to have alerted, so the all
+  # clear never arrives on its own. Remove both together if alerting is dropped.
+  - id: emhass_health_recovered
+    alias: "EMHASS - all clear when the add-on health check recovers"
+    mode: single
+    trigger:
+      - trigger: state
+        entity_id: binary_sensor.emhass_addon_healthy
+        from: "off"
+        to: "on"
+    condition:
+      - condition: state
+        entity_id: input_boolean.emhass_shadow_enabled
+        state: "on"
+      - condition: template
+        value_template: >
+          {{ trigger.from_state is not none and trigger.to_state is not none
+             and (trigger.to_state.last_changed - trigger.from_state.last_changed).total_seconds() | float(0) >= 3600 }}
+    action:
+      - action: notify.notify
+        data:
+          title: "EMHASS shadow EMS healthy again"
+          message: >
+            {% set down = ((trigger.to_state.last_changed - trigger.from_state.last_changed).total_seconds() | float(0)) / 3600 %}
+            The add-on health check is back on after {{ down | round(1) | string | replace('.', ',') }} h,
+            so re-planning has resumed and the next refresh runs at :13 or :43. Check the plan
+            freshness on the EMHASS tab if the outage spanned the 13:00 price publication.

@@ -3,7 +3,7 @@
 
   build.py fixtures <vm_pull_dir>   one-off: select the archived plans, pack the
                                     5-minute statistics, Nord Pool rows and scores.csv
-                                    from a directory holding the live plans/, a
+                                    from a directory holding the VM's plans/, a
                                     stats5.json (recorder/statistics_during_period
                                     output) and nordpool.json ({date: rows})
   build.py synthetic                write the synthetic archive (DST day, a
@@ -25,10 +25,9 @@ import sys
 from datetime import date, datetime, timedelta, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(os.path.dirname(HERE))                        # the repo root: emhasscore, backtest
-sys.path.insert(0, os.path.join(ROOT, "ha", "pyscript_helpers"))      # the emhass_core facade
-sys.path.insert(0, ROOT)
-sys.path.insert(0, os.path.dirname(HERE))                             # tests: the golden package
+sys.path.insert(0, os.path.dirname(os.path.dirname(HERE)))            # tools/emhass
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(HERE))), "..", "pyscript_helpers"))
+sys.path.insert(0, os.path.dirname(HERE))                             # tools/emhass/tests
 
 from golden import fixtures as F                                      # noqa: E402
 

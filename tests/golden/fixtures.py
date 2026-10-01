@@ -3,7 +3,7 @@
 Everything the wrapper (pyscript/emhass_shadow.py) would hand the core, rebuilt
 offline from committed fixtures:
 
-  plans/                 archived plan documents copied verbatim from the live
+  plans/                 archived plan documents copied verbatim from the VM's
                          /config/emhass/plans (2026-09-02..07), chosen to cover a
                          negative-price curtailment day (09-05), the PV split
                          arriving mid-day (09-06), the P50 archive and the knob
@@ -16,7 +16,7 @@ offline from committed fixtures:
                          measured entities over the same days, in the WS row
                          shape (start ms, mean, max) that the wrapper receives
   nordpool.json          Nord Pool rows per day, the raw get_prices_for_date rows
-  scores.csv             the live scores.csv as of 2026-09-07
+  scores.csv             the VM's scores.csv as of 2026-09-07
 
 The solver is stubbed IN PROCESS (StubSolver): a deterministic greedy policy
 that charges on surplus, discharges in the dearer half of the horizon, and
@@ -135,19 +135,6 @@ def window_actuals(core, t0: datetime, n: int) -> dict | None:
     return got
 
 
-def realised_for_day(act: dict) -> dict:
-    """The wrapper's realised dict from the recorder alone (no daily meter sensor offline)."""
-    out = {"cash_eur": None, "soc_start_pct": None, "soc_end_pct": None, "pv_kwh": None, "load_kwh": None}
-    soc = act.get("soc_pct")
-    if soc:
-        out["soc_start_pct"], out["soc_end_pct"] = soc[0], soc[-1]
-    if act.get("pv_w") is not None:
-        out["pv_kwh"] = round(sum(act["pv_w"]) * 0.25 / 1000.0, 2)
-    if act.get("load_w") is not None:
-        out["load_kwh"] = round(sum(act["load_w"]) * 0.25 / 1000.0, 2)
-    return out
-
-
 def load_days(core, today: date, n_days: int = 7) -> dict:
     """The wrapper's _load_history_days: {date: W per step} for the n complete days before today."""
     rows = raw_stats().get(ENT["load_w"])
@@ -223,16 +210,20 @@ class StubSolver:
         soc = float(payload["soc_init"])
         smin = float(payload.get("battery_minimum_state_of_charge", 0.10))
         smax = float(payload.get("battery_maximum_state_of_charge", 1.00))
+        # The add-on bounds the port discharge at eff_dis * max and the port
+        # charge at max itself (measured on the live plans of 2026-09-29).
+        eta_c = float(payload.get("battery_charge_efficiency", self.eta_c))
+        eta_d = float(payload.get("battery_discharge_efficiency", self.eta_d))
         ccap = float(payload.get("battery_charge_power_max", 12500.0))
-        dcap = float(payload.get("battery_discharge_power_max", 12500.0))
+        dcap = float(payload.get("battery_discharge_power_max", 12500.0)) * eta_d
         med = sorted(buy)[n // 2]
         step_kwh = self.cap_kwh * 1000.0 / 0.25          # W that moves the whole pack in one step
         rows = []
         for k, t in enumerate(_step_times(self.t0, n)):
             surplus = pv[k] - load[k]
             charge = discharge = curtail = 0.0
-            headroom = max(0.0, smax - soc) * step_kwh / self.eta_c
-            floor = max(0.0, soc - smin) * step_kwh * self.eta_d
+            headroom = max(0.0, smax - soc) * step_kwh / eta_c
+            floor = max(0.0, soc - smin) * step_kwh * eta_d
             if surplus > 0:
                 charge = min(ccap, surplus, headroom)
                 rest = surplus - charge
@@ -245,8 +236,8 @@ class StubSolver:
                 if buy[k] >= med:
                     discharge = min(dcap, need, floor)
                 grid = need - discharge
-            soc += charge * 0.25 / 1000.0 * self.eta_c / self.cap_kwh
-            soc -= discharge * 0.25 / 1000.0 / self.eta_d / self.cap_kwh
+            soc += charge * 0.25 / 1000.0 * eta_c / self.cap_kwh
+            soc -= discharge * 0.25 / 1000.0 / eta_d / self.cap_kwh
             soc = min(max(soc, smin), smax)
             p_batt = round(discharge - charge, 4)
             grid = round(grid, 4)
@@ -274,7 +265,7 @@ def patched_solve(fn, stub):
     with warnings.catch_warnings():
         # numpy/scipy keep deprecated lazy submodules whose getattr warns once emhass is
         # loaded in the session; the scan is read-only. Deliberate twin of
-        # tools/emhass/backtest/solver.py::patch_solve, kept apart so this suite runs
+        # backtest//solver.py::patch_solve, kept apart so this suite runs
         # on an interpreter without the emhass library.
         warnings.simplefilter("ignore", DeprecationWarning)
         mods = {m for m in list(sys.modules.values()) if m is not None and getattr(m, "solve", None) is orig}

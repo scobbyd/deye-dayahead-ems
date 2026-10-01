@@ -4,21 +4,30 @@ Reads HA state and the tariff helpers, calls the Nord Pool action, hands
 plain data to the native module emhass_core (task.executor, off the event
 loop), writes the results back as states and long-term statistics. EMHASS
 itself publishes sensor.emhass_da_* via publish-data. Nothing here writes to
-the inverter.
+the inverter; pyscript/emhass_writer.py does.
 
 Services
   pyscript.emhass_plan_day(dry_run=False)  plan now -> 24:00 of D+1 (D+2 with Solcast day 3), archive, roll, publish
-  pyscript.emhass_score_day(date=None)     score yesterday (or date) into /config/emhass/scores.csv
-  pyscript.emhass_replay_day(date)         re-solve one past day under current settings, rescore
-  pyscript.emhass_replay_range(start,end)  replay a range of days (end default yesterday), then re-plan
+  pyscript.emhass_ladder_nightly           00:10: walk the actual rung over the last four days
+  pyscript.emhass_ladder(start,end,rungs,reprice)
+                                           walk the ladder over a range, re-import emhass:ladder_earned_eur
+  pyscript.emhass_ladder_hours(start,end)  backfill the ladder's hourly sidecar, re-import the statistics
+  pyscript.emhass_today_hours              the running day's settled hours, without a plan run
   pyscript.emhass_ab(start,end,label,overrides,from_live,cadence_min,settle,baseline)
                                            A/B: re-run past days' solves under other knobs, settled closed-loop
   pyscript.emhass_ab_apply(label)          push a stored A/B variant's knobs into the live helpers
   pyscript.emhass_fit / emhass_tune        forecast-model-fit / -tune on the UPS-port load
   pyscript.emhass_health                   healthz + config drift -> binary_sensor.emhass_addon_healthy
-  pyscript.emhass_rehydrate                rebuild the pyscript-owned states from the archive (runs at startup)
+  pyscript.emhass_rehydrate                rebuild the plan slices from the archive (runs at startup)
 
-Design: ha/README.md (install order, entity map, cadence, archive layout).
+The shadow scoreboard (emhass_score_day, scores.csv, sensor.emhass_score,
+sensor.emhass_gap_30d, sensor.emhass_ladder, the emhass:planned, replayed,
+realised, gap and hindsight_eur statistics) and the replay services were
+retired on 2026-09-27, the day after the writer went live ("Now that we
+are live, I don't want the shadow numbers of past year anymore"). The files
+under /config/emhass stay.
+
+Spec: an internal design note
 """
 # Load the compute as a genuinely NATIVE python module (NOT under pyscript/, which
 # would be pyscript-interpreted and rejected by task.executor).
@@ -34,19 +43,18 @@ from homeassistant.components.recorder.statistics import (async_add_external_sta
                                                           statistics_during_period)
 from homeassistant.components.recorder.models import StatisticMeanType
 
-# The EMHASS add-on's hostname on the Supervisor's internal network. 5b918bf2 is
-# the fixed slug of the community add-on repository (github.com/davidusb-geek/
-# emhass-add-on), so every install of that add-on answers at this name from HA
-# Core. Only ingress and this network reach it; the host port stays unmapped.
-ADDON_HOST = "5b918bf2-emhass"
-BASE = f"http://{ADDON_HOST}:5000"
-# Everything the shadow EMS writes lives under /config/emhass/ (inside HA backups).
+BASE = "http://5b918bf2-emhass:5000"          # add-on hostname on the hassio network (ingress only)
 ARCHIVE = "/config/emhass/plans"
 AB_DIR = "/config/emhass/ab"
-SCORES = "/config/emhass/scores.csv"
 LADDER = "/config/emhass/ladder.csv"          # the ladder: actual / hindsight / omni2, cash per day
 REBALANCE = "/config/emhass/rebalance.json"   # the settled rebalancing clock (core.rebalance_step)
-REPO_CFG = "/config/emhass/config.json"       # the reference copy of ha/config.json the drift check compares against (deploy.sh puts it there)
+WRITER_DIR = "/config/emhass/writer"           # the writer's tick archive, one file per day
+WRITER_ANCHOR = "/config/emhass/writer/anchor.json"   # the real pack at the live switch (core.write_anchor)
+REPO_CFG = "/config/emhass/config.json"
+# Every hardware and household entity this wrapper reads: core.PLANT["entities"]
+# (emhasscore/plant.py DEFAULTS, overridden by plant.json).
+ENTITIES = core.PLANT["entities"]
+NP_ENTRY = ENTITIES["nordpool_entry"]       # Nord Pool config entry
 TZ_NAME = hass.config.time_zone
 TZ = ZoneInfo(TZ_NAME)
 # num_lags 288, not 96 (2026-09-03): the mlforecaster predicts exactly
@@ -56,50 +64,19 @@ TZ = ZoneInfo(TZ_NAME)
 # horizon. At 96 the ML switch would have failed every run on day 10.
 ML = {"model_type": "load_forecast", "var_model": ENTITIES["load"],
       "sklearn_model": "KNeighborsRegressor", "num_lags": 288}
-STATS = (("emhass:planned_eur", "planned_eur", "EMHASS planned cost (on its own forecasts)"),
-         ("emhass:replayed_eur", "replayed_eur", "EMHASS replayed cost (the plan on the real day)"),
-         ("emhass:realised_eur", "realised_eur", "EMHASS realised cost (the incumbent EMS)"),
-         ("emhass:gap_eur", "gap_eur", "EMHASS gap (replayed minus hindsight; short of the 20/20 max)"),
-         ("emhass:hindsight_eur", "hindsight_eur", "EMHASS hindsight cost (20/20)"))
-# Every hardware and household entity this wrapper reads: rename to yours.
-# The emhass_* helpers and sensors that ha/packages/emhass/*.yaml creates, and
-# the knob helpers in core.LIVE_KNOBS, are not listed; they keep their names.
-# The measured series need state_class: measurement so the recorder keeps
-# 5-minute statistics of them (that is what _actuals_15min reads).
-ENTITIES = {
-    "pv": "sensor.total_pv_power",                                  # W, main MPPTs + microinverter
-    "load": "sensor.inverter_load_ups_power",                       # W, the physical load on the inverter output
-    "grid_import": "sensor.p1reader2_p1_reader_2_power_consumed",   # kW, fiscal (P1) meter
-    "grid_export": "sensor.p1reader2_p1_reader_2_power_returned",   # kW, fiscal (P1) meter
-    "batt_power": "sensor.inverter_battery_power",                  # W at the DC port, + = discharge
-    "soc": "sensor.inverter_battery",                               # % pack state of charge
-    "micro": "sensor.inverter_microinverter_power",                 # W, the must-take half (never curtailed); 0 W sensor when you have none
-    "export_switch": "switch.inverter_export_surplus",              # the inverter's export-surplus switch (the other half of the site rule)
-    "curtailed": "sensor.pv_curtailment_active",                    # 0/1 per 30 s, created by emhass_realised.yaml; a 15-min mean is the fraction
-    "solcast_today": "sensor.solcast_pv_forecast_forecast_today",   # Solcast integration, attribute detailedForecast
-    "solcast_tomorrow": "sensor.solcast_pv_forecast_forecast_tomorrow",
-    "solcast_day3": "sensor.solcast_pv_forecast_forecast_day_3",
-    "epex": "sensor.epex_predictor_nl",                             # EpexPredictor integration, attribute forecast
-    "nordpool_entry": "01XXXXXXXXXXXXXXXXXXXXXXXX",                 # your Nord Pool config entry id (the URL of its integration page)
-    "nordpool_area": "NL",                                          # the key of the price list that action returns
-}
-ACTUAL_EXPORT_SW = ENTITIES["export_switch"]
-# The Solcast site the microinverter shares with the Deye's east string: site
-# "A" of PLANT["pv"]["solcast_sites"] (plant.json). Registered as one 9,8 kWp
-# roof because the free tier allows two sites; the microinverter is ~2,8 of it.
-# See core.pv_split. The service is called every plan; an unknown id makes it
-# fail, and _solcast_site then logs a warning and passes an empty list, which
-# stands the split down rather than guessing (as does growatt_share 0).
+ACTUAL_EXPORT_SW = ENTITIES["export_switch"]             # the other half of the site's rule
+# The Solcast site the Growatt shares with the Deye's east string. Registered as
+# one 9,8 kWp roof because the free tier allows two sites; the Growatt is ~2,8
+# of it. See core.pv_split.
 SOLCAST_ESE_SITE = core.PLANT["pv"]["solcast_sites"]["A"]
-ACTUAL_PV = ENTITIES["pv"]
-ACTUAL_LOAD = ENTITIES["load"]
-ACTUAL_GRID_IMP = ENTITIES["grid_import"]
-ACTUAL_GRID_EXP = ENTITIES["grid_export"]
-ACTUAL_BATT = ENTITIES["batt_power"]
-ACTUAL_CURTAIL = ENTITIES["curtailed"]
-ACTUAL_MICRO = ENTITIES["micro"]
-ACTUAL_SOC = ENTITIES["soc"]
-NP_ENTRY = ENTITIES["nordpool_entry"]
+ACTUAL_PV = ENTITIES["pv"]                              # W
+ACTUAL_LOAD = ENTITIES["load"]                   # W
+ACTUAL_GRID_IMP = ENTITIES["grid_import"]  # kW, fiscal meter
+ACTUAL_GRID_EXP = ENTITIES["grid_export"]  # kW, fiscal meter
+ACTUAL_BATT = ENTITIES["batt_power"]                    # W at the DC port, + = discharge
+ACTUAL_CURTAIL = ENTITIES["curtailed"]                  # 0/1; a 15-min mean is the fraction
+ACTUAL_MICRO = ENTITIES["micro"]             # W, the must-take half (never curtailed)
+ACTUAL_SOC = ENTITIES["soc"]                           # % pack state of charge
 
 
 def _now():
@@ -120,16 +97,98 @@ def _attr(entity_id, name):
         return None
 
 
+def _writer_live():
+    try:
+        return state.get("input_select.emhass_writer_mode") == "live"
+    except Exception:                  # pyscript raises NameError on a missing entity; no helper means no writer
+        return False
+
+
+def _day_was_live(day):
+    """Whether the writer drove the inverter on a PAST day (its archive has a
+    live tick), which is what decides the real pack for yesterday's slice and
+    the ledger, not the mode now."""
+    return task.executor(core.day_was_live, WRITER_DIR, day)
+
+
+def _soc_anchor(day, act, live=None):
+    """LIVE MODE ANCHORS THE SETTLED CHAIN ON THE REAL PACK (spec 3.6). The
+    writer drops /config/emhass/writer/anchor.json when the mode goes live; on
+    that day the virtual pack is reset to the real SOC at the switch step, on
+    every later live day it starts from the real midnight SOC (the first
+    15-minute mean of sensor.inverter_battery). Outside live mode, or without
+    either, None: the archive's own anchor stands. (step, soc_pct) or None.
+    `live` overrides the mode-now test for a past day."""
+    if not (_writer_live() if live is None else live):
+        return None
+    soc = act.get("soc_pct") if act else None
+    midnight = soc[0] if soc and soc[0] is not None else None
+    return task.executor(core.soc_anchor_for_day, task.executor(core.read_anchor, WRITER_ANCHOR), day, midnight)
+
+
+def _measured(act, prefix="actual_", live=None):
+    """THE VIRTUAL PACK IS RETIRED IN LIVE MODE (2026-09-26): the settled
+    chain's past steps take the measured pack power (DC, + discharge), the
+    fiscal meter (W, + import) and the SOC from the recorder. Outside live
+    mode, or without the series, {} and the simulation stands. With
+    prefix="prev_" the same three lanes for yesterday's slice; `live`
+    overrides the mode-now test for a past day."""
+    if not (_writer_live() if live is None else live) or not act:
+        return {}
+    batt, soc, grid = act.get("batt_dc_w"), act.get("soc_pct"), act.get("grid_w")   # grid_w: _actuals_15min's P1 net, W
+    if batt is None or soc is None or grid is None:
+        return {}
+    return {prefix + "batt_w": batt, prefix + "grid_w": grid, prefix + "soc_pct": soc}
+
+
+def _yesterday_lanes(prev, yday):
+    """Yesterday's anchor and measured lanes for the display slice, so a live
+    day keeps the real pack after the midnight rollover (2026-09-27: the first
+    live day went back to the virtual pack at 00:13). The anchor is the live
+    switch step when the writer went live that day, else yesterday's real
+    midnight SOC."""
+    live = _day_was_live(yday)
+    out = dict(_measured(prev, prefix="prev_", live=live))
+    anchor = _soc_anchor(yday, prev, live=live)
+    if anchor is not None:
+        out["prev_soc_anchor"] = anchor
+    return out
+
+
+PACK_TEMP_MEAN = "sensor.emhass_pack_temp_1h"
+PACK_TEMP_USED = "sensor.emhass_pack_temp_used"
+
+
+def _pack_temp_latch():
+    """Move the latched pack temperature (core.temp_latch) and publish it.
+    The latch is an entity, not a module global, so a reload or a second
+    copy of this file cannot split it (the writer's guard, 308af7d)."""
+    mean = _num(PACK_TEMP_MEAN, None)
+    prev = _num(PACK_TEMP_USED, None)
+    used = core.temp_latch(prev, mean, _num("input_number.emhass_temp_deadband_c", 2.0))
+    if used is None:
+        log.warning(f"emhass: no pack temperature ({PACK_TEMP_MEAN} unreadable, no latch yet): the temperature ramp is off")
+        return
+    state.set(PACK_TEMP_USED, used, new_attributes={
+        "friendly_name": "EMHASS pack temperature used", "unit_of_measurement": "°C",
+        "device_class": "temperature", "icon": "mdi:thermometer-lines", "mean_1h": mean})
+
+
 def _knobs():
     """The live knob layer: every helper in core.LIVE_KNOBS, None when unreadable
     so the core falls back to its constant. input_datetime reads as 'HH:MM:SS'."""
     out = {}
     for name, (default, eid) in core.LIVE_KNOBS.items():
-        raw = state.get(eid)
+        try:
+            raw = state.get(eid)
+        except Exception:              # pyscript raises NameError on an entity that does not exist yet
+            raw = None
         if raw in (None, "unknown", "unavailable", ""):
             out[name] = None
         elif eid.startswith("input_datetime."):
             out[name] = str(raw)[:5]
+        elif eid.startswith("input_boolean."):
+            out[name] = 1.0 if raw == "on" else 0.0
         else:
             try:
                 out[name] = float(raw)
@@ -160,7 +219,7 @@ def _solcast_site(site, start, days=3):
     the combined sensor's detailedForecast so pv_series parses it unchanged.
 
     The per-site breakdown reaches the sensor attributes only as DAILY totals
-    (keys named after the resource ids); the half-hours exist nowhere but this service,
+    (keys named after the Solcast resource ids); the half-hours exist nowhere but this service,
     and turning on the detailed site breakdown instead would roughly triple a
     detailedForecast that is already near the recorder's 16.384 B attribute
     cap. An empty list on failure stands the split down rather than guessing."""
@@ -188,38 +247,6 @@ def _set_slice(entity_id, sl, name):
     attrs = dict(sl)
     attrs.update(friendly_name=name, icon="mdi:calendar-clock")
     state.set(entity_id, sl["date"], new_attributes=attrs)
-
-
-def _set_scores(row, roll):
-    if row:
-        attrs = dict(row)
-        attrs.update(friendly_name="EMHASS score", unit_of_measurement="EUR", icon="mdi:scale-balance")
-        state.set("sensor.emhass_score", row["gap_eur"] if row.get("gap_eur") is not None else "unknown",
-                  new_attributes=attrs)
-    if roll:
-        attrs = dict(roll)
-        attrs.update(friendly_name="EMHASS gap 30 d", unit_of_measurement="EUR", icon="mdi:sigma")
-        state.set("sensor.emhass_gap_30d", roll["gap_30d"], new_attributes=attrs)
-
-
-def _import_stats(rows):
-    """One row per scored day at 00:00 local (hour-aligned, as the recorder requires),
-    state = the day's value, sum = running total; the whole series is re-imported
-    each time so a re-scored day keeps every later sum consistent."""
-    for sid, key, name in STATS:
-        data, total = [], 0.0
-        for r in rows:
-            v = r.get(key)
-            if v is None:
-                continue
-            total += v
-            start = datetime.combine(datetime.fromisoformat(r["date"]).date(), datetime.min.time(), tzinfo=TZ)
-            data.append({"start": start, "state": round(v, 4), "sum": round(total, 4)})
-        if not data:
-            continue
-        meta = {"mean_type": StatisticMeanType.NONE, "has_sum": True, "name": name, "source": "emhass",
-                "statistic_id": sid, "unit_class": None, "unit_of_measurement": "EUR"}
-        async_add_external_statistics(hass, meta, data)
 
 
 def _load_history_days(today, n_days=None):
@@ -278,9 +305,11 @@ def _plan_day(dry_run=False):
     # PREDICTED. Chaining off the prediction is why an hourly re-solve never
     # noticed the pack falling behind: it was re-solving a fiction, correctly.
     act = _actuals_15min(today, core._slot(now))
+    anchor = _soc_anchor(today, act)
+    measured = _measured(act)
     settled = task.executor(core.virtual_day, ARCHIVE, today, TZ_NAME, now,
                             act.get("pv_w"), act.get("load_w"), act.get("curtailed"),
-                            act.get("pv_peak_w"), act.get("micro_w"))
+                            act.get("pv_peak_w"), act.get("micro_w"), soc_anchor=anchor, **measured)
     s_now = (settled or {}).get("soc_now_pct")
     v_soc, v_src = (None, None) if s_now is not None else task.executor(core.virtual_soc_at, ARCHIVE, t0)
     if s_now is not None:
@@ -296,13 +325,26 @@ def _plan_day(dry_run=False):
         soc_source = "reanchored" if had_plans else "real"
         if had_plans:
             log.warning("emhass: virtual SOC chain broken (no archived plan covers %s); reanchored on the real pack", t0.isoformat())
+    # LIVE MODE PLANS FROM THE REAL PACK (spec 2026-09-26, section 3.6). The
+    # writer executes this plan on the inverter, so the solve must start from
+    # what the pack actually holds, not from the settled virtual chain (which
+    # stood at 100 % while the real pack read 82 % on go-live day). The
+    # virtual chain keeps settling for the display slices either way; in
+    # live mode its drift is the writer's own execution error.
+    if _writer_live():
+        real = _num(ACTUAL_SOC, None)
+        if real is not None:
+            soc, soc_source = float(real), "real"
+        else:
+            log.warning("emhass: writer live but %s unavailable; planning from the %s SOC", ACTUAL_SOC, soc_source)
     inp = {"now": now.isoformat(), "tz": TZ_NAME, "base_url": BASE, "archive_dir": ARCHIVE, "dry_run": bool(dry_run),
            "np_today": _nordpool(today), "np_tomorrow": _nordpool(today + timedelta(days=1)),
            "epex": _attr(ENTITIES["epex"], "forecast") or [],
            "solcast_today": _attr(ENTITIES["solcast_today"], "detailedForecast") or [],
            "solcast_tomorrow": _attr(ENTITIES["solcast_tomorrow"], "detailedForecast") or [],
            "solcast_day3": _attr(ENTITIES["solcast_day3"], "detailedForecast") or [],
-           "soc_pct": soc, "soc_source": soc_source, "tariff": _tariff()}
+           "soc_pct": soc, "soc_source": soc_source, "tariff": _tariff(),
+           "soc_anchor": anchor, **measured}
     # The curtailable half only. pv_series merges the three ESE lists, so the
     # whole span goes in one of them.
     inp["solcast_ese_today"] = _solcast_site(
@@ -310,6 +352,7 @@ def _plan_day(dry_run=False):
     # The live knob layer (core.LIVE_KNOBS): growatt share, P50:P10 mix, stress
     # scale, SOC costs, terminal and intermediate SOC targets, the cut thresholds.
     # Unreadable helpers fall back to the core constants.
+    _pack_temp_latch()
     inp["knobs"] = _knobs()
     # The rebalancing clock on the SETTLED pack (2026-09-15): today's settled
     # slice is folded into /config/emhass/rebalance.json every tick, and the
@@ -327,8 +370,8 @@ def _plan_day(dry_run=False):
     # pack ran against rather than what the plan forecast.
     inp["actual_pv_w"], inp["actual_load_w"] = act.get("pv_w"), act.get("load_w")
     # The curtailment mask rides along: virtual_day substitutes POTENTIAL PV over
-    # the past, the same basis score_day's replay lane settles on, so the charts
-    # and the scoreboard cannot disagree on a curtailed day.
+    # the past, the same basis the ladder's replay lane settles on, so the
+    # charts and the ledger cannot disagree on a curtailed day.
     inp["curtailed"], inp["pv_peak_w"] = act.get("curtailed"), act.get("pv_peak_w")
     # The must-take half, so the repair scales the strings and not the Growatt.
     inp["micro_w"] = act.get("micro_w")
@@ -339,6 +382,7 @@ def _plan_day(dry_run=False):
     inp["prev_pv_w"], inp["prev_load_w"] = prev.get("pv_w"), prev.get("load_w")
     inp["prev_curtailed"], inp["prev_pv_peak_w"] = prev.get("curtailed"), prev.get("pv_peak_w")
     inp["prev_micro_w"] = prev.get("micro_w")
+    inp.update(_yesterday_lanes(prev, today - timedelta(days=1)))
     # Own same-clock load shape, unless the ML switch is on: passing
     # load_power_forecast flips EMHASS to load_forecast_method 'list', which
     # would silently override the mlforecaster the switch exists to enable.
@@ -380,8 +424,8 @@ def _plan_day(dry_run=False):
 
 def _actuals_15min(day, gap_upto=None):
     """The day's measured series as W per 15-minute step, from the recorder's
-    5-minute means: {pv_w, load_w} feed the 20/20 hindsight lane, {pv_w, grid_w,
-    batt_dc_w} the counterfactual replay. Any series with more than MAX_PV_GAPS
+    5-minute means: {pv_w, load_w} feed the virtual day and the display slices,
+    {pv_w, grid_w, batt_dc_w} the ladder's replay. Any series with more than MAX_PV_GAPS
     held steps is left out of the dict rather than returned - a lane built on
     gap-holds is worse than no lane, and each lane then fails on its own. The
     recorder keeps 5-minute statistics ~10 days, plenty for scoring yesterday."""
@@ -421,7 +465,7 @@ def _actuals_15min(day, gap_upto=None):
 
 
 def _export_off(t0, n):
-    """1,0 per step where the export switch (ENTITIES["export_switch"]) was OFF at the step start.
+    """1,0 per step where switch.inverter_export_surplus was OFF at the step start.
     The switch keeps no statistics, only states, so this reads its history rather
     than the recorder's 5-minute rolls. None when nothing is recorded for the
     window, which is the caller's signal to drop back to the SOC half alone."""
@@ -434,7 +478,7 @@ def _export_off(t0, n):
         log.warning(f"emhass: export-switch history fetch failed: {e}")
         return None
     # A list comprehension, not a generator expression: pyscript's AST walker
-    # raises NotImplementedError on ast_generatorexp (it has no handler for it).
+    # raises NotImplementedError on ast_generatorexp (see reference_pyscript_patterns).
     pts = [(st.last_changed.timestamp(), st.state)
            for st in (hist or {}).get(ACTUAL_EXPORT_SW, []) if st.state in ("on", "off")]
     pts.sort()
@@ -451,10 +495,10 @@ def _export_off(t0, n):
 
 
 def _fallback_mask(t0, n, soc_pct):
-    """Curtailment mask for a window that predates the curtailment sensor
-    (ENTITIES["curtailed"], which only started recording at 14:00 on 2026-09-05).
+    """Curtailment mask for a window that predates sensor.pv_curtailment_active
+    (which only started recording at 14:00 on 2026-09-05).
 
-    BOTH halves of the site rule, not just SOC. The SOC-only version was loose by
+    BOTH halves of the site's rule, not just SOC. The SOC-only version was loose by
     design, on the argument that pv_potential's max(measured, scaled) guard would
     neutralise a mask that over-fired. 09-05 disproved that: SOC sat above 95 %
     from the small hours, the fallback flagged the whole day, and with Solcast
@@ -470,83 +514,6 @@ def _fallback_mask(t0, n, soc_pct):
         return [1.0 if float(soc_pct[i]) > core.PV_CURTAIL_SOC_PCT else 0.0 for i in range(m)]
     return [1.0 if (float(soc_pct[i]) > core.PV_CURTAIL_SOC_PCT and off[i] >= 0.5) else 0.0
             for i in range(m)]
-
-
-def _score_inputs(day):
-    """Assemble (realised, actuals, hindsight) for ANY day inside the recorder's
-    ~15-day 5-minute window - not just yesterday, so a replay can rescore an old
-    day too. The measured 15-minute series (pv/load/grid/batt/soc) come from the
-    recorder; SOC bounds are the day's first and last recorded slot. Only the
-    yesterday-only extras (the fiscal midnight-SOC capture pair and the utility
-    meter's own daily cost) are read from the live daily sensors, and they
-    overlay the recorder values when present. hindsight is solved whenever PV,
-    load and a start SOC exist."""
-    yesterday = _now().date() - timedelta(days=1)
-    act = _actuals_15min(day)
-    realised = {"cash_eur": None, "soc_start_pct": None, "soc_end_pct": None,
-                "pv_kwh": None, "load_kwh": None}
-    soc = act.get("soc_pct")
-    if soc:
-        realised["soc_start_pct"], realised["soc_end_pct"] = soc[0], soc[-1]
-    pv_w, ld_w = act.get("pv_w"), act.get("load_w")
-    if pv_w is not None:
-        realised["pv_kwh"] = round(sum(pv_w) * core.STEP_H / 1000.0, 2)
-    if ld_w is not None:
-        realised["load_kwh"] = round(sum(ld_w) * core.STEP_H / 1000.0, 2)
-    if day == yesterday:
-        lp = _attr("sensor.emhass_grid_cost_daily", "last_period")
-        if lp not in (None, "", "unknown", "unavailable"):
-            realised["cash_eur"] = float(lp)
-        # the fiscal midnight-SOC capture is truer than the recorder's 00:00 slot
-        if _attr("sensor.emhass_soc_midnight", "date") == _now().date().isoformat():
-            realised["soc_end_pct"] = _num("sensor.emhass_soc_midnight", None)
-            prev = _attr("sensor.emhass_soc_midnight", "previous")
-            if prev not in (None, "", "unknown", "unavailable", "None"):
-                realised["soc_start_pct"] = float(prev)
-    return realised, act, _hindsight(day, act)
-
-
-def _plan_window(day):
-    """(t0, n) of the plan of record for `day`: the horizon the 20/20 lane has to
-    match. None when the day has no plan of record."""
-    found = task.executor(core.plan_for_day, ARCHIVE, day, TZ_NAME)
-    if not found:
-        return None
-    doc = found[0]
-    return datetime.fromisoformat(doc["t0"]).astimezone(TZ), int(doc["n"])
-
-
-def _hindsight(day, act):
-    """Solve the 20/20 lane over the plan of record's WHOLE horizon, not just the
-    scored day (ruling 2026-09-05): matched horizon, so the terminal SOC pin lands
-    beyond the scored day for hindsight exactly as it already does for the plan.
-
-    The horizon reaches 24-48 h past the day, so the actuals only exist a day or
-    two later; until then the lane is 'pending_horizon' and the caller backfills
-    it on a later night. Prices are the real day-ahead for every calendar day the
-    window touches, including the ones the plan itself had to predict - that is
-    what makes it hindsight."""
-    win = _plan_window(day)
-    if win is None:
-        return {"status": "no_plan", "eur": None, "posted": False}
-    t0, n = win
-    end = t0 + timedelta(minutes=core.STEP_MIN * n)
-    if end > _now():
-        return {"status": "pending_horizon", "eur": None, "posted": False, "ready": end.isoformat()}
-    for k in ("grid_w", "batt_dc_w", "pv_w"):
-        if act.get(k) is None:
-            return {"status": "no_actuals", "eur": None, "posted": False}
-    win = _window_actuals(t0, n)
-    if win is None:
-        return {"status": "no_actuals", "eur": None, "posted": False}
-    np_rows = []
-    d = t0.date()
-    while d <= end.date():
-        np_rows += _nordpool(d)
-        d += timedelta(days=1)
-    return task.executor(core.hindsight_day, ARCHIVE, BASE, day.isoformat(), TZ_NAME, np_rows,
-                         win, act, core.CAPACITY_KWH,
-                         _num("input_number.emhass_lambda_frac", 0.9))
 
 
 def _window_actuals(t0, n):
@@ -596,11 +563,15 @@ def _ladder_inputs(day):
     horizon is fully in the past (the recorder cannot have it before then, and
     the core reports the rung as pending rather than warning about gaps)."""
     act = _actuals_15min(day)
+    # A day the writer drove is the real pack in the ledger (2026-09-27): the
+    # actual rung takes the live anchor and the measured lanes.
+    live = _day_was_live(day)
+    marks = {"anchor": _soc_anchor(day, act, live=live), "measured": bool(live and _measured(act, live=live))}
     w = task.executor(core.ladder_windows, ARCHIVE, day.isoformat(), TZ_NAME)
     if not w:
-        return {"day": act, "win1": None, "win2": None}
+        return {"day": act, "win1": None, "win2": None, **marks}
     t0, now = datetime.fromisoformat(w["t0"]), _now()
-    out = {"day": act}
+    out = {"day": act, **marks}
     for key, n in (("win1", w["n1"]), ("win2", w["n2"])):
         end = t0 + timedelta(minutes=core.STEP_MIN * n)
         out[key] = _window_actuals(t0, n) if end <= now else None
@@ -608,9 +579,11 @@ def _ladder_inputs(day):
 
 
 def _ladder_walk(days, rungs=None, reprice=None):
-    """Run the ladder over `days` (date objects, any order) and publish
-    sensor.emhass_ladder. Returns the core's result; the caller re-plans when
-    it reports posted (the solves overwrite the add-on's opt_res_latest)."""
+    """Run the ladder over `days` (date objects, any order) and re-import
+    emhass:ladder_earned_eur. Returns the core's result; the caller re-plans
+    when it reports posted (the solves overwrite the add-on's opt_res_latest).
+    sensor.emhass_ladder, the ladder card's copy of the walk, was retired with
+    the card on 2026-09-27; the new ledger reads the statistic."""
     days = sorted(days)
     inputs = {}
     for d in days:
@@ -623,49 +596,8 @@ def _ladder_walk(days, rungs=None, reprice=None):
     res = task.executor(core.ladder_run, ARCHIVE, LADDER, BASE, [x.isoformat() for x in days], TZ_NAME, np_rows,
                         inputs, rungs, core.CAPACITY_KWH, _num("input_number.emhass_lambda_frac", 0.9), 180,
                         reprice)
-    _set_ladder(res)
-    return res
-
-
-def _set_ladder(res):
-    """sensor.emhass_ladder: state = the 7-day controller shortfall (actual
-    minus hindsight, EUR); attributes carry the window sums, the marginal value
-    of each rung of knowledge, the end-of-window packs, the last 14 rows and
-    `days`, the whole walk in the compact shape sensor.emhass_gap_30d already
-    uses. `days` is what the ledger card buckets into weeks, months and years,
-    so it is the FULL history, not a window: the card cannot query the CSV. It
-    stays in the solver's sign (negative = earnings) like every other attribute
-    here; the chart negates once, in its own generator. The sensor is excluded
-    from the recorder for the same reason the plan slices are - the payload
-    grows by a row a day and recorder history of it is pure churn."""
-    summ = res.get("summary") or {}
-    d7 = (summ.get("windows") or {}).get("d7") or {}
-    days = []
-    for r in (res.get("all_rows") or []):
-        # a seed row (the replay import's chain anchor) has no rungs of its
-        # own; published, it would null every period sum that contains it
-        if "seed" in (r.get("flags") or "").split(";"):
-            continue
-        row = [r.get("date")]
-        # Order is load-bearing: the three core rungs first, so
-        # emhass-ladder-30d-v2's generators and the ladder card keep indices
-        # 1..3, and the two diagnostic rungs appended after them (4, 5).
-        for k in ("actual_eur", "hindsight_eur", "omni2_eur",
-                  "hindsight_pv_eur", "hindsight_load_eur"):
-            v = r.get(k)
-            row.append(round(float(v), 3) if v is not None else None)
-        days.append(row)
-    recent = []
-    for r in (res.get("all_rows") or [])[-14:]:
-        recent.append({k: r.get(k) for k in ("date", "soc_start_pct", "actual_eur", "hindsight_eur",
-                                             "omni2_eur", "actual_soc_end_pct", "hindsight_soc_end_pct",
-                                             "omni2_soc_end_pct", "hindsight_status", "omni2_status", "flags")})
-    attrs = dict(summ)
-    attrs.update(recent=recent, days=days, solves=res.get("solves"), friendly_name="EMHASS ladder",
-                 unit_of_measurement="EUR", icon="mdi:stairs")
-    gap = d7.get("gap_hindsight")
-    state.set("sensor.emhass_ladder", gap if gap is not None else "unknown", new_attributes=attrs)
     _import_ladder_earned()
+    return res
 
 
 LADDER_EARNED = "emhass:ladder_earned_eur"
@@ -727,7 +659,8 @@ def emhass_today_hours():
     act = _actuals_15min(today, core._slot(now))
     settled = task.executor(core.virtual_day, ARCHIVE, today, TZ_NAME, now,
                             act.get("pv_w"), act.get("load_w"), act.get("curtailed"),
-                            act.get("pv_peak_w"), act.get("micro_w"))
+                            act.get("pv_peak_w"), act.get("micro_w"), soc_anchor=_soc_anchor(today, act),
+                            **_measured(act))
     if not settled:
         return {"status": "no_chain"}
     _write_today_hours(settled, today)
@@ -747,7 +680,7 @@ def _import_ladder_shadow():
         async_add_external_statistics(hass, meta, data)
 
 
-# Ruling 2026-09-24: "remove omni, hindsight etc from the comparisons, our EMS is
+# 2026-09-24: "remove omni, hindsight etc from the comparisons, our EMS is
 # good enough as is". The nightly walk solves the ACTUAL lane only, which is
 # what the ledger and emhass:ladder_earned_eur read. The other rungs keep their
 # columns and their already-settled history in ladder.csv (the schema derives
@@ -762,6 +695,29 @@ def _ladder_default_days(lookback=4):
     their windows measured; every rung that is already ok is skipped by the core."""
     y = _now().date() - timedelta(days=1)
     return [y - timedelta(days=k) for k in range(lookback)]
+
+
+@service(supports_response="optional")
+def emhass_ladder_nightly():
+    """The 00:10 walk: the actual rung over yesterday and the three days before
+    it, then emhass:ladder_earned_eur. Re-plans when a solve reached the
+    add-on (the solves overwrite its opt_res_latest). Took over the nightly
+    ladder from emhass_score_day on 2026-09-27."""
+    t = _now()
+    days = _ladder_default_days()
+    try:
+        lad = _ladder_walk(days, NIGHTLY_RUNGS)
+    except Exception as e:
+        log.warning(f"emhass: nightly ladder failed: {e}")
+        _last_run("ladder", False, round((_now() - t).total_seconds(), 1), f"nightly: {e}")
+        return {"ok": False, "message": str(e)}
+    seconds = round((_now() - t).total_seconds(), 1)
+    d7 = (lad.get("summary") or {}).get("windows", {}).get("d7")
+    log.info(f"emhass: nightly ladder: {lad['solves']} solves, d7 {d7}")
+    _last_run("ladder", True, seconds, f"nightly {days[-1]}..{days[0]}: {lad['solves']} solves")
+    if lad.get("posted"):
+        emhass_plan_day()
+    return {"ok": True, "days": [d.isoformat() for d in sorted(days)], "solves": lad["solves"], "seconds": seconds}
 
 
 @service(supports_response="optional")
@@ -810,149 +766,6 @@ def emhass_ladder_hours(start=None, end=None):
     return {"days": res, "filled": len(ok)}
 
 
-@service(supports_response="optional")
-def emhass_score_day(date=None):
-    """Score one calendar day (default yesterday) against the archive; replay the
-    plan's battery decisions against the day's measured grid trace; solve the
-    20/20 hindsight lane on the day's actuals; write scores.csv,
-    sensor.emhass_score, sensor.emhass_gap_30d and the emhass:* statistics."""
-    day = datetime.fromisoformat(str(date)).date() if date else (_now().date() - timedelta(days=1))
-    realised, act, hs = _score_inputs(day)
-    res = task.executor(core.score_day, ARCHIVE, SCORES, day.isoformat(), TZ_NAME, realised,
-                        core.CAPACITY_KWH, _num("input_number.emhass_lambda_frac", 0.9), hs, act)
-    row, roll = res["row"], res["rolling"]
-    _set_scores(row, roll)
-    _import_stats(res["rows"])
-    hs_msg = (hs or {}).get("status") or "-"
-    rp_msg = row.get("replay_status") or "-"
-    _last_run("score", True, (hs or {}).get("seconds", 0),
-              f"{day} gap {row.get('gap_eur')} replay {rp_msg} hindsight {hs_msg} "
-              f"flags {row.get('flags') or '-'}")
-    log.info(f"emhass: scored {day}: gap {row.get('gap_eur')} replay {rp_msg} "
-             f"hindsight {hs_msg} flags {row.get('flags') or '-'}")
-    back = _backfill_hindsight(day) if not date else None
-    lad = None
-    if not date:
-        try:
-            lad = _ladder_walk(_ladder_default_days(), NIGHTLY_RUNGS)
-            log.info(f"emhass: ladder extended: {lad['solves']} solves, "
-                     f"{(lad.get('summary') or {}).get('windows', {}).get('d7')}")
-        except Exception as e:
-            log.warning(f"emhass: ladder extension failed: {e}")
-    if (hs and hs.get("posted")) or back or (lad and lad.get("posted")):
-        # The hindsight and ladder solves overwrote the add-on's opt_res_latest
-        # with past-day plans; re-plan so a later republish serves the live horizon.
-        log.info("emhass: re-planning after the hindsight and ladder solves")
-        emhass_plan_day()
-    return {"row": row, "gap_30d": roll["gap_30d"], "n_days": roll["n_days"],
-            "replay_status": rp_msg, "hindsight_status": hs_msg, "backfilled": back,
-            "ladder": (lad or {}).get("summary")}
-
-
-def _backfill_hindsight(scored_day, lookback=4):
-    """A matched horizon reaches past the scored day, so the newest day is always
-    'pending_horizon' at 00:10. Walk back for the newest day whose window has
-    since closed and whose hindsight is still missing, and rescore it. One solve
-    a night: the lane fills in a day or two late, permanently one day behind the
-    replayed lane, which is the cost of not pricing the two lanes' midnights
-    differently. Bounded by the recorder's ~15 days of 5-minute statistics."""
-    rows = {r["date"]: r for r in task.executor(core.read_scores, SCORES)}
-    for k in range(1, lookback + 1):
-        day = scored_day - timedelta(days=k)
-        r = rows.get(day.isoformat())
-        if r is None or r.get("hindsight_eur") is not None:
-            continue
-        if (r.get("hindsight_status") or "") not in ("", "pending_horizon", "no_actuals", "no_plan"):
-            continue
-        realised, act, hs = _score_inputs(day)
-        if hs.get("status") != "ok":
-            log.debug(f"emhass: hindsight backfill {day} not ready: {hs.get('status')}")
-            continue
-        res = task.executor(core.score_day, ARCHIVE, SCORES, day.isoformat(), TZ_NAME, realised,
-                            core.CAPACITY_KWH, _num("input_number.emhass_lambda_frac", 0.9), hs, act)
-        _import_stats(res["rows"])
-        _set_scores(None, res["rolling"])
-        log.info(f"emhass: hindsight backfilled {day}: {res['row'].get('hindsight_eur')} "
-                 f"gap {res['row'].get('gap_eur')}")
-        return {"date": day.isoformat(), "hindsight_eur": res["row"].get("hindsight_eur"),
-                "gap_eur": res["row"].get("gap_eur")}
-    return None
-
-
-def _replay_one(day):
-    """Re-solve one past day under current settings and rescore it. No live
-    re-plan here - the caller does one after the batch. Returns a summary dict
-    with a status; 'ok' means the plan of record was replaced and the day
-    rescored."""
-    load_days = _load_history_days(day)
-    if len(load_days) < core.LOAD_MIN_REF_DAYS:
-        return {"status": "insufficient_load", "day": day.isoformat(), "load_ref_days": len(load_days)}
-    rp = task.executor(core.replay_plan, ARCHIVE, BASE, day.isoformat(), TZ_NAME,
-                       _tariff(), load_days, core.CAPACITY_KWH,
-                       _num("input_number.emhass_lambda_frac", 0.9), 180, _knobs())
-    if rp["status"] != "ok":
-        return rp
-    realised, act, hs = _score_inputs(day)
-    res = task.executor(core.score_day, ARCHIVE, SCORES, day.isoformat(), TZ_NAME, realised,
-                        core.CAPACITY_KWH, _num("input_number.emhass_lambda_frac", 0.9), hs, act)
-    row, roll = res["row"], res["rolling"]
-    _set_scores(row, roll)
-    _import_stats(res["rows"])
-    # replayed_eur is the SCORED lane (the plan's battery on the real day), not
-    # the replay solve's self-reported cost on its own forecasts - rp["eur"] is
-    # that self-cost, kept separately so the two are never confused again.
-    return {"status": "ok", "day": day.isoformat(), "replayed_eur": row.get("replayed_eur"),
-            "gap_eur": row.get("gap_eur"), "hindsight_eur": row.get("hindsight_eur"),
-            "plan_self_eur": rp["eur"], "load_ref_days": rp["load_ref_days"],
-            "seconds": rp["seconds"], "posted": rp.get("posted", False)}
-
-
-@service(supports_response="optional")
-def emhass_replay_day(date):
-    """Re-run one past day's plan of record under the CURRENT settings, on the
-    forecast shoes it originally saw, insert it as the plan of record and
-    rescore. For iterating on a mistake without waiting a day: retune, then
-    replay the affected days. Bounded by the recorder's ~15 days of 5-minute
-    load history (older days return insufficient_load). Shares the plan lock, so
-    run it off the :13/:43 refresh minutes."""
-    task.unique("emhass_plan_day")
-    day = datetime.fromisoformat(str(date)).date()
-    out = _replay_one(day)
-    _last_run("replay", out["status"] == "ok", out.get("seconds", 0),
-              f"{day}: {out['status']}" + ("" if out["status"] != "ok"
-              else f" replayed {out['replayed_eur']} gap {out.get('gap_eur')} "
-                   f"load_days {out['load_ref_days']}"))
-    if out.get("posted"):
-        emhass_plan_day()          # replay + hindsight overwrote opt_res_latest; restore the live horizon
-    return out
-
-
-@service(supports_response="optional")
-def emhass_replay_range(start, end=None):
-    """Replay every day in [start, end] (end default = yesterday), oldest first
-    so the virtual-SOC and rebalance chain rebuilds forward, then re-plan once.
-    Days outside the recorder's load-history window return insufficient_load and
-    are skipped; the rest are re-run and rescored under current settings."""
-    task.unique("emhass_plan_day")
-    d = datetime.fromisoformat(str(start)).date()
-    last = datetime.fromisoformat(str(end)).date() if end else (_now().date() - timedelta(days=1))
-    results, posted = [], False
-    while d <= last:
-        out = _replay_one(d)
-        results.append(out)
-        posted = posted or out.get("posted", False)
-        log.info(f"emhass: replay {d}: {out['status']}"
-                 + ("" if out["status"] != "ok" else f" replayed {out['replayed_eur']} gap {out.get('gap_eur')}"))
-        d += timedelta(days=1)
-    ok = [r for r in results if r["status"] == "ok"]
-    _last_run("replay-range", True, 0,
-              f"{start}..{last}: {len(ok)}/{len(results)} replayed "
-              f"({';'.join(sorted({r['status'] for r in results if r['status'] != 'ok'})) or 'all ok'})")
-    if posted:
-        emhass_plan_day()
-    return {"ok": True, "days": len(results), "replayed": len(ok), "results": results}
-
-
 def _off_refresh_minute():
     """Never post ad-hoc solves while a plan may be solving: the add-on has one
     opt_res_latest, and a solve landing between production's POST and its GET
@@ -984,7 +797,7 @@ def _ab_totals(days):
             "export_day_kwh", "cash_eur", "soc_term_eur", "total_eur")
     ok = [d for d in days if d.get("status") == "ok"]
     # list comprehensions, never generator expressions: pyscript's AST walker has
-    # no ast_generatorexp handler; this bit on 09-07
+    # no ast_generatorexp (see reference_pyscript_patterns); this bit on 09-07
     tot = {k: round(sum([float(d["summary"][k] or 0.0) for d in ok]), 3) for k in keys}
     soc17 = [d["summary"]["soc_17h_pct"] for d in ok if d["summary"].get("soc_17h_pct") is not None]
     tot["soc_17h_mean_pct"] = round(sum(soc17) / len(soc17), 1) if soc17 else None
@@ -1000,14 +813,17 @@ def emhass_ab(start, end=None, label="ab", overrides=None, from_live=False, cade
     from the SOC the settled walk had reached, each step settled against the real
     day through the virtual Deye. from_live=True seeds the overrides from the
     current helpers ("what would today's settings have done"). The baseline is the
-    same walk on the archived settings. Never touches the plan archive or
-    scores.csv; results go to /config/emhass/ab/<label>.json.gz and
+    same walk on the archived settings. Never touches the plan archive;
+    results go to /config/emhass/ab/<label>.json.gz and
     sensor.emhass_ab_last, and the live horizon is re-planned afterwards."""
     _off_refresh_minute()                                  # BEFORE taking the lock, so a running plan is never killed
     task.unique("emhass_plan_day")
     ov = dict(overrides or {})
     if from_live:
-        live = {k: v for k, v in _knobs().items() if v is not None}
+        # A measured input (a sensor.* knob, pack_temp_used) is not a setting:
+        # every replayed solve keeps its own archived value.
+        live = {k: v for k, v in _knobs().items()
+                if v is not None and not core.LIVE_KNOBS[k][1].startswith("sensor.")}
         live.update(ov)
         ov = live
     bad = core.ab_validate(ov)
@@ -1064,6 +880,8 @@ def emhass_ab_apply(label=None):
     for eid, v in applied.items():
         if eid.startswith("input_datetime."):
             service.call("input_datetime", "set_datetime", entity_id=eid, time=f"{str(v)[:5]}:00")
+        elif eid.startswith("input_boolean."):
+            service.call("input_boolean", "turn_on" if float(v) > 0.5 else "turn_off", entity_id=eid)
         else:
             service.call("input_number", "set_value", entity_id=eid, value=float(v))
     log.warning(f"emhass: A/B {label!r} pushed live: {applied} (before {before}); skipped {skipped}")
@@ -1079,7 +897,7 @@ def _ml_state(entity_id, name, res):
 
 @service
 def emhass_fit():
-    """forecast-model-fit on the last 13 days of the load entity (ENTITIES["load"]), with backtest."""
+    """forecast-model-fit on the last 13 days of sensor.inverter_load_ups_power, with backtest."""
     task.unique("emhass_ml")
     payload = dict(ML)
     payload.update(historic_days_to_retrieve=13, perform_backtest=True)
@@ -1101,7 +919,7 @@ def emhass_tune():
 
 @service
 def emhass_health():
-    """healthz (last run younger than 26 h) plus live config against REPO_CFG (the deployed copy of ha/config.json)."""
+    """healthz (last run younger than 26 h) plus live config against ha/config.json."""
     res = task.executor(core.health, BASE, REPO_CFG, 93600)
     state.set("binary_sensor.emhass_addon_healthy", "on" if res["ok"] else "off",
               new_attributes=dict(friendly_name="EMHASS add-on healthy", icon="mdi:heart-pulse",
@@ -1112,22 +930,23 @@ def emhass_health():
 
 @service
 def emhass_rehydrate():
-    """After a restart: rebuild the rolled slices and the score sensors from the archive
-    and scores.csv, republish the add-on's last plan if it is still fresh, run health."""
+    """After a restart: rebuild the rolled slices from the archive, republish the
+    add-on's last plan if it is still fresh, run health."""
     _act = _actuals_15min(_now().date(), core._slot(_now()))
     _prev = _actuals_15min(_now().date() - timedelta(days=1))
-    res = task.executor(core.rehydrate, ARCHIVE, SCORES, TZ_NAME, _now().isoformat(),
+    res = task.executor(core.rehydrate, ARCHIVE, TZ_NAME, _now().isoformat(),
                         _num("input_number.emhass_plan_stale_hours", 26.0),
                         _act.get("pv_w"), _act.get("load_w"),
                         _prev.get("pv_w"), _prev.get("load_w"),
                         _act.get("curtailed"), _prev.get("curtailed"),
                         _act.get("pv_peak_w"), _prev.get("pv_peak_w"),
-                        _act.get("micro_w"), _prev.get("micro_w"))
+                        _act.get("micro_w"), _prev.get("micro_w"),
+                        soc_anchor=_soc_anchor(_now().date(), _act), **_measured(_act),
+                        **_yesterday_lanes(_prev, _now().date() - timedelta(days=1)))
     _set_slice("sensor.emhass_plan_yesterday", res.get("yesterday"), "EMHASS plan yesterday")
     _set_slice("sensor.emhass_plan_today", res.get("today"), "EMHASS plan today")
     _set_slice("sensor.emhass_plan_next_day", res.get("next_day"), "EMHASS plan next day")
     _set_slice("sensor.emhass_plan_day_after", res.get("day_after"), "EMHASS plan day after")
-    _set_scores(res.get("last_row"), res.get("rolling"))
     if res.get("plan_fresh"):
         # Fresh is a statement about the archive. Before asking the add-on to
         # republish, check it still holds THAT solve: anything that solved since

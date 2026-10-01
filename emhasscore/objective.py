@@ -19,17 +19,89 @@ CAPACITY_KWH = float(PLANT["battery"]["capacity_kwh"])   # = config.json battery
 # the two lanes could drift apart on tariff as well. replay_day rebuilds the
 # plan's battery decisions against the day that actually happened, and the
 # realised lane is re-settled in the plan's archived tariff frame, so all four
-# lanes share one price vector (spec of 2026-09-04).
-ETA_BRIDGE = float(PLANT["inverter"]["eta_bridge"])      # measured Deye DC<->AC bridge efficiency (the site loss model)
+# lanes share one price vector. Spec:
+# an internal design note
+ETA_BRIDGE = float(PLANT["inverter"]["eta_bridge"])      # = an internal tool eta_bridge (measured Deye DC<->AC)
 
 
 GRID_CAP_W = int(PLANT["grid"]["cap_w"])      # = config.json maximum_power_from_grid / _to_grid (3 x 25 A)
 
 
-METER_DRIFT_EUR = 0.25  # realised cash, plan frame vs utility meter: flag past this
 
 
 SOC_MIN, SOC_MAX = float(PLANT["battery"]["soc_min"]), float(PLANT["battery"]["soc_max"])   # = config.json battery min/max state of charge
+
+
+# = config.json battery_charge_efficiency / battery_discharge_efficiency. The
+# virtual pack integrates through these on every settled step (settle_slice,
+# virtual_day, ab_walk), so like CAPACITY_KWH they must track what the LP plans
+# on, or the planned and the settled lanes model a different pack. Until
+# 2026-09-07 all three carried them as signature literals. They live here, not
+# in deye.py, because batt_power_limits needs them and deye imports this module.
+ETA_C = float(PLANT["battery"]["eta_charge"])
+ETA_D = float(PLANT["battery"]["eta_discharge"])
+
+# LOSS MAP V2 (an internal design note, adoption spec
+# an internal design note). Behind the physics_v2
+# knob, posted as runtime keys every solve (the associations table carries
+# all of them; config.json is not touched). EMHASS topology: P_batt is the
+# DC BUS. The battery block (these etas) holds the Deye DC-DC stage plus the
+# cells; the bridge holds only the DC/AC conversion. Linear parts only (1 - a); the
+# quadratic parts are the stress costs (Q_PORT, Q_BRIDGE).
+ETA_DC_AC_V2 = float(PLANT["inverter"]["eta_v2"]["dc_ac"])          # bridge inverting, a 1,86 %
+ETA_AC_DC_V2 = float(PLANT["inverter"]["eta_v2"]["ac_dc"])          # bridge rectifying (AC -> port 95,1 % at 11,2 kW minus DC-DC)
+ETA_C_V2 = float(PLANT["inverter"]["eta_v2"]["charge"])              # DC-DC charge a 1,92 % + battery side 0,37 %
+ETA_D_V2 = float(PLANT["inverter"]["eta_v2"]["discharge"])              # DC-DC discharge a 1,93 % + battery side 0,37 %
+GRID_CHARGE_AC_MAX_W = float(PLANT["inverter"]["grid_charge_ac_max_w"])   # grid-only charge: cells 10,92 kW = 11.300 x 0,990 x 0,977
+STANDBY_LOAD_W = float(PLANT["inverter"]["standby_load_w"])         # the Deye's own draw the UPS-load register does not see (~110 W - 22 W bias)
+
+# The battery side, cells <-> port (cable 2,55 mOhm + R_eff/3 + hysteresis):
+# loss_kW = A * P + B * P^2 with P the port power in kW.
+BATT_SIDE_A = float(PLANT["battery"]["side_loss_a"])
+BATT_SIDE_B_KW = float(PLANT["battery"]["side_loss_b_kw"])
+
+
+def cells_to_port_w(p_cells_w: float) -> float:
+    """The port power that moves `p_cells_w` through the cells (+ discharges).
+    Charge: port - loss(port) = cells. Discharge: port + loss(port) = cells.
+    Past the charge parabola's vertex the vertex itself is returned."""
+    c = abs(float(p_cells_w)) / 1000.0
+    if c == 0.0:
+        return 0.0
+    a, b = BATT_SIDE_A, BATT_SIDE_B_KW
+    if p_cells_w < 0:
+        disc = (1.0 - a) ** 2 - 4.0 * b * c
+        port = ((1.0 - a) - max(disc, 0.0) ** 0.5) / (2.0 * b)
+        return -round(port * 1000.0, 1)
+    port = (-(1.0 + a) + ((1.0 + a) ** 2 + 4.0 * b * c) ** 0.5) / (2.0 * b)
+    return round(port * 1000.0, 1)
+
+
+def bus_to_port_w(p_batt_w: float, eta_c: float, eta_d: float) -> float:
+    """The port power for a DC-bus P_batt: the cells take P_batt x eta_c on a
+    charge and give P_batt / eta_d on a discharge (EMHASS's own SOC model), and
+    the port is the cells through the battery side."""
+    p = float(p_batt_w)
+    return cells_to_port_w(p * eta_c if p < 0 else p / eta_d)
+
+
+def batt_power_limits(port_w: float, eta_d: float = ETA_D, v2: bool = False) -> tuple[float, float]:
+    """The knob's pack PORT power as EMHASS's (charge_max, discharge_max).
+
+    THE KNOB IS WHAT THE PORT DOES (2026-09-29). The add-on bounds the
+    bus discharge at eff_dis * discharge_max and the bus charge at charge_max
+    itself (the 21:43 and 21:58 plans of 09-29).
+    v1: P_batt is read as the port: discharge through eta_d, charge raw.
+    v2: P_batt is the DC bus, the writer converts it to the port
+    (bus_to_port_w): charge_max is the bus power whose cells take
+    port(1 - A - B port); discharge_max is the cell power that gives the port."""
+    w = float(port_w)
+    if not v2:
+        return round(w, 1), round(w / float(eta_d), 1)
+    p = w / 1000.0
+    cells_c = p * (1.0 - BATT_SIDE_A - BATT_SIDE_B_KW * p)
+    cells_d = p * (1.0 + BATT_SIDE_A + BATT_SIDE_B_KW * p)
+    return round(cells_c / ETA_C_V2 * 1000.0, 1), round(cells_d * 1000.0, 1)
 
 
 # Fixed horizon-end SOC (2026-09-02): soc_final = soc_init coupled the
@@ -108,7 +180,7 @@ def restamp(rows: list[dict], t0, n: int) -> list[dict]:
 
 
 # Quadratic-loss pricing, split by stage (2026-09-02). The measured
-# arbitrage quad LOSS_QUAD (the site loss model) crosses bridge +
+# arbitrage quad LOSS_QUAD (an internal tool) crosses bridge +
 # port on every leg, so it splits: Q_PORT (cells + pack cabling + battery-port
 # DC-DC, a function of battery current) goes on battery_stress_cost; Q_BRIDGE
 # (DC-AC conduction, a function of AC current) goes on inverter_stress_cost.
@@ -123,12 +195,12 @@ def restamp(rows: list[dict], t0, n: int) -> list[dict]:
 # of 8,8 mOhm, and port R / V^2 (8,8e-3 / 51,2^2 = 0,00336 kW/kW^2) was nearly
 # all of it. The 5 Sep star rewire measured 6,55 mOhm on 38 h of data (CI 5,7
 # to 7,8), which is 0,0025 of pure ohmic. Re-pinned conservatively to 0,003,
-# with the loss model's loss_quad 0,00483 -> 0,004 in step; the bridge did not
+# with casa.yaml's loss_quad 0,00483 -> 0,004 in step; the bridge did not
 # change. Revisit on the 13 Sep full-window port figure.
-Q_PORT = float(PLANT["inverter"]["q_port_kw_per_kw2"])      # kW lost per (kW battery power)^2 (0,0037 before the star rewire)
+Q_PORT = float(PLANT["inverter"]["q_port_kw_per_kw2"])     # kW lost per (kW battery power)^2; loss map v2 (2026-09-30): DC-DC b 0,0021 + battery side 0,0021
 
 
-Q_BRIDGE = float(PLANT["inverter"]["q_bridge_kw_per_kw2"])   # kW lost per (kW AC power)^2; Q_PORT+Q_BRIDGE ~ 0,0042 (was 0,00483)
+Q_BRIDGE = float(PLANT["inverter"]["q_bridge_kw_per_kw2"])   # kW lost per (kW AC power)^2; bridge b, inverting 0,0002, rectifying ~0,001
 
 
 P_NOM_BATT_KW = float(PLANT["battery"]["p_nom_kw"])   # = config.json battery charge/discharge power max
@@ -137,13 +209,15 @@ P_NOM_BATT_KW = float(PLANT["battery"]["p_nom_kw"])   # = config.json battery ch
 P_NOM_INV_KW = float(PLANT["inverter"]["p_nom_kw"])    # = config.json inverter_ac_output_max
 
 
-def stress_costs(buy, sell) -> tuple[float, float]:
+def stress_costs(buy, sell, p_nom_batt_kw: float = P_NOM_BATT_KW) -> tuple[float, float]:
     """(battery, inverter) stress unit costs, priced at the horizon's mean
-    price level so the knobs follow the tariff regime and the day's prices."""
+    price level so the knobs follow the tariff regime and the day's prices.
+    The add-on's battery nominal is max(charge_max, discharge_max) of the
+    POSTED limits, so the caller passes that (12,5 was 4 % off)."""
     if not buy:
         return 0.0, 0.0
     pi = sum((b + s) / 2.0 for b, s in zip(buy, sell)) / len(buy)
-    u_batt = max(round(P_NOM_BATT_KW * Q_PORT * pi, 5), 0.0)
+    u_batt = max(round(float(p_nom_batt_kw) * Q_PORT * pi, 5), 0.0)
     u_inv = max(round(P_NOM_INV_KW * Q_BRIDGE * pi, 5), 0.0)
     return u_batt, u_inv
 
@@ -180,6 +254,9 @@ def loss_adjustment(rows) -> float:
 # statically: DEFICIT_BASE below 20% keeps an overnight cushion priced, not
 # fenced (brief dips stay allowed).
 SURPLUS_BASE = 0.005            # EUR/kWh/h above battery_soc_surplus_threshold
+
+
+SURPLUS_THRESHOLD = 0.85        # config.json's value; a live knob since 2026-09-27
 
 
 DEFICIT_BASE = (0.20, 0.01)     # (threshold, EUR/kWh/h) for the 10-20% band
@@ -235,7 +312,7 @@ def rebalance_schedule(days_since_full, surplus_base: float = SURPLUS_BASE,
 # On the 09-05 plan of record the rule would have fired from 11:00 (10,39 kWh
 # curtailment against 6,49 kWh of Growatt left, ratio 1,60). The earlier
 # advisory feasibility calculation (gain from spill vs loss of stored energy)
-# never fired on a plan lane and is retired; the ratio rule was chosen knowing
+# never fired on a plan lane and is retired; the site chose the ratio rule knowing
 # it can cost stored energy on a day the pack runs behind, because the settled
 # chain re-evaluates it every solve.
 AUX_CUT_ON_RATIO = 1.5
@@ -282,7 +359,19 @@ def aux_cut_decision(curtail_kwh: float, aux_kwh: float, active: bool,
 LIVE_KNOBS = {
     # name: (default, helper entity id)
     "stress_scale": (1.0, "input_number.emhass_stress_scale"),
+    # Absolute stress unit costs in ct/kWh AT NOMINAL POWER (2026-09-26).
+    # Set, they replace the loss-map figures stress_costs() derives (0,61 and
+    # 0,23 ct on a 16 ct day), because the LP hops between piecewise segments
+    # on a flat midday when the marginal stress is smaller than the
+    # quarter-to-quarter price step, and every hop is an intent change the
+    # writer pays for in held steps and register writes. The EMHASS docs put
+    # the inverter figure at 5 to 20 ct for "low and slow"; 1 ct is the
+    # starting point. None or 0 keeps the derived figure; stress_scale
+    # multiplies either.
+    "battery_stress_ct": (None, "input_number.emhass_battery_stress_ct"),
+    "inverter_stress_ct": (None, "input_number.emhass_inverter_stress_ct"),
     "surplus_base": (SURPLUS_BASE, "input_number.emhass_surplus_base"),
+    "surplus_threshold": (SURPLUS_THRESHOLD, "input_number.emhass_surplus_threshold"),
     "deficit_threshold": (DEFICIT_BASE[0], "input_number.emhass_deficit_threshold"),
     "deficit_cost": (DEFICIT_BASE[1], "input_number.emhass_deficit_cost"),
     "soc_final": (SOC_FINAL_TARGET, "input_number.emhass_soc_final"),
@@ -299,6 +388,21 @@ LIVE_KNOBS = {
     "pv_p10_mix": (PV_P10_MIX, "input_number.emhass_pv_p10_mix"),
     "growatt_share": (GROWATT_SHARE, "input_number.emhass_growatt_share"),
     "rebalance_dwell_h": (REBALANCE_DWELL_H, "input_number.emhass_rebalance_dwell_h"),
+    # Loss map v2 (2026-09-30): the measured plant on the runtime payload and
+    # the writer's bus -> port conversion. 0 = the June model. Archived with
+    # every plan, so the writer compiles each step with its own plan's physics.
+    "physics_v2": (0.0, "input_boolean.emhass_physics_v2"),
+    # Temperature-scheduled conservatism (spec H, 2026-09-30): above the
+    # ramp start the hurdle and the battery stress scale rise per degree, up to the
+    # ramp end. The input is sensor.emhass_pack_temp_used, the 1 h mean of the
+    # Solarman pack temperature latched with a deadband (the wrapper holds the
+    # latch), so a charge's ~5 °C swing does not re-shape every re-plan.
+    "pack_temp_used": (None, "sensor.emhass_pack_temp_used"),
+    "temp_ramp_start_c": (35.0, "input_number.emhass_temp_ramp_start_c"),
+    "temp_ramp_end_c": (40.0, "input_number.emhass_temp_ramp_end_c"),
+    "temp_hurdle_slope": (0.01, "input_number.emhass_temp_hurdle_slope"),     # EUR/kWh per °C
+    "temp_stress_slope": (0.5, "input_number.emhass_temp_stress_slope"),     # battery stress_scale per °C (the inverter term keeps the base scale)
+    "temp_deadband_c": (2.0, "input_number.emhass_temp_deadband_c"),
 }
 
 
@@ -309,6 +413,51 @@ def knobs(inp_knobs: dict | None) -> dict:
         if k in out and v is not None:
             out[k] = v
     return out
+
+
+def plan_etas(doc: dict | None) -> tuple[float, float]:
+    """(eta_c, eta_d) a plan was solved on: the v2 payload posts them; an
+    older plan used the June model."""
+    pay = (doc or {}).get("payload") or {}
+    return (float(pay.get("battery_charge_efficiency", ETA_C)),
+            float(pay.get("battery_discharge_efficiency", ETA_D)))
+
+
+def is_v2(kn: dict | None) -> bool:
+    """A plan's physics: a missing or None flag (plans archived before
+    2026-09-30) is the June model."""
+    v = (kn or {}).get("physics_v2")
+    return bool(v) and float(v) > 0.5
+
+
+def temp_latch(prev: float | None, mean: float | None, band: float) -> float | None:
+    """The latched pack temperature: it follows the mean only once the mean
+    has moved `band` or more. A missing mean keeps the latch."""
+    if mean is None:
+        return prev
+    if prev is None or abs(float(mean) - float(prev)) >= float(band) - 1e-9:   # 35,4 - 33,4 is 1,999... in floats
+        return round(float(mean), 1)
+    return prev
+
+
+def temp_ramp(t_used: float | None, start: float, end: float) -> float:
+    """Degrees above the ramp start, clipped to the ramp; 0 without a
+    temperature or with end <= start."""
+    if t_used is None or float(end) <= float(start):
+        return 0.0
+    return min(max(float(t_used) - float(start), 0.0), float(end) - float(start))
+
+
+def conservatism(kn: dict) -> tuple[float, float, float]:
+    """(weight_battery_discharge EUR/kWh, battery stress scale, inverter stress
+    scale) with the temperature ramp on top of the base knobs. The hurdle and
+    the BATTERY stress scale rise with the ramp (pack heat). The inverter
+    stress scale is the base stress_scale only: that term also taxes PV
+    export, which does not heat the pack (2026-09-30)."""
+    d = temp_ramp(kn.get("pack_temp_used"), kn["temp_ramp_start_c"], kn["temp_ramp_end_c"])
+    return (round(float(kn["weight_battery_discharge"]) + float(kn["temp_hurdle_slope"]) * d, 5),
+            round(float(kn["stress_scale"]) + float(kn["temp_stress_slope"]) * d, 4),
+            round(float(kn["stress_scale"]), 4))
 
 
 def soc_target_timestep(t0: datetime, n: int, day: date, at: str) -> int | None:
@@ -323,16 +472,47 @@ def soc_target_timestep(t0: datetime, n: int, day: date, at: str) -> int | None:
     return k if 0 < k < n else None
 
 
+# Spec F: +1 pp on the SOC target so the helper means "at least"; only the
+# calibration error is left under v2.
+SOC_TARGET_MARGIN_V2 = 0.01
+
+
+# THE SOLVER'S OPTIMALITY GAP RIDES ON EVERY SOLVE (2026-09-26). The add-on's
+# default lp_solver_mip_rel_gap is 0,01: on a ~30 EUR objective that is
+# 0,30 EUR of slack, while the whole flattening gain the stress cost buys on
+# a flat midday is ~0,04 EUR, so HiGHS returned whichever vertex it reached
+# first and the 27th's plan hopped between 8,75 kW grid charges and
+# solar-only steps differently on every solve. The key in config.json is not
+# honoured by the add-on (the file said 1e-5, /get-config kept 0,01); as a
+# runtime parameter it passes through the associations table. 0,2 % is
+# ~0,06 EUR of slack (2026-09-26, after 1e-5 solved in 22 s against
+# 3 s at 1 %). Solve time is the price: watch `seconds`.
+LP_MIP_REL_GAP = 0.001
+
+
+def soc_target_level(level: float, kn: dict) -> float:
+    """The SOC target a plan posts for a helper value: v1 as is, v2 with the
+    margin, capped at soc_max."""
+    if is_v2(kn):
+        return min(level + SOC_TARGET_MARGIN_V2, float(kn["soc_max"]))
+    return level
+
+
 def apply_knobs(payload: dict, kn: dict, t0: datetime, n: int, day: date) -> dict:
     """The runtime keys a knob set adds to a solve payload. Stress costs are
     scaled in place (they are price-scaled per solve upstream); the SOC target
     lands only when its time is ahead inside the horizon on `day`."""
-    payload["battery_stress_cost"] = round(float(payload.get("battery_stress_cost", 0.0)) * float(kn["stress_scale"]), 5)
-    payload["inverter_stress_cost"] = round(float(payload.get("inverter_stress_cost", 0.0)) * float(kn["stress_scale"]), 5)
+    payload["lp_solver_mip_rel_gap"] = LP_MIP_REL_GAP
+    v2 = is_v2(kn)
+    weight, scale_b, scale_i = conservatism(kn)
+    for key, knob, scale in (("battery_stress_cost", "battery_stress_ct", scale_b),
+                             ("inverter_stress_cost", "inverter_stress_ct", scale_i)):
+        ct = kn.get(knob)
+        base = float(ct) / 100.0 if ct is not None and float(ct) > 0 else float(payload.get(key, 0.0))
+        payload[key] = round(base * scale, 5)
     payload["soc_final"] = round(float(kn["soc_final"]), 4)
-    payload["weight_battery_discharge"] = float(kn["weight_battery_discharge"])
-    payload["battery_charge_power_max"] = float(kn["batt_power_max_w"])
-    payload["battery_discharge_power_max"] = float(kn["batt_power_max_w"])
+    payload["weight_battery_discharge"] = weight
+    apply_plant(payload, kn)
     payload["battery_minimum_state_of_charge"] = float(kn["soc_min"])
     payload["battery_maximum_state_of_charge"] = float(kn["soc_max"])
     payload.pop("soc_target", None)
@@ -340,8 +520,28 @@ def apply_knobs(payload: dict, kn: dict, t0: datetime, n: int, day: date) -> dic
     if float(kn["soc_target"]) > 0:
         k = soc_target_timestep(t0, n, day, kn["soc_target_at"])
         if k is not None:
-            payload["soc_target"] = round(float(kn["soc_target"]), 4)
+            payload["soc_target"] = round(soc_target_level(float(kn["soc_target"]), kn), 4)
             payload["soc_target_timestep"] = k
+    return payload
+
+
+PLANT_KEYS = ("inverter_efficiency_dc_ac", "inverter_efficiency_ac_dc", "battery_charge_efficiency",
+              "battery_discharge_efficiency", "inverter_ac_input_max")
+
+
+def apply_plant(payload: dict, kn: dict) -> dict:
+    """Post the physics layer of `kn` on a payload: the power limits from the
+    knob, and under v2 the measured plant keys (the v1 payload carries none,
+    so they are removed). One place for the live solve and the A/B tester."""
+    v2 = is_v2(kn)
+    payload["battery_charge_power_max"], payload["battery_discharge_power_max"] = \
+        batt_power_limits(kn["batt_power_max_w"], v2=v2)
+    for k in PLANT_KEYS:
+        payload.pop(k, None)
+    if v2:
+        payload.update(inverter_efficiency_dc_ac=ETA_DC_AC_V2, inverter_efficiency_ac_dc=ETA_AC_DC_V2,
+                       battery_charge_efficiency=ETA_C_V2, battery_discharge_efficiency=ETA_D_V2,
+                       inverter_ac_input_max=GRID_CHARGE_AC_MAX_W)
     return payload
 
 

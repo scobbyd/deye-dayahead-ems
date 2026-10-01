@@ -12,11 +12,20 @@ from .grid import expected_steps, local_midnight, _parse_ts, _slot, STEP_H, STEP
 from .series import pv_mix
 from .objective import (
     aux_cut_decision,
+    batt_power_limits,
     CAPACITY_KWH,
     cut_payload,
     cut_thresholds,
+    is_v2,
+    apply_plant,
+    conservatism,
     knobs,
     LIVE_KNOBS,
+    plan_etas,
+    SOC_TARGET_MARGIN_V2,
+    soc_target_level,
+    STANDBY_LOAD_W,
+    stress_costs,
     SOC_MAX,
     rows_to_gross,
     SOC_MIN,
@@ -33,7 +42,7 @@ from .scoring import lambda_for, soc_term
 
 #
 # "How well would a knob change have done yesterday?" cannot be answered by a
-# single re-solve (replay_plan) or by hindsight (which knows the day). It takes
+# single re-solve (the retired replay_plan) or by hindsight (which knows the day). It takes
 # the day's own sequence of solves, re-run under the change, each starting from
 # the SOC the settled walk had reached, each step settled against the real day
 # through the virtual Deye - what the throwaway harness did on 2026-09-07 to
@@ -166,29 +175,66 @@ def _ab_payload(doc: dict, shift: int, overrides: dict, day: date, tz: str, load
     for k in LIVE_KNOBS:
         if k in overrides:
             kn[k] = overrides[k]
-    if "stress_scale" in overrides:
-        f = float(overrides["stress_scale"]) / float(archived.get("stress_scale", 1.0) or 1.0)
-        pay["battery_stress_cost"] = round(float(pay.get("battery_stress_cost", 0.0)) * f, 5)
-        pay["inverter_stress_cost"] = round(float(pay.get("inverter_stress_cost", 0.0)) * f, 5)
+    was_v2, now_v2 = is_v2(archived), is_v2(kn)
+    flip = was_v2 != now_v2
+    if flip:
+        # The whole physics layer follows the flag (loss map v2): plant keys and
+        # limits, the standby draw in the load, the SOC target margin.
+        apply_plant(pay, kn)
+        sign = 1.0 if now_v2 else -1.0
+        if pay.get("load_power_forecast"):
+            pay["load_power_forecast"] = [round(l + sign * STANDBY_LOAD_W, 1) for l in pay["load_power_forecast"]]
+        if pay.get("soc_target") is not None:
+            t = float(pay["soc_target"])
+            pay["soc_target"] = round(min(t + SOC_TARGET_MARGIN_V2, float(kn["soc_max"])) if now_v2
+                                      else t - SOC_TARGET_MARGIN_V2, 4)
+        notes.append("physics_v2 " + ("on" if now_v2 else "off") + ": plant keys, limits, standby load and SOC "
+                     "target margin follow the flag")
+    ramp_keys = ("temp_ramp_start_c", "temp_ramp_end_c", "temp_hurdle_slope", "temp_stress_slope", "pack_temp_used")
+    cons_now, cons_was = conservatism(kn), conservatism(knobs(archived))
+    if "stress_scale" in overrides or any(k in overrides for k in ramp_keys):
+        # Rescale the archived costs by the conservatism scale of each term
+        # (the same rule as apply_knobs: the ramp lifts the battery term only).
+        fb = cons_now[1] / (cons_was[1] or 1.0)
+        fi = cons_now[2] / (cons_was[2] or 1.0)
+        pay["battery_stress_cost"] = round(float(pay.get("battery_stress_cost", 0.0)) * fb, 5)
+        pay["inverter_stress_cost"] = round(float(pay.get("inverter_stress_cost", 0.0)) * fi, 5)
     if "surplus_base" in overrides:
         base = float(archived.get("surplus_base", SURPLUS_BASE) or SURPLUS_BASE)
         pay["battery_soc_surplus_cost"] = round(float(pay.get("battery_soc_surplus_cost", 0.0))
                                                 * float(overrides["surplus_base"]) / base, 5)
         notes.append("surplus_base scales the archived dwell cost (the rebalance fade of that day is kept)")
+    if "surplus_threshold" in overrides:
+        pay["battery_soc_surplus_threshold"] = float(overrides["surplus_threshold"])
     if "deficit_threshold" in overrides:
         pay["battery_soc_deficit_threshold"] = float(overrides["deficit_threshold"])
     if "deficit_cost" in overrides:
         pay["battery_soc_deficit_cost"] = float(overrides["deficit_cost"])
     if "soc_final" in overrides:
         pay["soc_final"] = round(float(overrides["soc_final"]), 4)
-    for k, key in (("weight_battery_discharge", "weight_battery_discharge"),
-                   ("soc_min", "battery_minimum_state_of_charge"), ("soc_max", "battery_maximum_state_of_charge")):
+    if "weight_battery_discharge" in overrides or any(k in overrides for k in ramp_keys):
+        pay["weight_battery_discharge"] = cons_now[0]      # the hurdle at the plan's own pack temperature
+    for k, key in (("soc_min", "battery_minimum_state_of_charge"), ("soc_max", "battery_maximum_state_of_charge")):
         if k in overrides:
             pay[key] = float(overrides[k])
     if "batt_power_max_w" in overrides:
-        pay["battery_charge_power_max"] = pay["battery_discharge_power_max"] = float(overrides["batt_power_max_w"])
+        pay["battery_charge_power_max"], pay["battery_discharge_power_max"] = \
+            batt_power_limits(overrides["batt_power_max_w"], v2=is_v2(kn))
+    if (flip or "battery_stress_ct" in overrides or "inverter_stress_ct" in overrides) \
+            and pay.get("load_cost_forecast") and pay.get("prod_price_forecast"):
+        # Re-derive the stress on the posted nominal and the current Q; a set ct
+        # (> 0) stays absolute, 0 or None is the derived figure. the base
+        # stress_scale multiplies either, the temperature ramp the battery term only.
+        nominal = max(float(pay["battery_charge_power_max"]), float(pay["battery_discharge_power_max"])) / 1000.0
+        derived = stress_costs(pay["load_cost_forecast"], pay["prod_price_forecast"], p_nom_batt_kw=nominal)
+        for key, knob, d, scale in (("battery_stress_cost", "battery_stress_ct", derived[0], cons_now[1]),
+                                    ("inverter_stress_cost", "inverter_stress_ct", derived[1], cons_now[2])):
+            ct = kn.get(knob)
+            base = float(ct) / 100.0 if ct is not None and float(ct) > 0 else d
+            pay[key] = round(base * scale, 5)
+        notes.append("stress costs re-derived on the posted nominal")
     for k in AB_RUNTIME_KEYS:                      # raw runtime keys, for diagnostics; they win
-        if k in overrides:
+        if k in overrides and k != "weight_battery_discharge":     # a knob too: posted above at the ramp
             pay[k] = overrides[k]
     if "soc_target" in overrides or "soc_target_at" in overrides:
         pay.pop("soc_target", None)
@@ -197,7 +243,7 @@ def _ab_payload(doc: dict, shift: int, overrides: dict, day: date, tz: str, load
         if level > 0:
             k = soc_target_timestep(t0, n, day, kn["soc_target_at"])
             if k is not None:
-                pay["soc_target"], pay["soc_target_timestep"] = round(level, 4), k
+                pay["soc_target"], pay["soc_target_timestep"] = round(soc_target_level(level, kn), 4), k
     return pay, micro, (load_w is not None and any(micro)), notes, times, kn
 
 
@@ -339,7 +385,7 @@ def _ab_summaries(lanes: dict, executed: dict, n_day: int, capacity_kwh: float,
 
 def ab_walk(archive_dir: str, base_url: str, day_iso: str, tz: str, overrides: dict, actuals: dict,
             cadence_min: int = 30, settle: str = "closed", capacity_kwh: float = CAPACITY_KWH,
-            eta_c: float = 0.961, eta_d: float = 0.957, timeout: int = 180) -> dict:
+            timeout: int = 180) -> dict:
     """One day, one variant. `actuals`: pv_w (measured), load_w, micro_w,
     curtailed (mask), all per 15-minute step of the day. Returns the summary,
     the settled lanes and the solve log; status != ok explains why not."""
@@ -378,7 +424,7 @@ def ab_walk(archive_dir: str, base_url: str, day_iso: str, tz: str, overrides: d
         log_rows.append(log_row)
         # settle the steps this solve is in force for
         soc = _ab_settle(rows, micro, micro_cut, times, t_solve, t_next, day, midnight, pot, load_a, mic_a, soc,
-                         settle, capacity_kwh, eta_c, eta_d, lanes, margin=bool(ov.get("margin", SETTLE_MARGIN)),
+                         settle, capacity_kwh, *plan_etas({"payload": pay}), lanes, margin=bool(ov.get("margin", SETTLE_MARGIN)),
                          deadband_a=deadband_a, clamp=clamp)
     summary, executed_summary = _ab_summaries(lanes, executed, n_day, capacity_kwh, day, tz)
     summary["clamp_writes"] = clamp["writes"]
@@ -413,7 +459,9 @@ def ab_apply_plan(overrides: dict) -> tuple[dict, dict]:
     the writes; this stays pure and testable."""
     applied, skipped = {}, {}
     for k, v in (overrides or {}).items():
-        if k in LIVE_KNOBS:
+        if k in LIVE_KNOBS and LIVE_KNOBS[k][1].startswith("sensor."):
+            skipped[k] = "a measured input, not a setting"
+        elif k in LIVE_KNOBS:
             applied[LIVE_KNOBS[k][1]] = v
         elif k in AB_RUNTIME_KEYS:
             skipped[k] = "raw EMHASS runtime key: use the knob form or change config.json"

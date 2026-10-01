@@ -1,17 +1,34 @@
 # emhass-deye-backtest
 
-Would a battery on a Deye hybrid inverter have paid for itself on your house,
-last year, on your prices? This repo answers that with real optimisation, not
-a spreadsheet: it runs [EMHASS](https://github.com/davidusb-geek/emhass)
-(the Energy Management for Home Assistant linear-programme planner) as a
-library over your own 15-minute meter data, one plan per day, and settles each
-plan on the day that actually happened. The reference plant it was built on
-is a Deye SUN-12K with a 48,2 kWh LiFePO4 pack in the Netherlands on
-day-ahead prices; every plant number is a config value, so change them.
+This repo offers two things built on one planner core.
 
-The same planner core also runs live inside Home Assistant as a shadow EMS
-(it plans, scores itself against the day, and does not touch the inverter).
-That side is in `ha/` and is optional.
+1. **The backtest.** Would a battery on a Deye hybrid inverter have paid for
+   itself on your house, last year, on your prices? The harness answers that
+   with real optimisation, not a spreadsheet: it runs
+   [EMHASS](https://github.com/davidusb-geek/emhass) (the Energy Management for
+   Home Assistant linear-programme planner) as a library over your own
+   15-minute meter data, one plan per day, and settles each plan on the day
+   that actually happened. It touches nothing but files.
+2. **The live planner and writer.** The same core runs inside Home Assistant,
+   plans the battery every 15 minutes on day-ahead (EPEX) prices, and a
+   pyscript writer executes the plan on a real Deye three-phase hybrid
+   (SUN-xxK-SG04LP3 family, through the Solarman integration's `deye_p3`
+   profile). It is for owners whose supplier's EMS used to drive their Deye
+   and who now want their own day-ahead battery control. That side is in
+   `ha/`; start with [`ha/README.md`](ha/README.md).
+
+The reference plant both were built on is a Deye SUN-12K-SG04LP3 with a
+48,2 kWh LiFePO4 pack in the Netherlands on day-ahead prices. Every plant
+number and entity id is a value in `plant.json`, so change them.
+
+**Beta notice for the writer.** The writer went live on the reference site on
+2026-09-26 and has run on one site, one inverter model and one unit. In live
+mode it writes holding registers on your inverter (work mode, grid charging,
+current limits, a time-of-use target), and those registers latch. The licence
+is MIT and carries no warranty. You are responsible for limits that suit your
+battery. It installs disarmed (`input_boolean.emhass_writer_armed` off) and in
+`dry` mode, so nothing writes to the inverter until you arm it by hand. Read
+`ha/README.md` before you do.
 
 ## Before you run anything: the three things this repo does not carry
 
@@ -117,11 +134,12 @@ band you allow. Read `docs/method.md` for the accounting and the gotchas.
 ## Layout
 
 ```
-plant.example.json   every site number: coordinates, pack, inverter, grid cap, PV strings, Solcast ids, tariff
-emhasscore/          the planner core (standard library only; also runs inside pyscript in HA)
+plant.example.json   every site number and entity: coordinates, pack, inverter, register calibration,
+                     baseline, grid cap, PV strings, Solcast ids, tariff, HA entities, writer levers
+emhasscore/          the planner core and the writer core (standard library only; also runs inside pyscript in HA)
 backtest/            the offline harness: frame schema, HA statistics puller, ladder, solver, quickcheck, replay
 tests/               pytest; the golden pin is built from your own archive
-ha/                  the live shadow EMS: HA package, pyscript wrapper, add-on config, deploy scripts
+ha/                  the live planner and writer: HA packages, pyscript wrappers, add-on config, deploy scripts
 docs/                frame schema, method, lanes
 examples/            a synthetic 14-day frame so the quick start runs on a clean clone
 ```
@@ -133,6 +151,9 @@ solver contract (`build_config`, `build_params`, `set_input_data_dict`,
 `naive_mpc_optim`) is what `backtest/solver.py` wraps. pvlib is only needed
 for the PV potential model, plotly only for the viewers.
 
+The tests pin the reference plant: run them without a `plant.json` at the
+repo root. The live side's requirements are in `ha/README.md`.
+
 ## Not included
 
 - The dashboard tab. It depends on a private theme and card stack. The
@@ -140,6 +161,9 @@ for the PV potential model, plotly only for the viewers.
 - The household frame builder that merged a supplier's quarter-hour export,
   CAMS irradiance and KNMI weather. The public path is HA long-term
   statistics.
+- The reference site's go-live and review tools for the writer (an
+  acceptance harness and a tick reviewer). The tests that need them, or the
+  site's archived plans and writer ticks, skip.
 - Any measured data.
 
 ## License

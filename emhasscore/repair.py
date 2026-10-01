@@ -26,7 +26,7 @@ PV_CURTAIL_SOC_PCT = float(PLANT["pv"]["curtail_soc_pct"])    # the crossing the
 PV_DAYLIGHT_W = 200.0        # below this the forecast says nothing useful about the ratio
 
 
-# THE SITE RULE (2026-09-07, restating 09-05): real SOC >= 95 % AND export surplus
+# THE RULE (2026-09-07, restating 09-05): real SOC >= 95 % AND export surplus
 # off means the Deye is throttling; a throttled step takes raw Solcast (P50) as
 # the available PV. Nothing else. A fitted daily scale (0,815 on 09-05) and a
 # 5-minute peak guard were bolted on during 09-05/09-06 and together cut 5,95 kWh

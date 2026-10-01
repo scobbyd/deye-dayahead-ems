@@ -3,7 +3,7 @@ response, and the closed-loop settlement built as the delta between the two."""
 from __future__ import annotations
 
 from .grid import STEP_H
-from .objective import CAPACITY_KWH, SOC_MAX, SOC_MIN
+from .objective import CAPACITY_KWH, ETA_C, ETA_D, SOC_MAX, SOC_MIN  # noqa: F401  (ETA_* re-exported)
 from .plant import PLANT
 
 
@@ -56,6 +56,94 @@ DEYE_CLAMP_MARGIN_A = 20.0
 DEYE_CLAMP_DEADBAND_A = 20.0
 
 
+# The writer's deadband on the DISCHARGE clamp (2026-09-26). The amps come
+# from watts over the MEASURED pack voltage, which sags under load: the first
+# live sale wrote 136 A at 12:00 and 141 A at 12:15 for the same 7,4 kW. 5 A
+# is about 250 W, inside the meter noise the sun already makes, and absorbs
+# that jitter and the offset creep between re-plans. A move to or from the
+# 240 A baseline is always far outside it.
+DEYE_DISCHARGE_DEADBAND_A = 5.0
+
+
+# The writer's deadband on the GRID CHARGING CURRENT (handoff 2026-09-26): a
+# grid charge steps its current nearly every quarter hour for six hours while
+# the plan shapes the import. A move to or from the 0 A baseline is always
+# written whatever the value (the setpoint must land); see setpoint_write.
+# 20 A (2026-09-30: "1 kW steps is perfectly fine"): at 0 A a 1 A drift
+# of the loaded voltage cost a write (238 -> 237 A at 12:45 that day).
+DEYE_GRID_CHARGE_DEADBAND_A = 20.0
+
+
+# The writer's quantisation step on the three current registers (handoff
+# 2026-09-26): a slowly ramping plan settles on one value per segment instead
+# of a new one per quarter. 1 A is the register's own resolution (no change).
+# UP for a charge that must land (the grid charge and the clamp that caps it),
+# DOWN where the plan is a ceiling (the discharge clamp, the curtailed
+# plateau's clamp, which carries the margin). The site picks the value.
+DEYE_CURRENT_QUANT_A = 1.0
+
+
+# THE REGISTERS DELIVER LESS THAN THEY ASK, AND NOT BY A FIXED 3 A (refit
+# 2026-09-29 on 121 binding intervals, 09-26 12:00 to 09-29 22:00; the first
+# trials had read a flat 3 A off four points). Per field:
+#   discharge clamp: the shortfall grows ~0,030 A per A up to ~150 A, then
+#                    holds at ~4,3 A (43 -> 42,3, 100 -> 97,2, 141 -> 136,9,
+#                    221 -> 216,5, 240 -> 236,2); night RMS 0,19 A. Sun adds
+#                    ~0,55 A per kW of PV, not modelled.
+#   grid charging:   proportional, 0,951 (92 -> 87,2, 240 -> 226,7); RMS 0,68 A.
+#   charge clamp:    ~1 A on three clean points; kept a constant until more exist.
+# The writer asks for the register value that delivers the plan's current
+# (writer.py calibrate_amps inverts deye_delivered_a); the twin keeps modelling
+# asked = delivered, because the settlement has to reproduce the plan on the
+# plan's own inputs.
+DEYE_DISCHARGE_SHORT_SLOPE = float(PLANT["registers"]["discharge_short_slope"])
+DEYE_DISCHARGE_SHORT_KNEE_A = float(PLANT["registers"]["discharge_short_knee_a"])
+DEYE_DISCHARGE_SHORT_ICPT_A = float(PLANT["registers"]["discharge_short_icpt_a"])
+DEYE_GRID_CHARGE_GAIN = float(PLANT["registers"]["grid_charge_gain"])
+DEYE_CHARGE_SHORT_A = float(PLANT["registers"]["charge_short_a"])
+
+
+def deye_delivered_a(field: str, reg_a: float) -> float:
+    """The current the pack actually moves for register value `reg_a` on `field`."""
+    reg = float(reg_a)
+    if reg <= 0.0:
+        return 0.0
+    if field == "battery_max_discharging_current":
+        short = DEYE_DISCHARGE_SHORT_SLOPE * min(reg, DEYE_DISCHARGE_SHORT_KNEE_A) - DEYE_DISCHARGE_SHORT_ICPT_A
+        return reg - max(0.0, short)
+    if field == "battery_grid_charging_current":
+        return reg * DEYE_GRID_CHARGE_GAIN
+    return max(0.0, reg - DEYE_CHARGE_SHORT_A)
+
+
+# THE PORT VOLTAGE SAGS UNDER LOAD (measured 2026-09-29): 53,46 -> 52,44 V
+# stepping 1 -> 235 A, 51,63 -> 52,67 V stepping 236 -> 14 A, so pack plus
+# cable read ~4,6 mOhm. The writer ticks with the pack often at rest (a hold,
+# a flip of intent), and amps from the resting voltage undershoot the plan by
+# ~2 % at full power: 11.484 W asked at 52,7 V gave 218 A, which the loaded
+# 51,6 V turns into 11,25 kW. loaded_voltage solves V = V_oc -/+ R * I for the
+# step's own power. Carried separately from the internal R instrument
+# (battery_calc), which tracks temperature at ~3 %/degC; a constant is ~1 A.
+DEYE_PACK_R_OHM = float(PLANT["battery"]["r_ohm"])
+
+
+def loaded_voltage(v_oc: float, p_batt_w: float, r_ohm: float = DEYE_PACK_R_OHM) -> float:
+    """Port voltage while the pack moves `p_batt_w` (plan sign: + discharges)
+    from open-circuit `v_oc`. Discharge: V = V_oc - R*I with P = V*I; charge:
+    V = V_oc + R*I."""
+    v, p, r = float(v_oc), float(p_batt_w), float(r_ohm)
+    if r <= 0.0 or p == 0.0 or v <= 0.0:
+        return v
+    if p > 0.0:
+        disc = v * v - 4.0 * r * p
+        if disc <= 0.0:
+            return v / 2.0                      # past the maximum-power point; never reached at 12 kW
+        i = (v - disc ** 0.5) / (2.0 * r)
+        return v - r * i
+    i = (-v + (v * v + 4.0 * r * -p) ** 0.5) / (2.0 * r)
+    return v + r * i
+
+
 # THE SETTLEMENT EMULATES THE WRITER (2026-09-12). Every settled lane
 # (rolled_slices, the ladder's actual rung, the closed replay) runs the
 # actual step under the writer's insurance margin, so surplus sun above an
@@ -82,13 +170,35 @@ def clamp_write(standing_a: float | None, wanted_a: float,
     if lift and float(standing_a) < float(wanted_a):
         return float(wanted_a), True
     return float(standing_a), False
-# = config.json battery_charge_efficiency / battery_discharge_efficiency. The
-# virtual pack integrates through these on every settled step (settle_slice,
-# virtual_day, ab_walk), so like CAPACITY_KWH they must track what the LP plans
-# on, or the planned and the settled lanes model a different pack. Until
-# 2026-09-07 all three carried them as signature literals.
-ETA_C = float(PLANT["battery"]["eta_charge"])
-ETA_D = float(PLANT["battery"]["eta_discharge"])
+
+
+def setpoint_write(standing_a: float | None, wanted_a: float, deadband_a: float,
+                   baseline: float = 0.0) -> tuple[float, bool]:
+    """clamp_write for a register that is a SETPOINT rather than a ceiling: a
+    move to or from the baseline is always written (0 A to 15 A is inside a
+    20 A deadband but starves a grid charge the plan pays for), any other move
+    goes through the deadband."""
+    if standing_a is None:
+        return float(wanted_a), True
+    s, w = float(standing_a), float(wanted_a)
+    if abs(s - w) < 0.5:
+        return s, False                          # the register resolves to 1 A: nothing to write
+    at_base = abs(s - float(baseline)) < 0.5, abs(w - float(baseline)) < 0.5
+    if at_base[0] != at_base[1]:
+        return w, True
+    return clamp_write(s, w, deadband_a)
+
+
+def quantise_amps(a: float, step_a: float, up: bool) -> float:
+    """`a` on the writer's quantisation grid: UP (ceil) or DOWN (floor) to a
+    multiple of `step_a`. 0 A (hold the pack) and the nameplate pass through;
+    a value never goes below one step (down would turn a small sale into a
+    hold) nor above the nameplate."""
+    a, step = float(a), float(step_a)
+    if step <= DEYE_CURRENT_STEP_A or a <= 0.0 or a >= DEYE_CURRENT_MAX_A:
+        return a
+    q = -(-a // step) * step if up else (a // step) * step
+    return min(max(q, step), DEYE_CURRENT_MAX_A)
 
 
 # What a field costs if a dead controller leaves it standing. The registers latch
@@ -106,22 +216,20 @@ DEYE_TIER = {
     "microinverter_export_cut_off": "wasteful",
     "zero_export_power": "wasteful",
     "energy_pattern": "wasteful",
+    "grid_peak_shaving": "costly",                  # off + Export First is the sell recipe
+    "program_6_soc": "dangerous",                   # 100 keeps a grid charge alive
+    "program_6_power": "wasteful",                  # below nameplate it caps every sell
 }
 
 
-# The state that must survive a dead controller.
-DEYE_BASELINE = {
-    "work_mode": "Zero Export To CT",
-    "energy_pattern": "Load First",
-    "zero_export_power": 25.0,
-    "export_surplus": True,
-    "export_surplus_power": 14500.0,
-    "battery_max_charging_current": DEYE_CURRENT_MAX_A,
-    "battery_max_discharging_current": DEYE_CURRENT_MAX_A,
-    "battery_grid_charging": False,
-    "battery_grid_charging_current": 0.0,
-    "microinverter_export_cut_off": False,
-}
+# The state that must survive a dead controller. Zero Export To Load since the
+# go-live (2026-09-25): the external meter left with the supplier and the internal
+# CTs at the grid port match the fiscal meter to ~20 W. The three fields after
+# the cutoff are the registers the supplier used that the record did not carry:
+# peak shaving ON blocks every battery sale, program 6 SOC 100 is what makes
+# a grid charge happen, program 6 power below nameplate caps every sale.
+DEYE_BASELINE = dict(PLANT["baseline"], battery_max_charging_current=DEYE_CURRENT_MAX_A,
+                     battery_max_discharging_current=DEYE_CURRENT_MAX_A)
 
 
 def deye_amps(w: float, pack_v: float = DEYE_PACK_V) -> float:
@@ -138,10 +246,20 @@ def deye_amps(w: float, pack_v: float = DEYE_PACK_V) -> float:
     return min(a, DEYE_CURRENT_MAX_A)
 
 
+EXPORT_SHUT_SOC_PCT = 90.0      # export shuts only above this SOC, and only at a negative sell price
+
+
+def export_shuts(sell: float | None, soc_pct: float) -> bool:
+    """The site's export rule (2026-09-27): PV export goes off only when the all-in
+    sell price is negative AND the pack is above EXPORT_SHUT_SOC_PCT. An unknown
+    price is read as paying."""
+    return sell is not None and float(sell) < 0.0 and float(soc_pct) > EXPORT_SHUT_SOC_PCT
+
+
 def deye_command(p_grid_w: float, p_batt_w: float, pack_v: float = DEYE_PACK_V,
                  micro_cut: bool = False, target_soc: float | None = None,
                  pv_curtail_w: float = 0.0, sell: float | None = None,
-                 margin: bool = False) -> dict:
+                 margin: bool = False, soc_pct: float | None = None) -> dict:
     """One plan step compiled into the register vocabulary. p_batt_w follows the
     plan's sign: negative charges, positive discharges.
 
@@ -174,22 +292,18 @@ def deye_command(p_grid_w: float, p_batt_w: float, pack_v: float = DEYE_PACK_V,
     pack needs no insurance: the next half-hourly solve starts from its
     settled SOC.
 
-    `target_soc` is what a real writer would put in the TOU slot; settlement
-    (settle_step) never passes one, so in every settled lane the two discharge
-    intents run through deye_response's Export First branch (pack uncommanded,
-    the delta is zero) and its zero-export branch (the clamp above). The TOU
-    branch of deye_response is exercised only by the unit tests today.
+    `target_soc` is accepted for signature compatibility and IGNORED since the
+    go-live trials (2026-09-26): the pack is commanded by the discharge clamp
+    on a discharge, and by program 6 SOC 100 on a grid charge.
 
-    Two ORTHOGONAL axes, which is the thing an earlier version got wrong by
-    treating Export First as a battery command:
+    Two axes, both measured on the real inverter:
 
-      PV ROUTING     work_mode, export_surplus. Export First sends PV to the grid
-                     ahead of the pack, which is how a morning of falling prices
-                     is sold off while the pack is held empty for the cheap block.
-      BATTERY        grid charging with its current, or a TOU target SOC with a
-                     power cap, or nothing at all. Only this moves the pack.
-
-    They compose; the intents below are combinations, not alternatives.
+      PV ROUTING     work_mode, export_surplus, grid_peak_shaving. Export First
+                     sends PV to the grid ahead of the pack; with peak shaving
+                     OFF it also lets the pack sell.
+      BATTERY        grid charging with its current AND program 6 SOC 100, or
+                     the discharge clamp, or a zero charge clamp. Only these
+                     move the pack.
     """
     charging = p_batt_w < -DEYE_BATT_DEADBAND_W
     discharging = p_batt_w > DEYE_BATT_DEADBAND_W
@@ -229,8 +343,18 @@ def deye_command(p_grid_w: float, p_batt_w: float, pack_v: float = DEYE_PACK_V,
         # the clamp stays at nameplate. Only the LP's own decline is a
         # target: the headroom it leaves is a decision, the clamp holds the
         # plan's charge and carries the insurance margin.
-        export_pays = (sell is None or float(sell) > 0.0) and float(pv_curtail_w) <= 0.0
-        if export_pays and -p_grid_w > -p_batt_w:
+        #
+        # EXPORT SHUTS ONLY AT A NEGATIVE ALL-IN SELL PRICE WITH THE PACK ABOVE
+        # 90 % (2026-09-27). With the step's SOC known (the writer passes
+        # the plan's SOC_opt) that is the whole rule: below 90 % or at a price
+        # that is not negative, export stays on and the clamp opens, so the pack
+        # takes the sun first and only what it cannot take is sold. Without a
+        # SOC (settlement, replay) the rule above stands unchanged.
+        if soc_pct is None:
+            export_pays = (sell is None or float(sell) > 0.0) and float(pv_curtail_w) <= 0.0
+        else:
+            export_pays = not export_shuts(sell, soc_pct)
+        if export_pays and float(pv_curtail_w) <= 0.0 and -p_grid_w > -p_batt_w:
             cmd.update(export_surplus=True,
                        battery_max_charging_current=deye_amps(-p_batt_w, pack_v))
         elif export_pays:
@@ -246,24 +370,44 @@ def deye_command(p_grid_w: float, p_batt_w: float, pack_v: float = DEYE_PACK_V,
             cmd.update(export_surplus=False,
                        battery_max_charging_current=deye_amps(need, pack_v))
     elif intent == "grid_charge":
-        cmd.update(export_surplus=False, battery_grid_charging=True,
+        # THE TOU TARGET IS THE COMMAND (verified 2026-09-25 and 26): the switch
+        # and the current alone import nothing at 90 % SOC; with program 6 SOC
+        # at 100 the meter matched the twin to 2 W. Switch and current are the
+        # permission and the cap.
+        #
+        # THE GRID CURRENT IS A FLOOR, NOT A CEILING (measured 2026-09-27 under
+        # sun, 240 A clamp): at 60 A with ~125 A of surplus the pack took the
+        # whole surplus and the meter read +15 W; at 160 A with ~130 A of
+        # surplus the grid imported only the shortfall. So the charge clamp
+        # stays at nameplate: the plan's charge is the minimum, sun above
+        # the forecast is banked, not throttled ("7 kW is the minimum,
+        # more is always welcome").
+        #
+        # A GRID CHARGE KEEPS EXPORT ON (2026-09-27): the charge is bought
+        # for a later, higher price, while selling the sun the pack cannot take
+        # (a tapering pack near full) still pays now. Export shuts only under
+        # the negative-price rule. Without a SOC the old export-off stands.
+        cmd.update(export_surplus=(soc_pct is not None and not export_shuts(sell, soc_pct)),
+                   battery_grid_charging=True,
                    battery_grid_charging_current=deye_amps(-p_batt_w, pack_v),
-                   battery_max_charging_current=deye_amps(-p_batt_w, pack_v))
+                   battery_max_charging_current=DEYE_CURRENT_MAX_A,
+                   program_6_soc=100.0)
     elif intent in ("export", "self_supply"):
-        # A DISCHARGE IS NOT A WORK MODE (2026-09-06). Export First governs where
-        # PV is allowed to go; it does not command the pack. Reading it as
-        # "discharge at the clamp" put 12 to 17 kW on the meter where the 09-05
-        # replay measured a few hundred watts. The pack is commanded by a TOU
-        # slot: drive toward target_soc at up to power, which discharges above
-        # the target and charges below it.
-        cmd.update(battery_max_discharging_current=deye_amps(p_batt_w, pack_v),
-                   tou_target_soc=target_soc, tou_power_w=abs(float(p_batt_w)))
-        # UNVERIFIED, and the only lever here that is: discharging INTO the grid
-        # needs export permitted, and under Zero Export To CT the CT rule holds
-        # it to load. Export First is the candidate; bench-check it before the
-        # writer exists. self_supply needs no such permission.
-        cmd["work_mode" if intent == "export" else "export_surplus"] = (
-            "Export First" if intent == "export" else False)
+        # THE PACK IS COMMANDED BY THE DISCHARGE CLAMP (verified on the real
+        # inverter 2026-09-25 and 26). Under Export First with peak shaving OFF
+        # three levers all move the pack and the smallest wins: the sell
+        # setpoint (export_surplus_power, a GRID setpoint), the discharge clamp
+        # (a PACK setpoint, 97 A of 100 delivered) and the TOU slot power (a
+        # PACK cap). The clamp is the one the record uses: it is what the plan's
+        # P_batt means, and it puts the load error on the meter, where the
+        # settlement's delta already books it. The other two stay wide open.
+        # With peak shaving ON the inverter sells NOTHING from the pack, so the
+        # export intent turns it off and the baseline turns it back on.
+        cmd.update(battery_max_discharging_current=deye_amps(p_batt_w, pack_v))
+        if intent == "export":
+            cmd.update(work_mode="Export First", grid_peak_shaving=False)
+        else:
+            cmd["export_surplus"] = False
     elif intent == "pv_export":
         # Sell PV now, bank nothing: hold the pack with a ZERO CHARGE CLAMP and
         # let the surplus leave. Deliberately NOT Export First (2026-09-06):
@@ -271,7 +415,15 @@ def deye_command(p_grid_w: float, p_batt_w: float, pack_v: float = DEYE_PACK_V,
         # standing merely fails to charge, while Export First is costly-tier and
         # would sell into a negative price. It also keeps a register whose exact
         # semantics we have not bench-verified off the common path.
-        cmd.update(battery_max_charging_current=0.0, export_surplus=True)
+        #
+        # AN IDLE STEP RESTS THE PACK (2026-09-27). The zero charge clamp
+        # alone left the discharge clamp at 240 A, so at night Zero Export To
+        # Load ran the house (and a little export) off the pack through steps
+        # the plan held idle: 1,6 kW mean on 09-27 21:10-21:50, the round trip
+        # the LP had declined. A zero discharge clamp holds it (-10 W measured
+        # 09-26); a dead writer leaving it standing merely imports (wasteful).
+        cmd.update(battery_max_charging_current=0.0, battery_max_discharging_current=0.0,
+                   export_surplus=True)
     # A STEP THAT DECLINES SUN IS A ZERO-EXPORT STEP (2026-09-07). The intent
     # table above reads an idle battery as "sell the sun" and lifts the CT rule,
     # so on a full-pack negative-price afternoon the base run exported what the
@@ -281,7 +433,9 @@ def deye_command(p_grid_w: float, p_batt_w: float, pack_v: float = DEYE_PACK_V,
     # pays when export does not - so any planned curtailment means the strings
     # are to be held to the sink, whatever the battery does. The gen port still
     # spills past the CT rule, exactly as deye_response models it.
-    if float(pv_curtail_w) > 0:
+    # With the step's SOC known, the site's export rule (2026-09-27) overrides this:
+    # the strings are held to the sink only at a negative price above 90 %.
+    if float(pv_curtail_w) > 0 and (soc_pct is None or export_shuts(sell, soc_pct)):
         cmd["export_surplus"] = False
     cmd["intent"] = intent
     cmd["tier"] = DEYE_TIER
@@ -309,7 +463,9 @@ def deye_response(cmd: dict, main_pot_w: float, micro_w: float, load_w: float, s
                   capacity_kwh: float = CAPACITY_KWH, pack_v: float = DEYE_PACK_V) -> dict:
     """The virtual Deye: what the inverter does with that command, given the sun,
     the load and the pack. Returns batt_w (plan sign), grid_w (+ = import),
-    pv_main_w, curtail_main_w, curtail_micro_w.
+    pv_main_w, curtail_main_w, curtail_micro_w. Every branch was measured on
+    the real inverter on 2026-09-25 and 26 (an internal design note); the zero-export branch models both Zero Export To CT
+    and Zero Export To Load, which differ only in where the CT sits.
 
     This is the settlement. The lane it replaces computed the grid as the plan's
     own P_grid plus the forecast errors, which books every error to the meter;
@@ -329,22 +485,34 @@ def deye_response(cmd: dict, main_pot_w: float, micro_w: float, load_w: float, s
     charge_cap = float(cmd["battery_max_charging_current"]) * pack_v
     disch_cap = float(cmd["battery_max_discharging_current"]) * pack_v
 
-    if cmd.get("battery_grid_charging"):
-        charge = min(float(cmd["battery_grid_charging_current"]) * pack_v, charge_cap, headroom)
-        discharge, pv_main = 0.0, main_pot
-    elif cmd.get("tou_target_soc") is not None:
-        # Drive toward the target at up to the slot's power, in whichever
-        # direction the pack happens to be on. The cap applies to both.
-        want = (float(soc) - float(cmd["tou_target_soc"])) * step_w
-        # `or` would turn a deliberate 0 W - hold the pack where it is, which is
-        # what the sell-the-morning intent asks for - into the full clamp.
-        tp = cmd.get("tou_power_w")
-        cap = min(float(tp) if tp is not None else disch_cap, disch_cap)
-        discharge = min(cap, floor, max(0.0, want))
-        charge = min(cap, charge_cap, headroom, max(0.0, -want))
-        pv_main = main_pot
+    gc_target = float(cmd.get("program_6_soc", 5.0)) / 100.0
+    if cmd.get("battery_grid_charging") and gc_target > float(soc):
+        # The switch and the current are permission and cap; the TOU target
+        # decides whether the pack wants charge at all (2026-09-25: 40 A with
+        # the target at 5 % imported nothing at 90 % SOC).
+        # The grid current is a FLOOR (2026-09-27, under sun): the pack takes
+        # the larger of it and the PV surplus, up to the charge clamp. With
+        # export off the CT rule throttles the strings to what the pack and
+        # the house take.
+        surplus = micro + main_pot - load
+        charge = min(charge_cap, headroom,
+                     max(float(cmd["battery_grid_charging_current"]) * pack_v, surplus))
+        discharge = 0.0
+        if cmd.get("export_surplus"):
+            pv_main = main_pot
+        else:
+            pv_main = min(main_pot, max(0.0, load + charge - micro))
     elif cmd.get("work_mode") == "Export First":
-        charge = discharge = 0.0            # PV may export; the pack is uncommanded
+        # MEASURED 2026-09-25/26. The pack follows the smallest of three levers:
+        # the sell setpoint (grid), the discharge clamp (pack) and the TOU slot
+        # power (pack). With peak shaving ON the pack only covers the house.
+        # PV beyond load + setpoint charges the pack.
+        pv_ac = main_pot + micro
+        setp = float(cmd.get("export_surplus_power", 14500.0))
+        tou_cap = float(cmd.get("program_6_power", 12000.0))
+        want = max(0.0, (load - pv_ac) if cmd.get("grid_peak_shaving", True) else (setp + load - pv_ac))
+        discharge = min(disch_cap, tou_cap, floor, want)
+        charge = min(charge_cap, headroom, max(0.0, pv_ac - load - setp))
         pv_main = main_pot
     else:
         surplus = micro + main_pot - load
@@ -431,7 +599,7 @@ def settle_step(plan_grid_w: float, plan_batt_w: float, plan_pv_w: float, plan_l
 
 
 def soc_dwell_h(soc_pct, threshold_pct: float = 95.0) -> float:
-    """Hours a settled SOC lane spends at or above `threshold_pct` (the site rule,
+    """Hours a settled SOC lane spends at or above `threshold_pct` (
     2026-09-08): the cost side of front-loading, counted wherever a settled
     lane exists. None steps do not count."""
     return round(sum(1 for v in soc_pct if v is not None and float(v) >= threshold_pct) * STEP_H, 2)

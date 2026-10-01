@@ -60,8 +60,9 @@ def iter_organic_plans(archive_dir: str, since: datetime | None = None,
     whole of yesterday's virtual lane was being served by a single plan stamped
     two days earlier, with all 21 of that day's hourly re-plans passed over):
 
-      - ORDER. list_plans sorts by FILENAME, and replay_plan deliberately breaks
-        the correspondence between filename and plan_ts: it archives a re-solve
+      - ORDER. list_plans sorts by FILENAME, and replay_plan (retired
+        2026-09-27; its docs stay in the archive) broke the correspondence
+        between filename and plan_ts: it archived a re-solve
         under today's name while keeping the source plan's own pre-midnight
         plan_ts, so plan_for_day picks it as the record. Any first-match-wins
         scan that reads filename order AS plan_ts order therefore hands a replay
@@ -104,8 +105,8 @@ def plan_heads(archive_dir: str) -> list[tuple[str, dict]]:
     a caller loads just the candidates it actually tests.
 
     Ordering by plan_ts rather than filename is the point. list_plans sorts by
-    FILENAME, and replay_plan deliberately breaks the correspondence: it
-    archives a re-solve under today's name while keeping the source plan's own
+    FILENAME, and the retired replay_plan broke the correspondence: it
+    archived a re-solve under today's name while keeping the source plan's own
     pre-midnight plan_ts, so the replay becomes the record for the day it
     replays. The tie-break keeps a replay ahead of the plan it re-solved, which
     is what the harness is for, while a genuinely newer plan still outranks it.

@@ -52,9 +52,9 @@ solve cannot produce the default grid-charging plan.
 | `sensor_replace_zero`, `sensor_linear_interp` | the same names | the recorder cleaning lists; keep them equal to the above |
 | `var_model` | `sensor.inverter_load_ups_power` | the load sensor the ML forecaster fits on (same as the load) |
 
-The same names appear in `ENTITIES` at the top of `ha/pyscript/emhass_shadow.py`
-and in the header of each `ha/packages/emhass/*.yaml`. Rename them in all
-three places.
+The same names appear in `entities` in your `plant.json` (which both
+pyscript wrappers read) and, for a few of them, hard-coded in the package
+YAML (`ha/README.md`, "The entity map"). Rename them in all three places.
 
 ## Keys the runtime payload overrides (dead in this file)
 
@@ -85,7 +85,7 @@ give byte-identical objectives).
 - `load_forecast_method: naive` until day 10, then `mlforecaster` (the ML
   keys below it: KNN, `num_lags` 96 in the file; the fit and tune services
   post 288, see the comment on `ML` in `emhass_shadow.py`).
-- `number_of_deferrable_loads: 0` and the empty deferrable lists: the shadow
-  EMS has no controllable loads.
+- `number_of_deferrable_loads: 0` and the empty deferrable lists: the
+  planner has no controllable loads.
 - `data_path` and `heat_topology` are never echoed by `/get-config`; the drift
   check ignores their absence.

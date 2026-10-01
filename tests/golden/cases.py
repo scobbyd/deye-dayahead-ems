@@ -175,16 +175,16 @@ def rehydrate_0907(core):
     now = NOW_0907
     act = F.actuals_for_day(core, now.date(), core._slot(now))
     prev = F.actuals_for_day(core, now.date() - timedelta(days=1))
-    out = core.rehydrate(F.PLANS, F.SCORES, F.TZ, now.isoformat(), 26.0, act.get("pv_w"), act.get("load_w"),
+    out = core.rehydrate(F.PLANS, F.TZ, now.isoformat(), 26.0, act.get("pv_w"), act.get("load_w"),
                          prev.get("pv_w"), prev.get("load_w"), act.get("curtailed"), prev.get("curtailed"),
                          act.get("pv_peak_w"), prev.get("pv_peak_w"), act.get("micro_w"), prev.get("micro_w"))
     # the today slice after a restart is the same slice the plan path serves
     out["same_as_rolled"] = out["today"] == _rolled(core, now)["today"] and out["yesterday"] == _rolled(core, now)["yesterday"]
-    out["stale"] = core.rehydrate(F.PLANS, F.SCORES, F.TZ, F.local(2026, 9, 9).isoformat(), 26.0)["plan_fresh"]
+    out["stale"] = core.rehydrate(F.PLANS, F.TZ, F.local(2026, 9, 9).isoformat(), 26.0)["plan_fresh"]
     return out
 
 
-# ---- pv repair and scoring -----------------------------------------------------------
+# ---- pv repair and settlement -----------------------------------------------------------
 
 @case
 def pv_potential_0905(core):
@@ -202,45 +202,6 @@ def pv_potential_0905(core):
     out["length_mismatch"] = list(core.pv_potential(act["pv_w"][:10], fc, act["curtailed"]))
     out["effective_load"] = core.effective_load(act["grid_w"], act["batt_dc_w"], act["pv_w"])
     return out
-
-
-def _score_inputs(core, day, hindsight=None):
-    act = F.actuals_for_day(core, day)
-    return _record(core, day), F.realised_for_day(act), act, hindsight
-
-
-@case
-def score_row_0905(core):
-    plan, realised, act, _ = _score_inputs(core, date(2026, 9, 5))
-    out = {}
-    for name, hs in (("no_hindsight", None), ("ok", {"status": "ok", "eur": -9.1234}),
-                     ("pending", {"status": "pending_horizon", "eur": None}),
-                     ("failed", {"status": "solve_failed", "eur": None})):
-        out[name] = core.score_row(date(2026, 9, 5), plan, realised, 48.2, 0.9, hs, act)
-    r2 = dict(realised, cash_eur=-6.7785)
-    out["with_meter"] = core.score_row(date(2026, 9, 5), plan, r2, 48.2, 0.9, None, act)
-    out["with_meter_drift"] = core.score_row(date(2026, 9, 5), plan, dict(realised, cash_eur=-2.0), 48.2, 0.9, None, act)
-    out["no_actuals"] = core.score_row(date(2026, 9, 5), plan, realised, 48.2, 0.9, None, None)
-    out["no_plan"] = core.score_row(date(2026, 9, 5), None, realised, 48.2, 0.9, None, act)
-    return out
-
-
-@case
-def score_row_0906(core):
-    plan, realised, act, _ = _score_inputs(core, date(2026, 9, 6))
-    return core.score_row(date(2026, 9, 6), plan, realised, 48.2, 0.9, None, act)
-
-
-@case
-def score_row_0903_replay_record(core):
-    plan, realised, act, _ = _score_inputs(core, date(2026, 9, 3))
-    return {"plan_ts": plan["plan_ts"], "row": core.score_row(date(2026, 9, 3), plan, realised, 48.2, 0.9, None, act)}
-
-
-@case
-def score_row_0904(core):
-    plan, realised, act, _ = _score_inputs(core, date(2026, 9, 4))
-    return core.score_row(date(2026, 9, 4), plan, realised, 48.2, 0.9, None, act)
 
 
 @case
@@ -265,49 +226,8 @@ def replay_day_0905(core):
             "raw_plan": core.replay_day(plan, act["grid_w"], act["batt_dc_w"], act["pv_w"], 48.2, lam),
             "raw_plan_pot": core.replay_day(plan, act["grid_w"], act["batt_dc_w"], act["pv_w"], 48.2, lam, pv_pot_w=pot),
             "no_actuals": core.replay_day(plan, None, act["batt_dc_w"], act["pv_w"], 48.2, lam),
-            "planned_cost": core.planned_cost(plan, 48.2, lam),
             "cash_in_frame": core.cash_in_frame(act["grid_w"], plan["buy"], plan["sell"])}
 
-
-@case
-def scores_csv(core):
-    rows = core.read_scores(F.SCORES)
-    d = tempfile.mkdtemp(prefix="emhass-golden-")
-    try:
-        p = os.path.join(d, "scores.csv")
-        shutil.copy(F.SCORES, p)
-        new = dict(rows[-1], date="2026-09-07", gap_eur=0.5, flags="")
-        after = core.upsert_score(p, new)
-        with open(p) as f:
-            text = f.read()
-        re_read = core.read_scores(p)
-        missing = core.read_scores(os.path.join(d, "none.csv"))
-    finally:
-        shutil.rmtree(d, ignore_errors=True)
-    return {"rows": rows, "rolling": core.rolling(rows), "rolling_3": core.rolling(rows, days=3),
-            "scoreboard": [core.scoreboard_row(r) for r in rows], "upsert": after, "csv_text": text,
-            "re_read": re_read, "missing": missing}
-
-
-@case
-def score_day_0905(core):
-    d = tempfile.mkdtemp(prefix="emhass-golden-")
-    try:
-        p = os.path.join(d, "scores.csv")
-        shutil.copy(F.SCORES, p)
-        plan, realised, act, _ = _score_inputs(core, date(2026, 9, 5))
-        first = core.score_day(F.PLANS, p, "2026-09-05", F.TZ, realised, 48.2, 0.9, None, act)
-        # rescoring with nothing new keeps the old hindsight and the old meter figure
-        second = core.score_day(F.PLANS, p, "2026-09-05", F.TZ, {"cash_eur": None}, 48.2, 0.9,
-                                {"status": "solve_failed", "eur": None}, act)
-        pending = core.score_day(F.PLANS, p, "2026-09-05", F.TZ, realised, 48.2, 0.9,
-                                 {"status": "pending_horizon", "eur": None}, act)
-    finally:
-        shutil.rmtree(d, ignore_errors=True)
-    return {"first": first, "second": second, "pending": pending}
-
-
-# ---- the plan run, against the stub ----------------------------------------------------
 
 def _plan_inp(core, now, archive, dry_run=True, days_ahead=2, ese=True, load=True, **extra):
     """run_plan's input dict for `now`, the sun taken from the newest archived
@@ -472,54 +392,6 @@ def hindsight_day_0906_window_open(core):
     return {"window": None if win is None else {k: len(v) for k, v in win.items()}, "t0": t0, "n": n}
 
 
-@case
-def replay_plan_0905(core):
-    with F.tmp_archive() as arch:
-        stub = F.StubSolver(F.local(2026, 9, 7, 14, 45))
-        tariff = {"energy_tax": 0.0, "supplier_fee": 0.019, "btw_pct": 21.0, "feedin_fee": 0.019}
-        with F.patched_solve(core.replay_plan, stub):
-            ok = core.replay_plan(arch, "http://stub", "2026-09-05", F.TZ, tariff, F.load_days(core, date(2026, 9, 5)), 48.2, 0.9)
-            again = core.replay_plan(arch, "http://stub", "2026-09-05", F.TZ, tariff, F.load_days(core, date(2026, 9, 5)), 48.2, 0.9)
-            short = core.replay_plan(arch, "http://stub", "2026-09-03", F.TZ, tariff, F.load_days(core, date(2026, 9, 3)), 48.2, 0.9)
-            none = core.replay_plan(arch, "http://stub", "2026-09-10", F.TZ, tariff, F.load_days(core, date(2026, 9, 5)), 48.2, 0.9)
-        fixture_names = set(os.listdir(F.PLANS))
-        assert os.path.basename(ok["archive_path"]) not in fixture_names, "replay overwrote a fixture document"
-        doc = core.load_plan(ok["archive_path"])
-        doc2 = core.load_plan(again["archive_path"])
-        after = {"plan_for_day": _sel(core.plan_for_day(arch, date(2026, 9, 5), F.TZ)),
-                 "original": core.original_plan_for_day(arch, date(2026, 9, 5), F.TZ)["plan_ts"],
-                 "plan_for_day_0906": _sel(core.plan_for_day(arch, date(2026, 9, 6), F.TZ)),
-                 "organic_0905": [d["plan_ts"] for d in core.iter_organic_plans(arch, since=F.local(2026, 9, 5), until=F.local(2026, 9, 5, 1))],
-                 "virtual_soc_midnight_0906": list(core.virtual_soc_at(arch, F.local(2026, 9, 6)))}
-        # the replay doc's archive name is stamped with the wall clock; the doc itself is deterministic
-        for o in (ok, again):
-            o["archive_path"] = "<wall-clock>"
-    posted = [{k: v for k, v in p.items() if not isinstance(v, list)} for p in stub.calls]
-    return {"ok": ok, "again": again, "short_history": short, "no_plan": none, "doc": doc,
-            "doc_identical_second_time": doc == doc2, "after": after, "posted": posted}
-
-
-@case
-def replay_plan_0905_knobs(core):
-    """The replay under the live knob layer: terminal 0,7, a 0,9 target at 16:00,
-    twice the stress, a 6 kW cap. The archived document carries the knobs."""
-    kn = {k: None for k in core.LIVE_KNOBS}
-    kn.update(soc_final=0.7, soc_target=0.9, soc_target_at="16:00", stress_scale=2.0, batt_power_max_w=6000.0,
-              surplus_base=0.01, pv_p10_mix=0.6)
-    with F.tmp_archive() as arch:
-        stub = F.StubSolver(F.local(2026, 9, 7, 14, 45))
-        tariff = {"energy_tax": 0.0, "supplier_fee": 0.019, "btw_pct": 21.0, "feedin_fee": 0.019}
-        with F.patched_solve(core.replay_plan, stub):
-            ok = core.replay_plan(arch, "http://stub", "2026-09-05", F.TZ, tariff, F.load_days(core, date(2026, 9, 5)),
-                                  48.2, 0.9, 180, kn)
-        doc = core.load_plan(ok["archive_path"])
-        ok["archive_path"] = "<wall-clock>"
-    return {"ok": ok, "doc_knobs": doc["knobs"], "doc_soc_final": doc["soc_final"],
-            "payload": _pay_summary(doc["payload"]), "posted": [{k: v for k, v in p.items() if not isinstance(v, list)} for p in stub.calls]}
-
-
-# ---- A/B -----------------------------------------------------------------------------------------
-
 def _pay_summary(p):
     return {k: v for k, v in p.items() if not isinstance(v, list)} | {"lists": {k: (len(v), round(sum(float(x) for x in v), 3)) for k, v in p.items() if isinstance(v, list)}}
 
@@ -661,6 +533,75 @@ def deye_table(core):
 
 
 @case
+def writer_table(core):
+    """The writer's pure functions over the command grid: the hold rule, the
+    diff against four standing states, the write order, and a tick in each
+    mode."""
+    now = F.local(2026, 9, 27, 10, 30, 20)
+    out = {"constants": {"fields": list(core.WRITER_FIELDS), "restore": list(core.RESTORE_ORDER),
+                         "never": list(core.WRITER_NEVER), "entity": core.WRITER_ENTITY,
+                         "stale_min": core.WRITER_STALE_MIN},
+           "held": [], "diffs": [], "ticks": []}
+    grid = [(g, b, c, mc, s) for g in (-3000.0, 0.0, 2500.0) for b in (-6000.0, 0.0, 4000.0)
+            for c in (0.0, 1500.0) for mc in (False, True) for s in (-0.01, 0.08)]
+    cmds = [core.deye_command(g, b, 51.2, micro_cut=mc, pv_curtail_w=c, sell=s, margin=True) for g, b, c, mc, s in grid]
+    for i, cur in enumerate(cmds):
+        nxt = cmds[(i * 7 + 3) % len(cmds)]
+        rec, held = core.held_record(cur, nxt)
+        out["held"].append({"cur": cur["intent"], "next": nxt["intent"], "held": held, "record": core.off_baseline(rec)})
+    base = {f: core.DEYE_BASELINE[f] for f in core.WRITER_FIELDS}
+    standings = {"baseline": base,
+                 "export": {f: cmds[grid.index((-3000.0, 4000.0, 0.0, False, 0.08))][f] for f in core.WRITER_FIELDS},
+                 "grid_charge": {f: cmds[grid.index((2500.0, -6000.0, 0.0, False, 0.08))][f] for f in core.WRITER_FIELDS},
+                 "clamped": dict(base, battery_max_charging_current=118.0, export_surplus=False),
+                 "strings": dict(base, export_surplus="on", battery_grid_charging="off", battery_max_charging_current="240.0")}
+    for name, st in standings.items():
+        for cmd in cmds:
+            d = core.writer_diff(st, cmd)
+            out["diffs"].append({"standing": name, "intent": cmd["intent"], "diff": d, "writes": core.order_writes(d)})
+
+    def row(g, b, c=0.0, s=0.08):
+        return {"timestamp": "2026-09-27T08:30:00.000Z", "P_grid": g, "P_batt": b, "P_PV_curtailment": c, "unit_prod_price": s}
+    steps = {"export_held": {"row": row(-9000.0, 8000.0), "next_row": row(0.0, -5000.0), "micro_cut": False, "next_micro_cut": False, "stale": False},
+             "export": {"row": row(-9000.0, 8000.0), "next_row": row(-6000.0, 5000.0), "micro_cut": False, "next_micro_cut": False, "stale": False},
+             "grid_charge": {"row": row(2000.0, -6000.0), "next_row": row(2000.0, -6000.0), "micro_cut": False, "next_micro_cut": False, "stale": False},
+             "cut": {"row": row(0.0, -5000.0, 800.0, -0.01), "next_row": row(0.0, -5000.0, 800.0, -0.01), "micro_cut": True, "next_micro_cut": True, "stale": False},
+             "stale": {"row": row(-9000.0, 8000.0), "next_row": row(-9000.0, 8000.0), "micro_cut": False, "next_micro_cut": False, "stale": True},
+             "none": None}
+    for name, step in steps.items():
+        if step:
+            step = dict(step, plan_ts="2026-09-27T10:13:00+02:00", t0="2026-09-27T10:15:00+02:00", n=8, index=0)
+        for mode in ("off", "dry", "live"):
+            for sname, st in standings.items():
+                for pv in (51.2, None):
+                    doc = core.writer_tick(mode, st, step, pv, now, {"work_mode": 1})
+                    out["ticks"].append({"step": name, "mode": mode, "standing": sname, "pack_v": pv, "doc": doc})
+    export_step = dict(steps["export"], plan_ts="2026-09-27T10:13:00+02:00", t0="2026-09-27T10:15:00+02:00", n=8, index=0)
+    out["fold"] = core.fold_writes(core.writer_tick("live", base, export_step, 51.2, now),
+                                   [("battery_max_discharging_current", 156.0, 4.2), ("work_mode", "Export First", None)])
+    return out
+
+
+@case
+def writer_day_0905(core):
+    """96 live-mode ticks over the 09-05 archive with the standing state
+    following the writes: the intent per step, the holds, the writes and the
+    counters. This is what the dry day on the VM is compared against."""
+    standing = {f: core.DEYE_BASELINE[f] for f in core.WRITER_FIELDS}
+    counts, ticks = {}, []
+    for q in range(96):
+        now = F.local(2026, 9, 5, 0, 0, 20) + timedelta(minutes=15 * q)
+        # the 09-05 archive is hourly, so the staleness threshold is 75 min here
+        doc = core.writer_tick("live", standing, core.step_in_force(F.PLANS, now, stale_min=75.0), 51.2, now, counts)
+        doc = core.fold_writes(doc, [(f, v, 1.0) for f, v in doc["writes"]])
+        for f, v in doc["writes"]:
+            standing[f] = v
+        counts = doc["write_counts"]
+        ticks.append({k: doc[k] for k in ("tick_ts", "plan_ts", "intent", "next_intent", "held", "record", "writes", "status")})
+    return {"ticks": ticks, "write_counts": counts, "standing_at_end": standing}
+
+
+@case
 def inputs_table(core):
     doc = core.load_plan(os.path.join(F.PLANS, "20260907T143500.json.gz"))
     t0, n = core.horizon(NOW_0907, F.TZ, days_ahead=2)
@@ -709,7 +650,7 @@ def inputs_table(core):
         "aux_cut": [core.aux_cut_decision(c, a, act) for c in (0.0, 1.9, 2.0, 3.0, 12.0) for a in (0.0, 1.0, 2.0, 8.0) for act in (False, True)],
         "cost": [core.step_cost(g, 0.3, 0.1) for g in (1000.0, -1000.0, 0.0)],
         "score_terms": {"lambda": core.lambda_for([0.1, 0.2, 0.3], 0.9), "lambda_empty": core.lambda_for([], 0.9),
-                        "soc_term": core.soc_term(60.0, 40.0, 48.2, 0.1), "r2": [core._r2(None), core._r2(1.005)]},
+                        "soc_term": core.soc_term(60.0, 40.0, 48.2, 0.1)},
         "holds": [core.addon_holds_plan(a, b) for a, b in ((F.LAST_RUN, F.LAST_RUN), (F.LAST_RUN, dict(F.LAST_RUN, timestamp="2026-09-07T12:00:00+00:00")),
                                                             (F.LAST_RUN, dict(F.LAST_RUN, timestamp="2026-09-07T12:00:01Z")), (None, F.LAST_RUN),
                                                             (F.LAST_RUN, dict(F.LAST_RUN, action="publish-data")), ({"timestamp": "x"}, F.LAST_RUN))],
@@ -718,12 +659,12 @@ def inputs_table(core):
                      "0907_whole": {k: len(v) for k, v in F.actuals_for_day(core, date(2026, 9, 7)).items()}},
         "window": F.window_actuals(core, F.local(2026, 9, 4, 23, 15), 195),
         "window_gaps": core.window_series(F.local(2026, 9, 7, 14, 0), 8, F.raw_stats()[F.ENT["pv_w"]], 4)[1],
-        "constants": {k: getattr(core, k) for k in ("STEP_MIN", "STEP_H", "CAPACITY_KWH", "MAX_PV_GAPS", "ETA_BRIDGE", "GRID_CAP_W", "METER_DRIFT_EUR",
+        "constants": {k: getattr(core, k) for k in ("STEP_MIN", "STEP_H", "CAPACITY_KWH", "MAX_PV_GAPS", "ETA_BRIDGE", "GRID_CAP_W",
                                                     "SOC_MIN", "SOC_MAX", "SOC_FINAL_TARGET", "GROWATT_SHARE", "PV_P10_MIX", "AUX_CUT_ON_RATIO",
                                                     "AUX_CUT_ON_MIN_KWH", "AUX_CUT_OFF_RATIO", "AUX_CUT_OFF_MIN_KWH", "LOAD_REF_DAYS",
                                                     "LOAD_MIN_REF_DAYS", "LOAD_MIX_ALPHA", "Q_PORT", "Q_BRIDGE", "P_NOM_BATT_KW", "P_NOM_INV_KW",
                                                     "SURPLUS_BASE", "DEFICIT_BASE", "REBALANCE_TARGET_DAYS", "REBALANCE_PULL", "REBALANCE_FULL_LEVEL",
-                                                    "ARCHIVE_SUFFIX", "PV_CURTAIL_SOC_PCT", "PV_DAYLIGHT_W", "SCORE_COLUMNS", "PUBLISH_MAP",
+                                                    "ARCHIVE_SUFFIX", "PV_CURTAIL_SOC_PCT", "PV_DAYLIGHT_W", "PUBLISH_MAP",
                                                     "OMITTED_CONFIG_KEYS", "LIVE_KNOBS")}
                      | {"ARCHIVE_REACH_s": core.ARCHIVE_REACH.total_seconds()},
     }
@@ -775,10 +716,9 @@ def _rolled_syn(core, now, act):
 def syn_score_dst(core):
     act = _syn_actuals()
     day = date(2026, 10, 25)
-    plan = _record(core, day, F.SYN_PLANS)
+    # The score_row lane of this case retired with the scoreboard (2026-09-27).
     cut = core.compact_slice(*reversed(core.newest_plan_for_day(F.SYN_PLANS, day, F.TZ)))
-    return {"row": core.score_row(day, plan, F.realised_for_day(act), 48.2, 0.9, {"status": "ok", "eur": -3.0}, act),
-            "cut_slice": cut, "settled_cut": core.settle_slice(cut, act["pv_w"], act["load_w"], act["micro_w"]),
+    return {"cut_slice": cut, "settled_cut": core.settle_slice(cut, act["pv_w"], act["load_w"], act["micro_w"]),
             "ab_solves": {str(c): [(t.isoformat(), d["plan_ts"], s) for t, d, s in core._ab_solves(F.SYN_PLANS, day, F.TZ, c)] for c in (60, 15)}}
 
 
@@ -808,10 +748,6 @@ def foreign_solve_refused(core):
     with F.patched_solve(core.hindsight_day, longer(F.local(2026, 9, 7, 14, 45))):
         out["hindsight"] = core.hindsight_day(F.PLANS, "http://stub", "2026-09-05", F.TZ, np_rows, win,
                                               F.actuals_for_day(core, day), 48.2, 0.9)
-    with F.tmp_archive() as arch, F.patched_solve(core.replay_plan, longer(F.local(2026, 9, 7, 14, 45))):
-        tariff = {"energy_tax": 0.0, "supplier_fee": 0.019, "btw_pct": 21.0, "feedin_fee": 0.019}
-        out["replay"] = core.replay_plan(arch, "http://stub", "2026-09-05", F.TZ, tariff, F.load_days(core, day), 48.2, 0.9)
-        out["replay_left_no_doc"] = sorted(os.listdir(arch)) == sorted(os.listdir(F.PLANS))
     return out
 
 
@@ -820,18 +756,6 @@ def virtual_day_unreached(core):
     """A day the archive does not reach: the chain is broken and virtual_day says so."""
     return {"0910": _vd(core, date(2026, 9, 10), F.local(2026, 9, 11)),
             "0901": _vd(core, date(2026, 9, 1), F.local(2026, 9, 2), F.actuals_for_day(core, date(2026, 9, 2)))}
-
-
-@case
-def score_row_flag_table(core):
-    """The flags no fixture day produces on its own: not_optimal, pv_gaps, no_soc,
-    and an UNSETTLED row (no measured load, so settle_slice stands down)."""
-    plan, realised, act, _ = _score_inputs(core, date(2026, 9, 5))
-    bad = dict(plan, optim_status="Infeasible", pv_gap_steps=3)
-    out = {"not_optimal_gaps": core.score_row(date(2026, 9, 5), bad, realised, 48.2, 0.9, None, act),
-           "no_soc": core.score_row(date(2026, 9, 5), plan, dict(realised, soc_start_pct=None, soc_end_pct=None), 48.2, 0.9, None, act),
-           "unsettled": core.score_row(date(2026, 9, 5), plan, realised, 48.2, 0.9, None, {k: v for k, v in act.items() if k != "load_w"})}
-    return out
 
 
 @case
@@ -873,7 +797,7 @@ def addon_health(core):
     reads the wall clock and is masked."""
     import json as _json
     import emhasscore.addon as addon
-    cfg_path = os.path.join(os.path.dirname(os.path.dirname(F.ROOT)), "ha", "config.json")     # the add-on config shipped with the HA side
+    cfg_path = os.path.join(os.path.dirname(os.path.dirname(F.ROOT)), "config.json")     # ha/config.json
     with open(cfg_path) as f:
         cfg = _json.load(f)
     answers = {}

@@ -1,0 +1,305 @@
+# Energy package - EMHASS writer: the plan drives the real Deye.
+#
+# pyscript/emhass_writer.py ticks every quarter hour (+20 s), compiles the plan
+# step in force and writes the register record in live mode. This file is the
+# part that needs no Python: the mode helper, the baseline script (the kill
+# switch, restore order: dangerous first), and two safety automations that
+# watch the writer's heartbeat. The registers latch and the inverter has no
+# comms-loss timeout, so a dead controller must be undone from here.
+# Spec: an internal design note
+#
+# No initial: on the helpers (a reboot would flip them); seeded by
+# ha/scripts/seed_helpers.sh.
+#
+# THE ARMING SWITCH. input_boolean.emhass_writer_armed off means nothing here
+# or in the pyscript writer touches the inverter: every automation below that
+# writes carries it as a condition, and the writer reads every mode as dry and
+# writes nothing. Without initial: a fresh install starts disarmed; arm it by
+# hand once plant.json and the baseline script below describe your pack.
+
+input_boolean:
+  emhass_writer_armed:
+    name: EMHASS writer armed
+    icon: mdi:shield-key
+
+input_select:
+  emhass_writer_mode:
+    name: EMHASS writer mode
+    # dry first: a fresh install (no restored state) starts writing nothing;
+    # off is not a resting state, it enforces the baseline every tick
+    options:
+      - dry
+      - "off"
+      - live
+    icon: mdi:pencil-lock
+
+script:
+  # THE KILL SWITCH. Restore order = emhasscore/writer.py RESTORE_ORDER: the
+  # TOU command and the grid-charge permission first (either alone stops an
+  # import), the cap, then the sale (work mode, peak shaving), then the
+  # wasteful fields. continue_on_error so one unavailable entity does not
+  # stop the rest. A test pins this sequence to the core's order and values.
+  emhass_deye_baseline:
+    alias: "EMHASS - Deye baseline (kill switch)"
+    mode: single
+    icon: mdi:shield-refresh
+    sequence:
+      - action: number.set_value
+        continue_on_error: true
+        target:
+          entity_id: number.inverter_program_6_soc
+        data:
+          value: 5
+      - action: switch.turn_off
+        continue_on_error: true
+        target:
+          entity_id: switch.inverter_battery_grid_charging
+      - action: number.set_value
+        continue_on_error: true
+        target:
+          entity_id: number.inverter_battery_grid_charging_current
+        data:
+          value: 0
+      - action: select.select_option
+        continue_on_error: true
+        target:
+          entity_id: select.inverter_work_mode
+        data:
+          option: Zero Export To Load
+      - action: switch.turn_on
+        continue_on_error: true
+        target:
+          entity_id: switch.inverter_grid_peak_shaving
+      - action: switch.turn_on
+        continue_on_error: true
+        target:
+          entity_id: switch.inverter_export_surplus
+      - action: number.set_value
+        continue_on_error: true
+        target:
+          entity_id: number.inverter_battery_max_charging_current
+        data:
+          value: 240
+      - action: number.set_value
+        continue_on_error: true
+        target:
+          entity_id: number.inverter_battery_max_discharging_current
+        data:
+          value: 240
+      - action: switch.turn_off
+        continue_on_error: true
+        target:
+          entity_id: switch.inverter_microinverter_export_cut_off
+
+automation:
+  # DEAD MAN. The heartbeat is the ISO timestamp of the last tick; unknown
+  # (pyscript not loaded, HA just restarted) reads as infinitely old. Only a
+  # standing dangerous or costly register triggers the restore: a dead writer
+  # with the baseline standing costs nothing.
+  - id: emhass_writer_dead_man
+    alias: "EMHASS - writer dead man: baseline when the heartbeat stops"
+    mode: single
+    trigger:
+      - trigger: time_pattern
+        minutes: "/5"
+    condition:
+      - condition: state
+        entity_id: input_boolean.emhass_writer_armed
+        state: "on"
+      - condition: template
+        value_template: >
+          {{ (as_timestamp(now()) - as_timestamp(states('sensor.emhass_writer_heartbeat'), 0)) > 1200 }}
+      - condition: or
+        conditions:
+          - condition: state
+            entity_id: switch.inverter_battery_grid_charging
+            state: "on"
+          - condition: state
+            entity_id: select.inverter_work_mode
+            state: Export First
+          - condition: numeric_state
+            entity_id: number.inverter_program_6_soc
+            above: 50
+    action:
+      - action: script.emhass_deye_baseline
+      - action: notify.notify
+        data:
+          title: EMHASS writer dead man
+          message: >
+            No writer tick since {{ states('sensor.emhass_writer_heartbeat') }} with grid charging
+            {{ states('switch.inverter_battery_grid_charging') }}, work mode
+            {{ states('select.inverter_work_mode') }}, program 6 SOC
+            {{ states('number.inverter_program_6_soc') }}. Baseline restored. Check pyscript.
+
+  # GRID-CHARGE CAP. A grid charge stands at most 35 minutes without the
+  # writer vouching for it (a fresh heartbeat AND intent grid_charge). Checked
+  # every 5 minutes rather than a `for:` trigger, so a legitimate two-hour
+  # charge keeps being re-checked and a dead writer is caught at 35 minutes.
+  - id: emhass_writer_grid_charge_cap
+    alias: "EMHASS - writer grid-charge cap: 35 minutes unless the plan holds it"
+    mode: single
+    trigger:
+      - trigger: time_pattern
+        minutes: "/5"
+    condition:
+      - condition: state
+        entity_id: input_boolean.emhass_writer_armed
+        state: "on"
+      - condition: state
+        entity_id: switch.inverter_battery_grid_charging
+        state: "on"
+        for: "00:35:00"
+      - condition: template
+        value_template: >
+          {% set fresh = (as_timestamp(now()) - as_timestamp(states('sensor.emhass_writer_heartbeat'), 0)) < 960 %}
+          {{ not (fresh and state_attr('sensor.emhass_writer', 'intent') == 'grid_charge') }}
+    action:
+      - action: script.emhass_deye_baseline
+      - action: notify.notify
+        data:
+          title: EMHASS writer grid-charge cap
+          message: >
+            Grid charging stood for 35 minutes without the writer holding it (heartbeat
+            {{ states('sensor.emhass_writer_heartbeat') }}, intent
+            {{ state_attr('sensor.emhass_writer', 'intent') }}). Baseline restored.
+
+  # SOC-FLOOR BACKSTOP. The writer's ceiling holds the discharge clamp at 0 A
+  # while the real SOC is under the planner's floor (emhasscore/writer.py,
+  # soc_floor_tripped), in every mode. This covers a dead writer: the dead man
+  # above restores the baseline (discharge 240 A), so this runs 30 s after it
+  # in the same 5-minute cycle and takes the clamp back to 0 A. It only ever
+  # lowers the clamp; the writer releases it at floor + 2 points.
+  - id: emhass_writer_soc_floor_backstop
+    alias: "EMHASS - writer SOC-floor backstop: no discharge under the floor without a writer"
+    mode: single
+    trigger:
+      - trigger: time_pattern
+        minutes: "/5"
+        seconds: 30
+    condition:
+      - condition: state
+        entity_id: input_boolean.emhass_writer_armed
+        state: "on"
+      - condition: template
+        value_template: >
+          {{ (as_timestamp(now()) - as_timestamp(states('sensor.emhass_writer_heartbeat'), 0)) > 1200 }}
+      - condition: template
+        value_template: >
+          {% set soc = states('sensor.inverter_battery') | float(-1) %}
+          {% set floor = states('input_number.emhass_soc_min') | float(0) * 100 %}
+          {{ soc >= 0 and floor > 0 and soc < floor
+             and states('number.inverter_battery_max_discharging_current') | float(0) > 0 }}
+    action:
+      - action: number.set_value
+        target:
+          entity_id: number.inverter_battery_max_discharging_current
+        data:
+          value: 0
+      - action: notify.notify
+        data:
+          title: "Battery SOC floor: discharge stopped (backstop)"
+          message: >
+            SOC {{ states('sensor.inverter_battery') }} % against a floor of
+            {{ (states('input_number.emhass_soc_min') | float(0) * 100) | round(0) }} % and no writer tick
+            since {{ states('sensor.emhass_writer_heartbeat') }}. Discharge clamp set to 0 A. Check pyscript.
+
+  # HEAT BACKSTOP without a writer. The writer's ceiling caps charge and
+  # discharge at input_number.emhass_heat_cut_kw while the 1 h mean pack
+  # temperature is at or above input_number.emhass_heat_cut_c (writer.py,
+  # heat_cut_tripped). This covers a dead writer, as the SOC-floor backstop
+  # does, 45 s into the same 5-minute cycle. It only ever lowers a clamp. The
+  # amps are the cut power at the pack voltage, without the per-field
+  # calibration and rounded down to 5 A, so the cap errs low. 0 kW = off.
+  - id: emhass_writer_heat_backstop
+    alias: "EMHASS - writer heat backstop: cap the battery power when hot without a writer"
+    mode: single
+    trigger:
+      - trigger: time_pattern
+        minutes: "/5"
+        seconds: 45
+    variables:
+      cap_a: >
+        {% set kw = states('input_number.emhass_heat_cut_kw') | float(0) %}
+        {% set v = states('sensor.inverter_battery_voltage') | float(56) %}
+        {{ ((kw * 1000 / (v if v > 40 else 56)) // 5 * 5) | int }}
+    condition:
+      - condition: state
+        entity_id: input_boolean.emhass_writer_armed
+        state: "on"
+      - condition: template
+        value_template: >
+          {{ (as_timestamp(now()) - as_timestamp(states('sensor.emhass_writer_heartbeat'), 0)) > 1200 }}
+      - condition: template
+        value_template: >
+          {% set t = states('sensor.emhass_pack_temp_1h') | float(-100) %}
+          {% set cut = states('input_number.emhass_heat_cut_c') | float(999) %}
+          {{ states('input_number.emhass_heat_cut_kw') | float(0) > 0 and t >= cut
+             and (states('number.inverter_battery_max_charging_current') | float(0) > cap_a
+                  or states('number.inverter_battery_grid_charging_current') | float(0) > cap_a
+                  or states('number.inverter_battery_max_discharging_current') | float(0) > cap_a) }}
+    action:
+      - repeat:
+          for_each:
+            - number.inverter_battery_max_charging_current
+            - number.inverter_battery_grid_charging_current
+            - number.inverter_battery_max_discharging_current
+          sequence:
+            - if:
+                - condition: template
+                  value_template: "{{ states(repeat.item) | float(0) > cap_a }}"
+              then:
+                - action: number.set_value
+                  continue_on_error: true
+                  target:
+                    entity_id: "{{ repeat.item }}"
+                  data:
+                    value: "{{ cap_a }}"
+      - action: notify.notify
+        data:
+          title: "Battery heat backstop: power capped (backstop)"
+          message: >
+            Pack {{ states('sensor.emhass_pack_temp_1h') }} °C (1 h mean) at or above the
+            {{ states('input_number.emhass_heat_cut_c') }} °C cut and no writer tick since
+            {{ states('sensor.emhass_writer_heartbeat') }}. Battery currents capped at {{ cap_a }} A. Check pyscript.
+
+  # A restart with the mode off or dry starts from the baseline. In live mode
+  # the writer's own startup tick (180 s) re-applies the plan's record.
+  - id: emhass_writer_baseline_on_start
+    alias: "EMHASS - writer: baseline on start unless live"
+    mode: single
+    trigger:
+      - trigger: homeassistant
+        event: start
+    condition:
+      - condition: state
+        entity_id: input_boolean.emhass_writer_armed
+        state: "on"
+      - condition: not
+        conditions:
+          - condition: state
+            entity_id: input_select.emhass_writer_mode
+            state: live
+    action:
+      - action: script.emhass_deye_baseline
+
+  # GROWATT CUT HEADS-UP (2026-09-27). The cut is rare and still under
+  # review (the rule cuts from the solve to 24:00), so every cut gets a look.
+  # Fires on the register, whoever wrote it.
+  - id: emhass_writer_growatt_cut_notify
+    alias: "EMHASS - writer: notify when the Growatt gets cut"
+    mode: single
+    trigger:
+      - trigger: state
+        entity_id: switch.inverter_microinverter_export_cut_off
+        from: "off"
+        to: "on"
+    action:
+      - action: notify.notify
+        data:
+          title: Growatt cut
+          message: >
+            The microinverter export cut-off is on (writer {{ states('input_select.emhass_writer_mode') }},
+            intent {{ state_attr('sensor.emhass_writer', 'intent') }}). Plan rule: active
+            {{ state_attr('sensor.emhass_last_run', 'aux_cut_active') }}, curtailment/Growatt ratio
+            {{ state_attr('sensor.emhass_last_run', 'aux_cut_ratio') }}. SOC
+            {{ states('sensor.inverter_battery') }} %, Growatt {{ states('sensor.inverter_microinverter_power') }} W.

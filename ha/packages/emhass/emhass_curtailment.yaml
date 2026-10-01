@@ -1,0 +1,52 @@
+# Energy package - EMHASS: the PV curtailment mask.
+#
+# Until 2026-09-27 this file (emhass_realised.yaml) also re-priced the fiscal
+# meter's flows for the shadow scoreboard: sensor.emhass_grid_cost_rate, the
+# integration sensor.emhass_grid_cost, the utility meter
+# sensor.emhass_grid_cost_daily, and the midnight captures
+# sensor.emhass_soc_midnight and sensor.emhass_pv_daily_kwh. Their only reader
+# was pyscript.emhass_score_day, retired the day after the writer went live.
+
+# ---------------------------------------------------------------------------
+# PV curtailment mask (2026-09-05).
+#
+# The Deye holds the MAIN array back when the real pack is full and there is
+# nowhere to put the power. Measured PV is then not exogenous, and handing it
+# to the counterfactual lanes starves a virtual pack that would have had room:
+# on 09-05 the array made 1.496 W at 13:00 against a ~7.900 W potential, purely
+# because the real pack sat at 99 %.
+#
+# an observation, at 5-minute resolution: export was disabled with the pack
+# at 90 % and ~3 kW on the array; the cut itself began as SOC crossed 95 % at
+# 09:24, dropping the array to ~1 kW and tapering to zero as the pack topped
+# out. So the trigger is the 95 % crossing and export-off is the precondition
+# that precedes it - hence both, ANDed.
+#
+# Use switch.inverter_export_surplus, NOT input_boolean.ems_sell_enabled: the
+# latter is a master gate that sat off all of 09-05 and would mask the whole
+# day instead of the curtailed part of it.
+#
+# Numeric 0/1 with state_class measurement so the recorder keeps 5-minute
+# statistics: pyscript reads it as a series like any other, and a 15-minute
+# mean between 0 and 1 is the FRACTION of the step that was curtailed, which is
+# more honest than a boolean at the edges. emhass_core.pv_potential thresholds
+# it. Charting it is fair game; it is the reason a settled day's PV is partly
+# reconstructed.
+template:
+  - trigger:
+      - trigger: time_pattern
+        seconds: "/30"
+    sensor:
+      - name: "PV curtailment active"
+        unique_id: pv_curtailment_active
+        state_class: measurement
+        icon: mdi:solar-panel-large
+        availability: >
+          {{ has_value('sensor.inverter_battery')
+             and states('switch.inverter_export_surplus') in ['on', 'off'] }}
+        state: >
+          {{ 1 if (states('sensor.inverter_battery') | float(0) > 95
+                   and is_state('switch.inverter_export_surplus', 'off')) else 0 }}
+        attributes:
+          soc_pct: "{{ states('sensor.inverter_battery') | float(0) }}"
+          export_surplus: "{{ states('switch.inverter_export_surplus') }}"

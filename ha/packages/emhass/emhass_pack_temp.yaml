@@ -1,0 +1,15 @@
+# The pack temperature the EMS conservatism ramp reads (spec H of
+# an internal design note): the Solarman pack
+# temperature as a 1 h mean. It tracks the hottest ESP32 BMS probe to a median
+# -0,3 °C, with no ESP32 dependency. The wrapper latches it with a deadband
+# into sensor.emhass_pack_temp_used.
+sensor:
+  - platform: statistics
+    name: EMHASS pack temp 1h  # slug must be sensor.emhass_pack_temp_1h (the wrapper reads it)
+    unique_id: emhass_pack_temp_1h
+    entity_id: sensor.inverter_battery_temperature
+    state_characteristic: mean
+    max_age:
+      hours: 1
+    sampling_size: 2000
+    precision: 1

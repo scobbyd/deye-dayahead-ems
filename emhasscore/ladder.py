@@ -28,7 +28,8 @@ The three rungs, by what each knows about the days after D:
 No SOC term. Every rung starts day D where ITS OWN trajectory ended day D-1
 (reset to the actual lane's midnight only when its chain is broken), and each
 day is scored as the replay lane's cash plus the bridge/port loss over the
-measured day. The gap over any window is then a plain sum of daily cash, exact
+measured day (on a live day the actual lane's metered steps are the P1 meter's
+cash alone: the meter already paid those losses, replay_day). The gap over any window is then a plain sum of daily cash, exact
 over the window and only approximate on a single day, which is the honest
 shape of a problem where energy crosses midnight. ladder_summary prices each
 rung's END-of-window pack against the actual lane at the last day's lambda so
@@ -134,7 +135,7 @@ def hours_path(csv_path: str) -> str:
 def tariff_path(csv_path: str) -> str:
     """tariff_hours.csv next to ladder.csv: the buy and sell tariff per hour
     for the deep past (generated from the day-ahead archive by
-    the tariff-hours helper); the ladder's own rows carry the tariff for
+    an internal tool); the ladder's own rows carry the tariff for
     every replayed day and win where both exist."""
     return os.path.join(os.path.dirname(csv_path) or ".", "tariff_hours.csv")
 
@@ -209,8 +210,9 @@ def hour_sums(step_eur: list, day: date, tz: str) -> list[tuple[str, float]]:
 
 def today_hours(settled: dict, day: date, tz: str) -> tuple[list, list]:
     """The running day's hours from the live plan run's settled slice
-    (virtual_day at `now`): cash from cost_eur (no bridge loss: that is a
-    day-level term the ladder adds when it settles the day) and the lanes,
+    (virtual_day at `now`): cash from cost_eur (no bridge loss: on a live
+    day the meter paid it, on a virtual one the ladder adds it when it settles
+    the day) and the lanes,
     both over the hours that have at least one settled step (i < n_past).
     The ladder's nightly row replaces these rows the next morning."""
     n = expected_steps(day, tz)
@@ -558,18 +560,29 @@ def _reprice(ex: dict, day: date, tz: str, np_rows, tf: dict | None) -> dict:
 
 
 def _run_actual(archive_dir: str, day: date, tz: str, act: dict, capacity_kwh: float, lam: float,
-                soc0: float | None = None, np_rows=None, reprice: dict | None = None) -> dict:
+                soc0: float | None = None, np_rows=None, reprice: dict | None = None,
+                soc_anchor: tuple | None = None, measured: bool = False) -> dict:
     """What the controller actually did: the plans in force through the day,
     settled step by step through the virtual pack (the A/B tester's executed
     lane). NOT the plan of record replayed over the whole day: that lane sells
     the evening on the midnight plan and then starts the next day from the live
     pack, which the 13:13 re-plan had kept full for the morning peak - 14 kWh
     counted twice at the 09-07 seam, the whole of the 'actual beats every
-    ceiling' anomaly of the first run."""
+    ceiling' anomaly of the first run.
+
+    A LIVE DAY IS THE REAL PACK (2026-09-27): with `measured` the lane takes
+    the measured pack, meter and SOC (the same act lanes the replay prices
+    against) and `soc_anchor` the live switch step or the real midnight,
+    exactly as the display slice does. Without them the first live day was
+    settled through the virtual pack (start 24 %, end 10 %, minus 5,51 EUR)
+    where the real pack ran 85 % to 15 %."""
     t0 = _midnight(day, tz)
+    lanes = {}
+    if measured and act.get("soc_pct") is not None:
+        lanes = {"actual_batt_w": act["batt_dc_w"], "actual_grid_w": act["grid_w"], "actual_soc_pct": act["soc_pct"]}
     ex = virtual_day(archive_dir, day, tz, t0 + timedelta(days=1), act["pv_w"], act.get("load_w"),
                      act.get("curtailed"), act.get("pv_peak_w"), act.get("micro_w"), capacity_kwh,
-                     soc_start_pct=soc0)
+                     soc_start_pct=soc0, soc_anchor=soc_anchor, **lanes)
     if ex is None:
         return {"status": "no_chain", "solves": 0}
     ex = _reprice(ex, day, tz, np_rows, reprice)
@@ -720,7 +733,8 @@ def ladder_day(archive_dir: str, base_url: str, day_iso: str, tz: str, np_rows, 
             # chained through its own settled pack; the live anchor only when the chain is broken
             p_end = _chain(prev, "actual")
             res = _run_actual(archive_dir, day, tz, act, capacity_kwh, lam, soc0=p_end,
-                              np_rows=np_rows, reprice=reprice)
+                              np_rows=np_rows, reprice=reprice,
+                              soc_anchor=(inputs or {}).get("anchor"), measured=bool((inputs or {}).get("measured")))
             if p_end is None:
                 flags.append("actual_reset")
             if res.get("soc_start_pct") is not None:
@@ -805,7 +819,9 @@ def ladder_hours_fill(archive_dir: str, csv_path: str, days: list[str], tz: str,
         if lam is None:
             lam = lambda_for(compact_slice(found[1], found[0])["sell"], lambda_frac)
         prev = by_date.get((day - timedelta(days=1)).isoformat())
-        res = _run_actual(archive_dir, day, tz, act, capacity_kwh, float(lam), soc0=_chain(prev, "actual"))
+        day_in = (inputs or {}).get(d) or {}
+        res = _run_actual(archive_dir, day, tz, act, capacity_kwh, float(lam), soc0=_chain(prev, "actual"),
+                          soc_anchor=day_in.get("anchor"), measured=bool(day_in.get("measured")))
         if res.get("status") != "ok" or not res.get("step_eur"):
             out[d] = {"status": res.get("status")}
             continue

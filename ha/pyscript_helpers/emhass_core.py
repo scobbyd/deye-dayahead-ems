@@ -27,29 +27,30 @@ if _HERE not in _sys.path:
 for _name in [m for m in _sys.modules if m == 'emhasscore' or m.startswith('emhasscore.')]:
     del _sys.modules[_name]
 
-from emhasscore import grid, series, objective, deye, addon, archive, repair, scoreboard, slices, planning, scoring, ab, ladder, rebalance  # noqa: E402  (the submodules, for tests that patch one)
-from emhasscore import plant  # noqa: E402
-from emhasscore.plant import PLANT  # noqa: E402  (the site: coordinates, pack, Solcast ids; the wrapper reads core.PLANT)
+from emhasscore import plant, grid, series, objective, deye, addon, archive, writer, repair, slices, planning, scoring, ab, ladder, rebalance  # noqa: E402  (the submodules, for tests that patch one)
+from emhasscore.plant import PLANT  # noqa: E402
 from emhasscore.grid import (  # noqa: E402
     ceil_step, expected_steps, horizon, _parse_ts, _slot, STEP_H, STEP_MIN, step_times,
 )
 from emhasscore.series import (  # noqa: E402
-    fifteen_min_series, GROWATT_SHARE, MICRO_SHARE, LOAD_MIN_REF_DAYS, LOAD_MIX_ALPHA, load_profile, LOAD_REF_DAYS,
+    fifteen_min_series, GROWATT_SHARE, LOAD_MIN_REF_DAYS, LOAD_MIX_ALPHA, load_profile, LOAD_REF_DAYS,
     load_series, MAX_PV_GAPS, _median, price_series, pv_mix, PV_P10_MIX, pv_series, pv_split, tariff,
     window_series,
 )
 from emhasscore.objective import (  # noqa: E402
-    apply_knobs, aux_cut_decision, AUX_CUT_OFF_MIN_KWH, AUX_CUT_OFF_RATIO, AUX_CUT_ON_MIN_KWH,
+    apply_knobs, apply_plant, soc_target_level, aux_cut_decision, BATT_SIDE_A, BATT_SIDE_B_KW, bus_to_port_w, cells_to_port_w, conservatism, ETA_AC_DC_V2,
+    ETA_C_V2, ETA_D_V2, ETA_DC_AC_V2, GRID_CHARGE_AC_MAX_W, STANDBY_LOAD_W, AUX_CUT_OFF_MIN_KWH, AUX_CUT_OFF_RATIO, AUX_CUT_ON_MIN_KWH, batt_power_limits,
     AUX_CUT_ON_RATIO, build_payload, CAPACITY_KWH, cut_thresholds, DEFICIT_BASE, ETA_BRIDGE, GRID_CAP_W,
-    knobs, LIVE_KNOBS, loss_adjustment, METER_DRIFT_EUR, P_NOM_BATT_KW, P_NOM_INV_KW, Q_BRIDGE, Q_PORT,
+    is_v2, knobs, LIVE_KNOBS, loss_adjustment, LP_MIP_REL_GAP, P_NOM_BATT_KW, P_NOM_INV_KW, Q_BRIDGE, Q_PORT,
     REBALANCE_DWELL_H, REBALANCE_FULL_LEVEL, REBALANCE_PULL, rebalance_schedule, REBALANCE_TARGET_DAYS, SOC_FINAL_TARGET,
-    SOC_MAX, SOC_MIN, soc_target_timestep, step_cost, stress_costs, SURPLUS_BASE,
+    SOC_MAX, SOC_MIN, soc_target_timestep, step_cost, stress_costs, SURPLUS_BASE, plan_etas, temp_latch, temp_ramp,
 )
 from emhasscore.deye import (  # noqa: E402
     clamp_write, deye_amps, DEYE_BASELINE, DEYE_BATT_DEADBAND_W, DEYE_CLAMP_DEADBAND_A, DEYE_CLAMP_MARGIN_A,
-    DEYE_CLAMP_MARGIN_FRAC, deye_command, DEYE_CURRENT_MAX_A, DEYE_CURRENT_STEP_A, DEYE_GRID_DEADBAND_W,
+    DEYE_CLAMP_MARGIN_FRAC, deye_command, DEYE_CURRENT_MAX_A, deye_delivered_a, DEYE_CURRENT_STEP_A, DEYE_PACK_R_OHM, loaded_voltage,
+    DEYE_DISCHARGE_DEADBAND_A, DEYE_GRID_CHARGE_DEADBAND_A, DEYE_CURRENT_QUANT_A, DEYE_GRID_DEADBAND_W,
     DEYE_PACK_V, deye_response, DEYE_TIER, ETA_C, ETA_D, integrate_soc, settle_slice, settle_step, soc_dwell_h,
-    SETTLE_MARGIN, wanted_clamp, wanted_clamp_a,
+    quantise_amps, setpoint_write, SETTLE_MARGIN, wanted_clamp, wanted_clamp_a,
 )
 from emhasscore.addon import (  # noqa: E402
     addon_holds_plan, emhass_get, emhass_post, health, ml_action, OMITTED_CONFIG_KEYS, publish, PUBLISH_MAP,
@@ -60,11 +61,17 @@ from emhasscore.archive import (  # noqa: E402
     list_plans, load_plan, newest_plan_for_day, organic_plans, original_plan_for_day, plan_for_day,
     plan_heads, _plan_stem, virtual_soc_at, write_plan_archive,
 )
+from emhasscore.writer import (  # noqa: E402
+    append_tick, apply_ceilings, baseline_record, calibrate_amps, ceiling_writes, compile_step, CURRENT_FIELDS, day_step, day_was_live, fold_writes,
+    guard_memory, guard_standing, soc_floor_tripped, SOC_FLOOR_RELEASE_PTS, writer_ceilings,
+    heat_cut_tripped, heat_cut_amps, HEAT_CUT_RELEASE_C, HEAT_CUT_FIELDS, HEAT_CUT_FALLBACK_V,
+    held_record, last_counts, off_baseline, quantise_record, segment_of, SEGMENT_MEAN_INTENTS, WRITER_KNOBS,
+    order_writes, read_anchor, soc_anchor_for_day, write_anchor,
+    RESTORE_ORDER, same, step_in_force, wants_writes, writer_diff, WRITER_ENTITY, WRITER_FIELDS, WRITER_NEVER,
+    WRITER_STALE_MIN, writer_tick,
+)
 from emhasscore.repair import (  # noqa: E402
     effective_load, PV_CURTAIL_SOC_PCT, PV_DAYLIGHT_W, pv_potential,
-)
-from emhasscore.scoreboard import (  # noqa: E402
-    _r2, read_scores, rolling, SCORE_COLUMNS, scoreboard_row, _TEXT_COLUMNS, upsert_score,
 )
 from emhasscore.slices import (  # noqa: E402
     compact_slice, rehydrate, rolled_slices, virtual_day,
@@ -73,8 +80,7 @@ from emhasscore.planning import (  # noqa: E402
     load_exact_key, run_plan,
 )
 from emhasscore.scoring import (  # noqa: E402
-    cash_in_frame, hindsight_day, lambda_for, planned_cost, replay_day, replay_plan, score_day, score_row,
-    soc_term,
+    cash_in_frame, hindsight_day, lambda_for, replay_day, soc_term,
 )
 from emhasscore.ladder import (  # noqa: E402
     LADDER_COLUMNS, LANE_COLUMNS, ladder_day, ladder_earned_series, ladder_hours_fill, ladder_run,

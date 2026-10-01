@@ -9,15 +9,18 @@ from .series import load_series, MAX_PV_GAPS, price_series, pv_mix, pv_series, p
 from .objective import (
     apply_knobs,
     aux_cut_decision,
+    batt_power_limits,
     build_payload,
     cut_payload,
     cut_thresholds,
+    is_v2,
     knobs,
     plan_cost,
     rebalance_schedule,
     rows_to_gross,
     SOC_MAX,
     SOC_MIN,
+    STANDBY_LOAD_W,
     stress_costs,
 )
 from .addon import solve
@@ -68,6 +71,9 @@ def _plan_series(inp: dict, t0: datetime, n: int, tz: str, kn: dict, out: dict) 
             if v is not None:
                 load_w[k], hits = round(max(float(v), 0.0), 1), hits + 1
         out["load_exact_steps"] = hits
+    if load_w and is_v2(kn):
+        # The Deye's own draw is not in the UPS-load register (loss map v2).
+        load_w = [round(l + STANDBY_LOAD_W, 1) for l in load_w]
     # The must-take half leaves pv_power_forecast and arrives as NEGATIVE LOAD,
     # the textbook treatment of an uncontrollable behind-the-meter generator and
     # the only way the solver stops believing it can throttle the Growatt.
@@ -102,7 +108,9 @@ def _plan_payload(inp: dict, t0: datetime, n: int, now: datetime, tz: str, soc: 
     payload = build_payload(t0, n, soc, float(kn["soc_final"]), s["main_w"], buy, sell)
     if s["load_w"]:
         payload["load_power_forecast"] = [round(l - m, 1) for l, m in zip(s["load_w"], s["micro_w"])]
-    payload["battery_stress_cost"], payload["inverter_stress_cost"] = stress_costs(buy, sell)
+    ch_max, dis_max = batt_power_limits(kn["batt_power_max_w"], v2=is_v2(kn))
+    payload["battery_stress_cost"], payload["inverter_stress_cost"] = \
+        stress_costs(buy, sell, p_nom_batt_kw=max(ch_max, dis_max) / 1000.0)
     # The settled clock when the caller keeps one (inp["rebalance"], see
     # rebalance.py); the plan-chain scan only for a caller that does not.
     if "rebalance" in inp:
@@ -110,6 +118,7 @@ def _plan_payload(inp: dict, t0: datetime, n: int, now: datetime, tz: str, soc: 
     else:
         dsf = days_since_full(inp["archive_dir"], now, tz)
     payload.update(rebalance_schedule(dsf, kn["surplus_base"], kn["deficit_threshold"], kn["deficit_cost"]))
+    payload["battery_soc_surplus_threshold"] = float(kn["surplus_threshold"])
     out["days_since_full"] = dsf
     apply_knobs(payload, kn, t0, n, now.astimezone(ZoneInfo(tz)).date())
     out["knobs"] = kn
@@ -270,7 +279,11 @@ def run_plan(inp: dict) -> dict:
                        inp.get("prev_pv_w"), inp.get("prev_load_w"),
                        inp.get("curtailed"), inp.get("prev_curtailed"),
                        inp.get("pv_peak_w"), inp.get("prev_pv_peak_w"),
-                       inp.get("micro_w"), inp.get("prev_micro_w"))
+                       inp.get("micro_w"), inp.get("prev_micro_w"),
+                       soc_anchor=inp.get("soc_anchor"), actual_batt_w=inp.get("actual_batt_w"),
+                       actual_grid_w=inp.get("actual_grid_w"), actual_soc_pct=inp.get("actual_soc_pct"),
+                       prev_soc_anchor=inp.get("prev_soc_anchor"), prev_batt_w=inp.get("prev_batt_w"),
+                       prev_grid_w=inp.get("prev_grid_w"), prev_soc_pct=inp.get("prev_soc_pct"))
     out.update(yesterday=sl["yesterday"], today=sl["today"], next_day=sl["next_day"],
                day_after=sl["day_after"], ok=True, message="ok")
     return out

@@ -1,10 +1,4 @@
-# EMHASS: EpexPredictor forecast-as-of capture.
-#
-# No outside entities. The shell command calls a THIRD-PARTY site,
-# https://epexpredictor.batzill.com (the same service the EpexPredictor HACS
-# integration reads), twice a day, and appends the raw response to disk. Keep
-# the gate helper off if you do not want that call made from your HA host.
-# region=NL is the reference plant's bidding zone: set yours.
+# Energy package - EMHASS: EpexPredictor forecast-as-of capture.
 #
 # Every live solve already archives the prices it used (/config/emhass/plans),
 # but that record lives and dies with the shadow planner. This captures the raw
@@ -14,7 +8,7 @@
 # forecast attribute is > 16 kB and is dropped (see the epex_predictor sensor).
 # No recorder-visible attribute here, one JSON line per capture on disk:
 #   /config/emhass/epex_raw/YYYY-MM.jsonl   {"issued_utc": ..., "body": {...}}
-# about 37 kB per line, 2 a day. Reader: backtest/pricefill.py (the as-issued lane).
+# about 37 kB per line, 2 a day. Reader: an internal tool.
 #
 # 12:05 local: the last read of tomorrow as a pure forecast, before the
 # auction publishes (~13:00). 00:05 local: the overnight refresh, D+2 in view.

@@ -1,6 +1,7 @@
 # the offline harness; emhasscore itself needs only the standard library
 emhass==0.18.2
 pandas>=2.2
+pyarrow>=15          # parquet: the replay walk writes its settled days as parquet
 numpy>=2.0
 requests>=2.31
 pvlib>=0.11

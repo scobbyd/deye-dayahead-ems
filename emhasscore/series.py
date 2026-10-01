@@ -88,8 +88,7 @@ def pv_series(t0, n, detailed_today, detailed_tomorrow, detailed_day3=None,
 # to the same number. It tracks the ESE string and not the WNW one - on
 # 2026-09-03 the WNW string ran 3.533 W while the Growatt sat at 416 W, a ratio
 # no shared plane could produce.
-MICRO_SHARE = float(PLANT["pv"]["micro_share"])   # 0 = no AC-coupled microinverter
-GROWATT_SHARE = MICRO_SHARE                        # the reference plant's microinverter is a Growatt; call sites keep this name
+GROWATT_SHARE = float(PLANT["pv"]["micro_share"])   # the reference plant's microinverter is a Growatt; 0 = none
 
 
 # The planner's production number is a P50:P10 MIX (2026-09-07). Not a
@@ -201,7 +200,7 @@ def window_series(t0: datetime, n: int, stat_rows, gap_upto: int | None = None,
 # So the phase error costs ~40 % of the load forecast's accuracy, and it is the
 # ORIGIN HOUR that drives naive's error, exactly as the positional copy
 # predicts. A lag-1 daily level correction was tried because the site's own
-# report (docs/reports/2026-08-29-load-forecaster-and-inverter-losses.md) found
+# report (an internal design note) found
 # the daily LEVEL dominated by lag 1, autocorrelation +0,581 against +0,045 at
 # lag 7; on this horizon it made things worse and was dropped. No day-of-week
 # split either: at ~15 days of recorder history each weekday holds two samples.

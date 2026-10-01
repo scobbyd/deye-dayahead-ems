@@ -226,6 +226,7 @@ def test_pv_scale_zero_walks_a_day_without_a_plant(tmp_path):
     """--pv-scale 0 empties every PV column (measured, potential, Growatt and
     the forecast lanes), the walk still solves and settles, the plant's size is
     frozen in meta.json and a resumed Walk takes it from there."""
+    pytest.importorskip("emhass")
     from backtest.solver import LibrarySolver
     frame, frac, da = synthetic_frame(first=date(2026, 7, 14), days=16), constant_fraction(0.4), synthetic_da_prices()
     scaled = ri.scale_pv(frame, 0.0)
@@ -253,6 +254,7 @@ def test_hardware_override_reaches_the_lp_the_pack_and_the_actuator(tmp_path):
     """--capacity-kwh / --inverter-kw: the LP's plant params, the payload's power
     knob, the settlement's capacity and the register ceiling all move together,
     the set is frozen in meta.json, and the default restores the shipped values."""
+    pytest.importorskip("emhass")
     from backtest import hardware as hwm
     from backtest.solver import LibrarySolver
     from emhasscore import deye, objective
@@ -285,6 +287,7 @@ def test_walk_keeps_the_settled_rebalance_clock(tmp_path):
     """The walk starts with nothing on record (overdue: the pull is on in the
     first plan), folds every settled slice into state.json's rebalance clock,
     and hands the state to run_plan on the next tick."""
+    pytest.importorskip("emhass")
     from backtest.solver import LibrarySolver
     frame, frac, da = synthetic_frame(first=date(2026, 7, 14), days=16), constant_fraction(0.4), synthetic_da_prices()
     w = replay.Walk("foresight", date(2026, 7, 23), date(2026, 7, 23), run_dir=str(tmp_path),

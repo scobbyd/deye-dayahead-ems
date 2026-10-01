@@ -1,13 +1,10 @@
-# EMHASS shadow planner: schedule.
-#
-# Outside entities this file expects (rename to yours):
-#   binary_sensor.nord_pool_nl_tomorrow_price_available  the built-in Nord Pool integration
-#   notify.notify                                        your notify target (was a per-phone target)
+# Energy package - EMHASS shadow planner: schedule.
 #
 # Plan when tomorrow's Nord Pool prices publish (observed 13:00:04 local), or
 # at 15:00 if tomorrow is still unplanned (the missing steps then come from
-# epex_predictor and the plan is flagged). Refresh the plan every 30 minutes
-# at :13 and :43 (ruling 2026-09-08; :05 and :35 from 2026-09-07). The horizon
+# epex_predictor and the plan is flagged). Refresh the plan every 15 minutes
+# at :13, :28, :43 and :58 (2026-09-27; :13 and :43 from 2026-09-08,
+# :05 and :35 from 2026-09-07), and once 4 minutes after every start. The horizon
 # starts at the next quarter, so a :13 solve is in force from :15, two minutes
 # later, where a :05 solve idled ten minutes and left the :00 step on a plan
 # 25 minutes old. At :13 two of the running step's three five-minute
@@ -23,7 +20,7 @@
 # scored plan of record is the last solve before the scored day's midnight,
 # always post-13:00 with real prices), so the refresh sharpens the displayed
 # intent, the virtual-pack realism and the freshness of tomorrow's plan.
-# Archive cost: ~17 KB per gzipped plan, ~54 plans a day. Gated on the add-on being healthy so a
+# Archive cost: ~17 KB per gzipped plan, ~100 plans a day. Gated on the add-on being healthy so a
 # dead add-on is not hammered with retries. Score yesterday at 00:10. Fit the
 # load model nightly and tune it on Sundays once the ML switch is on (day 10).
 # None of these actions touches a sensor.emhass_da_* entity (check.sh actions).
@@ -60,25 +57,48 @@ automation:
       - action: pyscript.emhass_plan_day
 
   - id: emhass_plan_refresh
-    alias: "EMHASS - refresh the plan every 30 minutes"
+    alias: "EMHASS - refresh the plan every 15 minutes and after a start"
     mode: single
     trigger:
       - trigger: time_pattern
         minutes: "13"
       - trigger: time_pattern
+        minutes: "28"
+      - trigger: time_pattern
         minutes: "43"
+      - trigger: time_pattern
+        minutes: "58"
+      # After a start the rehydrate (pyscript _emhass_startup, 120 s in)
+      # republishes the last plan while it is under emhass_plan_stale_hours
+      # old; the writer then runs on a plan made before the restart. Re-solve
+      # once the rehydrate is done and the add-on answers.
+      - trigger: homeassistant
+        event: start
+        id: start
     condition:
       - condition: state
         entity_id: input_boolean.emhass_shadow_enabled
         state: "on"
+    action:
+      - if:
+          - condition: trigger
+            id: start
+        then:
+          - delay: "00:04:00"
+          - wait_template: "{{ is_state('binary_sensor.emhass_addon_healthy', 'on') }}"
+            timeout: "00:10:00"
+            continue_on_timeout: false
       - condition: state
         entity_id: binary_sensor.emhass_addon_healthy
         state: "on"
-    action:
       - action: pyscript.emhass_plan_day
 
-  - id: emhass_score
-    alias: "EMHASS - score yesterday"
+  # The nightly ladder walk (the actual rung over the last four days) and the
+  # emhass:ladder_earned_eur re-import the ledger reads. Until 2026-09-27 this
+  # was emhass_score_day, which also scored the shadow scoreboard; that was
+  # retired the day after the writer went live.
+  - id: emhass_ladder_nightly
+    alias: "EMHASS - walk the ladder nightly"
     mode: single
     trigger:
       - trigger: time
@@ -88,7 +108,7 @@ automation:
         entity_id: input_boolean.emhass_shadow_enabled
         state: "on"
     action:
-      - action: pyscript.emhass_score_day
+      - action: pyscript.emhass_ladder_nightly
 
   - id: emhass_fit
     alias: "EMHASS - fit the load forecaster"
@@ -191,7 +211,7 @@ automation:
   # hour of continuous "off" is the alert threshold: long enough to ride out an
   # add-on restart or one failed probe, short enough to lose a single refresh.
   # The usual cause is config drift (the EMHASS web UI config page was saved,
-  # which overwrites the live config); ha/scripts/deploy.sh restores it.
+  # which overwrites the live config); ha/scripts/check.sh restores it.
   #
   # One alert per outage is not enough: swipe it away at night and a multi-day
   # outage goes quiet again, which is the exact failure this guards. So it also
@@ -223,7 +243,6 @@ automation:
         for:
           hours: 1
     action:
-      # notify.notify is HA's default target; the live system used a group of phones
       - action: notify.notify
         data:
           title: "EMHASS shadow EMS degraded - re-planning stopped"
@@ -239,7 +258,7 @@ automation:
             is being skipped and the plan is going stale{% if age is not none %} (last solve
             {{ age | float(0) | round(1) | string | replace('.', ',') }} h ago){% endif %}.
             {% if drift | count > 0 %}Live config drifted on {{ drift | join(', ') }} - the EMHASS
-            web UI config page was most likely saved. Run ha/scripts/deploy.sh to restore
+            web UI config page was most likely saved. Run ha/scripts/check.sh to restore
             config.json.{% else %}healthz reports "{{ status }}". Check the EMHASS add-on under
             Settings, Add-ons and restart it if it is down.{% endif %}
 

@@ -1,14 +1,107 @@
 {
-  "site": {"latitude": 52.0, "longitude": 5.0, "altitude_m": 0.0, "timezone": "Europe/Amsterdam"},
-  "battery": {"capacity_kwh": 48.2, "p_nom_kw": 12.5, "pack_voltage_v": 51.2, "current_max_a": 240.0,
-              "eta_charge": 0.961, "eta_discharge": 0.957,
-              "soc_min": 0.10, "soc_max": 1.00, "soc_final_target": 0.50},
-  "inverter": {"model": "Deye SUN-12K-SG04LP3", "p_nom_kw": 12.0, "eta_bridge": 0.989,
-               "q_port_kw_per_kw2": 0.003, "q_bridge_kw_per_kw2": 0.0012},
-  "grid": {"cap_w": 17250},
-  "pv": {"micro_share": 0.288, "micro_max_w": 3000.0, "p10_mix": 0.20, "curtail_soc_pct": 95.0,
-         "strings": {"A": {"tilt": 34, "azimuth": 109, "kwp": 9.8, "scale": 1.0},
-                     "B": {"tilt": 39, "azimuth": 288, "kwp": 9.8, "scale": 1.0}},
-         "solcast_sites": {"A": "xxxx-xxxx-xxxx-xxxx", "B": "xxxx-xxxx-xxxx-xxxx"}},
-  "tariff": {"energy_tax": 0.0, "supplier_fee": 0.019, "btw_pct": 21.0, "feedin_fee": 0.019}
+  "_comment": "Copy to plant.json. Every key below is the reference plant (emhasscore/plant.py DEFAULTS). Any key you leave out falls back to that reference, so delete what you do not change and keep what you set. You MUST set: site, battery capacity_kwh / p_nom_kw / pack_voltage_v / current_max_a / soc_min / soc_max, inverter p_nom_kw / grid_charge_ac_max_w, baseline, grid cap_w, pv micro_share / micro_max_w / solcast_sites, entities (nordpool_entry and nordpool_area at least) and writer_entities if your Solarman device is not named 'inverter'. The loss-model and registers numbers are the reference unit's measurements: refit them or accept them. See ha/README.md, section 'plant.json'.",
+  "site": {
+    "latitude": 52.0,
+    "longitude": 5.0,
+    "altitude_m": 0.0,
+    "timezone": "Europe/Amsterdam"
+  },
+  "battery": {
+    "capacity_kwh": 48.2,
+    "p_nom_kw": 12.5,
+    "pack_voltage_v": 51.2,
+    "current_max_a": 240.0,
+    "eta_charge": 0.961,
+    "eta_discharge": 0.957,
+    "soc_min": 0.10,
+    "soc_max": 1.00,
+    "soc_final_target": 0.50,
+    "r_ohm": 0.0046,
+    "side_loss_a": 0.0037,
+    "side_loss_b_kw": 0.0021
+  },
+  "inverter": {
+    "model": "Deye SUN-12K-SG04LP3",
+    "p_nom_kw": 12.0,
+    "eta_bridge": 0.989,
+    "q_port_kw_per_kw2": 0.0042,
+    "q_bridge_kw_per_kw2": 0.0005,
+    "standby_load_w": 90.0,
+    "grid_charge_ac_max_w": 11300.0,
+    "eta_v2": {"dc_ac": 0.981, "ac_dc": 0.990, "charge": 0.977, "discharge": 0.977}
+  },
+  "registers": {
+    "discharge_short_slope": 0.030,
+    "discharge_short_knee_a": 150.0,
+    "discharge_short_icpt_a": 0.2,
+    "grid_charge_gain": 0.951,
+    "charge_short_a": 1.0
+  },
+  "baseline": {
+    "work_mode": "Zero Export To Load",
+    "energy_pattern": "Load First",
+    "zero_export_power": 25.0,
+    "export_surplus": true,
+    "export_surplus_power": 14500.0,
+    "battery_grid_charging": false,
+    "battery_grid_charging_current": 0.0,
+    "microinverter_export_cut_off": false,
+    "grid_peak_shaving": true,
+    "program_6_soc": 5.0,
+    "program_6_power": 12000.0
+  },
+  "grid": {
+    "cap_w": 17250
+  },
+  "pv": {
+    "micro_share": 0.288,
+    "micro_max_w": 3000.0,
+    "p10_mix": 0.20,
+    "curtail_soc_pct": 95.0,
+    "strings": {
+      "A": {"tilt": 34, "azimuth": 109, "kwp": 9.8, "scale": 1.0},
+      "B": {"tilt": 39, "azimuth": 288, "kwp": 9.8, "scale": 1.0}
+    },
+    "solcast_sites": {
+      "A": "xxxx-xxxx-xxxx-xxxx",
+      "B": "xxxx-xxxx-xxxx-xxxx"
+    }
+  },
+  "tariff": {
+    "energy_tax": 0.0,
+    "supplier_fee": 0.019,
+    "btw_pct": 21.0,
+    "feedin_fee": 0.019
+  },
+  "entities": {
+    "pv": "sensor.total_pv_power",
+    "load": "sensor.inverter_load_ups_power",
+    "grid_import": "sensor.your_p1_meter_power_consumed",
+    "grid_export": "sensor.your_p1_meter_power_returned",
+    "batt_power": "sensor.inverter_battery_power",
+    "batt_voltage": "sensor.inverter_battery_voltage",
+    "batt_current": "sensor.inverter_battery_current",
+    "soc": "sensor.inverter_battery",
+    "micro": "sensor.inverter_microinverter_power",
+    "export_switch": "switch.inverter_export_surplus",
+    "curtailed": "sensor.pv_curtailment_active",
+    "solcast_today": "sensor.solcast_pv_forecast_forecast_today",
+    "solcast_tomorrow": "sensor.solcast_pv_forecast_forecast_tomorrow",
+    "solcast_day3": "sensor.solcast_pv_forecast_forecast_day_3",
+    "epex": "sensor.epex_predictor_nl",
+    "nordpool_entry": "01XXXXXXXXXXXXXXXXXXXXXXXX",
+    "nordpool_area": "NL",
+    "notify": "notify.notify"
+  },
+  "writer_entities": {
+    "export_surplus": "switch.inverter_export_surplus",
+    "battery_max_charging_current": "number.inverter_battery_max_charging_current",
+    "battery_max_discharging_current": "number.inverter_battery_max_discharging_current",
+    "microinverter_export_cut_off": "switch.inverter_microinverter_export_cut_off",
+    "work_mode": "select.inverter_work_mode",
+    "grid_peak_shaving": "switch.inverter_grid_peak_shaving",
+    "battery_grid_charging_current": "number.inverter_battery_grid_charging_current",
+    "battery_grid_charging": "switch.inverter_battery_grid_charging",
+    "program_6_soc": "number.inverter_program_6_soc"
+  }
 }

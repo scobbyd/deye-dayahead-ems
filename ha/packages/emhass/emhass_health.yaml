@@ -1,7 +1,4 @@
-# EMHASS shadow planner: health.
-#
-# Outside entities this file expects (rename to yours):
-#   notify.notify   your notify target (was a per-phone target)
+# Energy package - EMHASS shadow planner: health.
 #
 # Plan age comes from the plan_ts of sensor.emhass_plan_next_day (written by
 # pyscript from the archive), not from sensor.emhass_last_run, which every
@@ -49,7 +46,6 @@ automation:
         entity_id: input_boolean.emhass_shadow_enabled
         state: "on"
     action:
-      # notify.notify is HA's default target; the live system used one phone
       - action: notify.notify
         data:
           title: EMHASS shadow plan stale

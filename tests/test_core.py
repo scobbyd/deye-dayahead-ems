@@ -252,7 +252,7 @@ def test_deye_command_self_balance_puts_the_error_on_the_battery():
     price the CT rule holds, and the clamp is the plan's charge only on a step
     the LP itself curtailed (2026-09-12)."""
     c = core.deye_command(p_grid_w=0.0, p_batt_w=-5000.0, pack_v=51.2)
-    assert c["work_mode"] == "Zero Export To CT"
+    assert c["work_mode"] == "Zero Export To Load"
     assert c["battery_grid_charging"] is False
     assert c["battery_max_charging_current"] == core.DEYE_CURRENT_MAX_A
     assert c["export_surplus"] is True
@@ -270,15 +270,27 @@ def test_deye_command_deliberate_grid_charge_turns_the_dangerous_field_on():
     assert c["intent"] == "grid_charge"
 
 
-def test_deye_command_export_discharge_is_a_tou_target_not_a_work_mode():
-    """Export First only lets PV reach the grid. The pack is commanded by a TOU
-    target SOC with a power cap, which is what the 09-05 acceptance replay proved
-    when the work-mode reading put 17 kW on a meter that measured 4,6."""
+def test_deye_command_export_discharge_is_the_clamp_with_peak_shaving_off():
+    """Measured 2026-09-25/26: under Export First the pack follows the discharge
+    clamp (97 A of 100 delivered), and only with grid peak shaving OFF; with it
+    on the inverter sold nothing from an 8 kW setpoint. The TOU target is gone
+    from the record."""
     c = core.deye_command(p_grid_w=-9000.0, p_batt_w=8000.0, pack_v=51.2, target_soc=0.3)
     assert c["work_mode"] == "Export First"
+    assert c["grid_peak_shaving"] is False
     assert c["battery_max_discharging_current"] == pytest.approx(156.0)  # 8000/51,2 = 156,3
-    assert c["tou_target_soc"] == 0.3 and c["tou_power_w"] == pytest.approx(8000.0)
+    assert "tou_target_soc" not in c and "tou_power_w" not in c
+    assert c["program_6_power"] == 12000.0                            # a lower TOU power caps the sale
     assert c["intent"] == "export"
+
+
+def test_deye_command_grid_charge_sets_the_tou_target():
+    """Measured 2026-09-25: switch + 40 A alone imported nothing at 90 % SOC;
+    with program 6 SOC 100 the meter matched the twin to 2 W."""
+    c = core.deye_command(p_grid_w=2000.0, p_batt_w=-6000.0, pack_v=51.2)
+    assert c["program_6_soc"] == 100.0
+    assert core.DEYE_TIER["program_6_soc"] == "dangerous"
+    assert core.DEYE_BASELINE["program_6_soc"] == 5.0
 
 
 def test_deye_command_pv_export_holds_the_pack_with_a_zero_charge_clamp():
@@ -293,10 +305,10 @@ def test_deye_command_pv_export_holds_the_pack_with_a_zero_charge_clamp():
     assert c["intent"] == "pv_export"
     assert c["battery_max_charging_current"] == 0.0
     assert c["export_surplus"] is True
-    assert c["work_mode"] == "Zero Export To CT"                  # untouched
+    assert c["work_mode"] == "Zero Export To Load"                # untouched
     assert core.DEYE_TIER["battery_max_charging_current"] == "wasteful"
-    # bank nothing is not do nothing: the pack may still cover the house
-    assert c["battery_max_discharging_current"] == core.DEYE_CURRENT_MAX_A
+    # an idle step rests the pack (2026-09-27): no discharge into the house either
+    assert c["battery_max_discharging_current"] == 0.0
 
 
 def test_deye_response_pv_export_holds_the_pack_and_sells_the_sun():
@@ -312,7 +324,8 @@ def test_deye_response_pv_export_holds_the_pack_and_sells_the_sun():
 def test_deye_command_baseline_is_the_conservative_state():
     b = core.DEYE_BASELINE
     assert b["battery_grid_charging"] is False
-    assert b["work_mode"] == "Zero Export To CT"
+    assert b["work_mode"] == "Zero Export To Load"
+    assert b["grid_peak_shaving"] is True and b["program_6_power"] == 12000.0
     assert b["battery_max_charging_current"] == core.DEYE_CURRENT_MAX_A
     assert b["microinverter_export_cut_off"] is False
 
@@ -374,10 +387,48 @@ def test_deye_response_grid_charge_draws_the_shortfall_from_the_meter():
 
 
 def test_deye_response_export_discharges_into_the_meter():
-    cmd = core.deye_command(p_grid_w=-9000.0, p_batt_w=8000.0, pack_v=51.2, target_soc=0.3)
+    """Export First + peak shaving off: the clamp is the pack setpoint and the
+    surplus over the house goes out. 2026-09-25 sell_clamp: 100 A asked, 97 A
+    delivered, meter = PV + pack - load."""
+    cmd = core.deye_command(p_grid_w=-9000.0, p_batt_w=8000.0, pack_v=51.2)
     r = core.deye_response(cmd, main_pot_w=1000.0, micro_w=0.0, load_w=500.0, soc=0.8)
-    assert r["batt_w"] == pytest.approx(7936.0, abs=64.0)          # 155 A x 51,2 V
-    assert r["grid_w"] < -8000.0
+    assert r["batt_w"] == pytest.approx(7987.2, abs=1.0)           # 156 A x 51,2 V
+    assert r["grid_w"] == pytest.approx(500.0 - 1000.0 - 7987.2, abs=1.0)
+
+
+def test_deye_response_peak_shaving_on_sells_nothing_from_the_pack():
+    """2026-09-25 sell_setpoint_ps_on: Export First with an 8 kW setpoint and
+    peak shaving left ON put 107 W on the meter; the pack only covered the
+    3,7 kW house load."""
+    cmd = dict(core.deye_command(p_grid_w=-9000.0, p_batt_w=8000.0, pack_v=51.2), grid_peak_shaving=True)
+    r = core.deye_response(cmd, main_pot_w=0.0, micro_w=0.0, load_w=3700.0, soc=0.9)
+    assert r["batt_w"] == pytest.approx(3700.0, abs=1.0)
+    assert r["grid_w"] == pytest.approx(0.0, abs=1.0)
+
+
+def test_deye_response_sell_setpoint_and_tou_power_cap_the_pack():
+    """The three levers compose and the smallest wins (2026-09-25 sell_setpoint
+    6 kW -> 6,2 kW on the meter; sell_tou_power 3 kW -> 3,16 kW from the pack
+    under an 11,5 kW setpoint)."""
+    base = core.deye_command(p_grid_w=-12000.0, p_batt_w=12000.0, pack_v=51.2)
+    setp = core.deye_response(dict(base, export_surplus_power=6000.0), 0.0, 0.0, 500.0, 0.9)
+    assert setp["grid_w"] == pytest.approx(-6000.0, abs=1.0)
+    assert setp["batt_w"] == pytest.approx(6500.0, abs=1.0)
+    tou = core.deye_response(dict(base, program_6_power=3000.0), 0.0, 0.0, 500.0, 0.9)
+    assert tou["batt_w"] == pytest.approx(3000.0, abs=1.0)
+    assert tou["grid_w"] == pytest.approx(-2500.0, abs=1.0)
+
+
+def test_deye_response_grid_charge_needs_the_tou_target():
+    """2026-09-25 grid_charge vs grid_charge_tou: without program 6 SOC above
+    the pack, the switch and 40 A do nothing and the pack keeps feeding the
+    house under zero export."""
+    cmd = core.deye_command(p_grid_w=2000.0, p_batt_w=-2000.0, pack_v=51.2)
+    off = core.deye_response(dict(cmd, program_6_soc=5.0), main_pot_w=0.0, micro_w=0.0, load_w=600.0, soc=0.9)
+    assert off["batt_w"] == pytest.approx(600.0, abs=1.0)          # self-supply, no import
+    assert off["grid_w"] == pytest.approx(0.0, abs=1.0)
+    on = core.deye_response(cmd, main_pot_w=0.0, micro_w=0.0, load_w=600.0, soc=0.9)
+    assert on["batt_w"] < -1900.0 and on["grid_w"] > 2500.0
 
 
 def test_deye_response_never_discharges_below_the_floor():
@@ -804,7 +855,7 @@ def test_run_plan_passes_the_price_scaled_stress_override(stub, tmp_path):
     _, body = stub.posts[0]
     buy, sell = body["load_cost_forecast"], body["prod_price_forecast"]
     pi = sum((b + s) / 2.0 for b, s in zip(buy, sell)) / len(buy)
-    assert body["battery_stress_cost"] == pytest.approx(round(12.5 * core.Q_PORT * pi, 5), abs=1e-6)
+    assert body["battery_stress_cost"] == pytest.approx(round(12500.0 / core.ETA_D / 1000.0 * core.Q_PORT * pi, 5), abs=1e-6)
     assert body["inverter_stress_cost"] == pytest.approx(round(12.0 * core.Q_BRIDGE * pi, 5), abs=1e-6)
     # empty archive -> days_since_full None -> OVERDUE (2026-09-15): no surplus
     # penalty, the pull at full strength; a pack with no balance on record needs one
@@ -971,17 +1022,11 @@ def flat_actuals(plan, g_meas=0.0, b_dc=0.0):
     return {"pv_w": [2000.0] * n, "grid_w": [float(g_meas)] * n, "batt_dc_w": [float(b_dc)] * n}
 
 
-DAY_ACTUALS = {"pv_w": [0.0] * 96, "grid_w": [0.0] * 96, "batt_dc_w": [0.0] * 96}
-
-
-def test_planned_cost_and_soc_term():
+def test_lambda_and_soc_term():
     plan = flat_plan()
     lam = core.lambda_for(plan["sell"], 0.9)
     assert lam == pytest.approx(0.09)
-    pc = core.planned_cost(plan, 48.0, lam)
-    assert pc["cash"] == pytest.approx(48 * 0.075 - 48 * 0.025)        # 2,40 EUR
-    assert pc["soc_term"] == pytest.approx(0.10 * 48 * 0.09)           # 10 % drained, 0,432 EUR
-    assert pc["total"] == pytest.approx(2.832)
+    assert core.soc_term(50.0, 40.0, 48.0, lam) == pytest.approx(0.10 * 48 * 0.09)   # 10 % drained, 0,432 EUR
     assert core.soc_term(40.0, 50.0, 48.0, 0.09) == pytest.approx(-0.432)   # a charged pack is a credit
 
 
@@ -1105,36 +1150,6 @@ def test_settle_slice_needs_matching_series():
     assert core.settle_slice({"n": 4}, [1.0], [1.0]) is None
 
 
-def test_score_row_gap_is_replayed_minus_hindsight():
-    plan = flat_plan()
-    act = flat_actuals(plan, g_meas=2000.0)          # 2 kW imported all day on the real meter
-    realised = {"cash_eur": 7.2, "soc_start_pct": 50.0, "soc_end_pct": 50.0, "pv_kwh": 40.0, "load_kwh": 10.0}
-    hs = {"status": "ok", "eur": -5.0}               # the 20/20 ceiling
-    row = core.score_row(date(2026, 9, 2), plan, realised, 48.0, 0.9, hindsight=hs, actuals=act)
-    assert row["planned_eur"] == pytest.approx(2.832) and row["replay_status"] == "ok"
-    # realised is STILL recorded (drift alarm) - re-settled in the plan's frame -
-    # but it is no longer a verdict lane, so the gap does not touch it.
-    assert row["realised_cash_eur"] == pytest.approx(14.4) and row["realised_cash_meter_eur"] == 7.2
-    assert row["realised_eur"] == pytest.approx(14.4)
-    assert row["hindsight_eur"] == -5.0
-    assert row["gap_eur"] == pytest.approx(row["replayed_eur"] - (-5.0))        # actual - max
-    assert row["forecast_gap_eur"] == pytest.approx(row["replayed_eur"] - row["planned_eur"])
-    assert "meter_drift" in row["flags"]             # the meter said 7,20 where the frame says 14,40
-    assert row["pv_planned_kwh"] == pytest.approx(48.0) and row["load_planned_kwh"] == pytest.approx(12.0)
-    assert row["lambda_eur_kwh"] == pytest.approx(0.09)
-    assert set(row) == set(core.SCORE_COLUMNS)
-
-
-def test_score_row_no_gap_without_the_hindsight_ceiling():
-    plan = flat_plan()
-    act = flat_actuals(plan, g_meas=2000.0)
-    realised = {"cash_eur": 7.2, "soc_start_pct": 50.0, "soc_end_pct": 50.0, "pv_kwh": 40.0, "load_kwh": 10.0}
-    row = core.score_row(date(2026, 9, 2), plan, realised, 48.0, 0.9,
-                         hindsight={"status": "no_actuals", "eur": None}, actuals=act)
-    assert row["gap_eur"] is None and "no_hindsight" in row["flags"]
-    assert row["replayed_eur"] is not None and row["realised_eur"] is not None    # both still recorded
-
-
 def test_replay_is_a_difference_so_an_unmetered_residual_cancels():
     """The site does not balance; ~4,2 kWh/day of standby and conversion loss sits
     between (load - PV - battery) and the meter. Written as a difference, that
@@ -1191,6 +1206,30 @@ def test_replay_of_a_settled_slice_takes_the_settled_battery():
     assert rep["peak_import_kw"] == pytest.approx(0.0, abs=0.01)
 
 
+def test_replay_bills_a_metered_step_at_the_meter_alone():
+    """A live day's settled slice marks the steps the P1 meter settled
+    (2026-09-30). Those bill the meter's grid with no bridge swap, no
+    curtailment repair and no quadratic loss: the meter already paid it. The
+    unmarked steps keep the counterfactual formula and its loss."""
+    n = 8
+    plan = flat_plan(n=n, settled=True, measured="1111" + "0000")
+    plan.update(p_batt_w=[3000.0] * n)
+    lam = core.lambda_for(plan["sell"], 0.9)
+    g_meas, b_dc, pv = [400.0] * n, [3000.0] * n, [2000.0] * n
+    pot = [2500.0] * n                                             # a repair the metered steps must not take
+    rep = core.replay_day(plan, g_meas, b_dc, pv, 48.0, lam, pv_pot_w=pot)
+    metered = [core.step_cost(400.0, plan["buy"][i], plan["sell"][i]) for i in range(4)]
+    assert rep["step_eur"][:4] == pytest.approx(metered, abs=1e-6)
+    full = core.replay_day(dict(plan, measured=None), g_meas, b_dc, pv, 48.0, lam, pv_pot_w=pot)
+    assert rep["step_eur"][4:] == pytest.approx(full["step_eur"][4:], abs=1e-6)
+    assert rep["loss"] == pytest.approx(full["loss"] / 2, abs=1e-4)   # only the unmetered half
+    assert rep["cash"] + rep["loss"] == pytest.approx(sum(rep["step_eur"]), abs=1e-4)
+    # an unsettled compact ignores the mask: it is not the day that ran
+    plan_only = core.replay_day(dict(plan, settled=False), g_meas, b_dc, pv, 48.0, lam, pv_pot_w=pot)
+    no_mask = core.replay_day(dict(plan, settled=False, measured=None), g_meas, b_dc, pv, 48.0, lam, pv_pot_w=pot)
+    assert plan_only["step_eur"] == no_mask["step_eur"] and plan_only["loss"] == no_mask["loss"] > 0
+
+
 def test_replay_crosses_the_bridge_asymmetrically():
     """1 kW leaving the pack lands as 989 W on the AC bus; 1 kW entering it costs
     1011 W off the bus. Only that one term survives the difference."""
@@ -1218,104 +1257,18 @@ def test_replay_flags_a_trace_that_asks_too_much_of_the_connection():
     assert short["status"] == "no_actuals" and short["eur"] is None
 
 
-def test_score_row_flags():
-    plan = flat_plan()
-    act = flat_actuals(plan, g_meas=1000.0)          # frame cash 7,20, near enough the 3,00 meter? no
-    realised = {"cash_eur": 7.2, "soc_start_pct": 50.0, "soc_end_pct": 50.0, "pv_kwh": None, "load_kwh": None}
-    row = core.score_row(date(2026, 9, 2), flat_plan(n_predicted_steps=12, pv_gap_steps=2), realised, 48.0, 0.9,
-                         actuals=act)
-    assert row["flags"] == "predicted_prices;pv_gaps"
-    row = core.score_row(date(2026, 9, 2), None, realised, 48.0, 0.9, actuals=act)
-    assert row["flags"] == "no_plan" and row["gap_eur"] is None and row["realised_cash_eur"] == 7.2
-    row = core.score_row(date(2026, 9, 2), plan, dict(realised, cash_eur=None), 48.0, 0.9)
-    assert "no_meter" in row["flags"] and row["gap_eur"] is None
-    row = core.score_row(date(2026, 9, 2), plan, realised, 48.0, 0.9)          # no measured series
-    assert "no_replay" in row["flags"] and row["gap_eur"] is None
-    assert row["replay_status"] == "no_actuals" and row["realised_eur"] == pytest.approx(7.2)
-    row = core.score_row(date(2026, 9, 2), plan, dict(realised, soc_end_pct=None), 48.0, 0.9, actuals=act)
-    assert "no_soc" in row["flags"] and row["gap_eur"] is None
-
-
-def test_csv_upsert_replaces_a_day_and_keeps_order(tmp_path):
-    p = str(tmp_path / "scores.csv")
-    plan = flat_plan()
-    act = flat_actuals(plan)
-    realised = {"cash_eur": 3.0, "soc_start_pct": 50.0, "soc_end_pct": 50.0, "pv_kwh": 1.0, "load_kwh": 2.0}
-    hs = {"status": "ok", "eur": -1.0}
-    core.upsert_score(p, core.score_row(date(2026, 9, 3), flat_plan(date="2026-09-03"), realised, 48.0, 0.9, hs, act))
-    core.upsert_score(p, core.score_row(date(2026, 9, 2), plan, realised, 48.0, 0.9, hs, act))
-    rows = core.upsert_score(p, core.score_row(date(2026, 9, 3), flat_plan(date="2026-09-03"),
-                                               dict(realised, cash_eur=4.0), 48.0, 0.9, hs, act))
-    assert [r["date"] for r in rows] == ["2026-09-02", "2026-09-03"]
-    assert rows[1]["realised_cash_meter_eur"] == 4.0
-    assert rows[1]["gap_eur"] == pytest.approx(rows[1]["replayed_eur"] - (-1.0))
-    back = core.read_scores(p)
-    assert back == rows and back[0]["n_predicted_steps"] == 0 and back[0]["replay_status"] == "ok"
-
-
-def test_rolling_window_and_compact_lists():
-    rows = []
-    for k in range(35):
-        d = (date(2026, 9, 1) + timedelta(days=k)).isoformat()
-        rows.append({c: None for c in core.SCORE_COLUMNS} | {"date": d, "planned_eur": 2.0, "replayed_eur": 2.5,
-                                                             "hindsight_eur": 2.0, "realised_eur": 3.0, "gap_eur": 0.5,
-                                                             "flags": "pv_gaps" if k == 34 else ""})
-    r = core.rolling(rows)
-    assert r["gap_30d"] == 15.0 and r["n_days"] == 30 and r["planned_30d"] == 60.0
-    assert r["replayed_30d"] == 75.0 and r["hindsight_30d"] == 60.0
-    assert r["n_flagged"] == 1 and len(r["recent"]) == 7 and len(r["days"]) == 30
-    # the table is actual, max, gap: replayed, hindsight, replayed-minus-hindsight
-    assert r["recent"][-1] == ["2026-10-05", 2.5, 2.0, 0.5, "pv_gaps"] and r["days"][0] == ["2026-09-06", 2.5, 2.0, 0.5]
-    short = core.rolling(rows[:3])
-    assert short["gap_30d"] == 1.5 and short["n_days"] == 3 and len(short["recent"]) == 3
-    assert core.rolling([])["n_days"] == 0
-    # a row missing a verdict lane (no hindsight ceiling, or too old for actuals)
-    # is not comparable and drops out until the day is re-scored
-    stale = [dict(rows[0], hindsight_eur=None)]
-    assert core.rolling(stale)["n_days"] == 0 and core.rolling(stale)["gap_30d"] == 0
-
-
-def test_score_day_reads_the_archive_and_rescoring_keeps_realised(tmp_path):
-    arch, csvp = str(tmp_path / "plans"), str(tmp_path / "scores.csv")
-    made = local(2026, 9, 1, 13, 0, 30)
-    t0, n = core.horizon(made, AMS)
-    core.write_plan_archive(arch, made, {"plan_ts": made.isoformat(), "t0": t0.isoformat(), "n": n, "tz": AMS,
-                                         "soc_init": 0.5, "soc_final": 0.5, "optim_status": "Optimal",
-                                         "n_predicted_steps": 0, "pv_gap_steps": 0, "rows": make_rows(t0, n)})
-    realised = {"cash_eur": 3.0, "soc_start_pct": 50.0, "soc_end_pct": 45.0, "pv_kwh": 40.0, "load_kwh": 10.0}
-    hs = {"status": "ok", "eur": -1.0}
-    res = core.score_day(arch, csvp, "2026-09-02", AMS, realised, 48.0, 0.9, hs, DAY_ACTUALS)
-    row = res["row"]
-    # the 3,00 meter figure against a zero measured grid trace: the drift alarm
-    assert row["flags"] == "meter_drift" and row["plan_ts"] == made.isoformat()
-    assert res["rolling"]["n_days"] == 1
-    assert row["replay_status"] == "ok" and row["replayed_eur"] is not None
-    assert row["gap_eur"] == pytest.approx(row["replayed_eur"] - (-1.0))
-    # 13:00:30 ceils to 13:15, so 1 Sep has 43 steps (indices 0..42); the day
-    # starts at the SOC after index 42
-    assert row["soc_start_plan_pct"] == pytest.approx(100 * (0.5 - 0.001 * 42))
-    empty = {"cash_eur": None, "soc_start_pct": None, "soc_end_pct": None, "pv_kwh": None, "load_kwh": None}
-    # a rescore with no fresh hindsight keeps the stored ceiling, so the gap holds
-    again = core.score_day(arch, csvp, "2026-09-02", AMS, empty, 48.0, 0.9, None, DAY_ACTUALS)["row"]
-    assert again["realised_cash_meter_eur"] == 3.0 and again["gap_eur"] == row["gap_eur"]
-    missing = core.score_day(arch, csvp, "2026-09-05", AMS, realised, 48.0, 0.9, hs, DAY_ACTUALS)["row"]
-    assert missing["flags"] == "no_plan"
-
-
 def test_rehydrate_rebuilds_from_files(tmp_path):
-    arch, csvp = str(tmp_path / "plans"), str(tmp_path / "scores.csv")
+    arch = str(tmp_path / "plans")
     made = local(2026, 9, 1, 13, 0, 30)
     t0, n = core.horizon(made, AMS)
     core.write_plan_archive(arch, made, {"plan_ts": made.isoformat(), "t0": t0.isoformat(), "n": n, "tz": AMS,
                                          "soc_init": 0.5, "soc_final": 0.5, "optim_status": "Optimal",
                                          "n_predicted_steps": 0, "pv_gap_steps": 0, "rows": make_rows(t0, n)})
-    realised = {"cash_eur": 3.0, "soc_start_pct": 50.0, "soc_end_pct": 45.0, "pv_kwh": 40.0, "load_kwh": 10.0}
-    core.score_day(arch, csvp, "2026-09-02", AMS, realised, 48.0, 0.9, {"status": "ok", "eur": -1.0}, DAY_ACTUALS)
-    r = core.rehydrate(arch, csvp, AMS, local(2026, 9, 2, 9, 0).isoformat(), 26)
-    assert r["today"]["date"] == "2026-09-02" and r["next_day"] is None
-    assert r["rolling"]["n_days"] == 1 and r["last_row"]["date"] == "2026-09-02" and r["plan_fresh"] is True
-    assert core.rehydrate(arch, csvp, AMS, local(2026, 9, 3, 9, 0).isoformat(), 26)["plan_fresh"] is False
-    assert core.rehydrate(str(tmp_path / "none"), str(tmp_path / "none.csv"), AMS, local(2026, 9, 3, 9, 0).isoformat(), 26)["rolling"] is None
+    r = core.rehydrate(arch, AMS, local(2026, 9, 2, 9, 0).isoformat(), 26)
+    assert r["today"]["date"] == "2026-09-02" and r["next_day"] is None and r["plan_fresh"] is True
+    assert "rolling" not in r and "last_row" not in r          # the scoreboard retired 2026-09-27
+    assert core.rehydrate(arch, AMS, local(2026, 9, 3, 9, 0).isoformat(), 26)["plan_fresh"] is False
+    assert core.rehydrate(str(tmp_path / "none"), AMS, local(2026, 9, 3, 9, 0).isoformat(), 26)["plan_fresh"] is False
 
 
 # ---- virtual SOC chaining ------------------------------------------------------
@@ -1824,17 +1777,6 @@ def test_virtual_day_repairs_to_the_p50_not_to_the_mix(tmp_path):
     assert vd["pv_reconstructed_kwh"] == pytest.approx(1.05 * core.STEP_H, abs=1e-3)
 
 
-def test_score_row_repairs_against_the_p50(tmp_path):
-    arch = str(tmp_path / "plans")
-    day = date(2026, 9, 2)
-    write_full_day_plan(arch, local(2026, 9, 1, 23, 0), day, pv=[1000.0] * 96, load=[350.0] * 96)
-    doc = _add_p50(arch, [1250.0] * 96)
-    plan = core.compact_slice(core.day_slice(doc["rows"], day, AMS, 0.5), doc)
-    act = dict(DAY_ACTUALS, pv_w=[600.0] * 96, curtailed=[1.0] * 96)
-    row = core.score_row(day, plan, {"cash_eur": None}, 48.2, 0.9, None, act)
-    assert row["pv_reconstructed_kwh"] == pytest.approx(96 * 0.65 * core.STEP_H, abs=1e-3)   # up to 1250, not 1000
-
-
 def test_hindsight_day_ceiling_is_the_p50(stub, tmp_path):
     arch = str(tmp_path / "plans")
     pt0, pn = hs_plan(arch)
@@ -2086,12 +2028,6 @@ def test_loss_adjustment_prices_the_quadratic_loss_per_slot():
     assert core.loss_adjustment(rows) == pytest.approx(core.Q_BRIDGE * 4 * 0.25 * 0.2, abs=1e-4)
 
 
-def test_planned_cost_includes_the_loss_adjustment():
-    plan = flat_plan(loss_eur=0.5)
-    pc = core.planned_cost(plan, 48.0, core.lambda_for(plan["sell"], 0.9))
-    assert pc["loss"] == 0.5 and pc["total"] == pytest.approx(2.832 + 0.5)
-
-
 def test_compact_slice_carries_the_loss_adjustment():
     t0 = local(2026, 9, 2, 0, 0)
     rows = make_rows(t0, 96)
@@ -2264,7 +2200,7 @@ def test_hindsight_day_failure_paths(stub, tmp_path):
 
 
 def test_pv_potential_is_raw_solcast_on_a_masked_step_and_nothing_else():
-    """The site rule (2026-09-07): a masked step takes raw Solcast; the fitted
+    """The site's rule (2026-09-07): a masked step takes raw Solcast; the fitted
     daily scale and the peak guard are retired. Numbers are 2026-09-05."""
     clean_meas = [897.0, 2493.0] * 6          # 12 clean steps, ratios 0,88 and 0,78: irrelevant now
     clean_sol = [1016.0, 3212.0] * 6
@@ -2339,59 +2275,6 @@ def test_window_series_spans_calendar_days(stub, tmp_path):
     day_vals, _ = core.fifteen_min_series(date(2026, 9, 1), AMS, rows)
     assert day_vals[53] == pytest.approx(vals[0])            # 13:15 is step 53 of the day
 
-
-def test_score_row_records_the_hindsight_lane():
-    realised = {"cash_eur": 3.0, "soc_start_pct": 50.0, "soc_end_pct": 50.0, "pv_kwh": 40.0, "load_kwh": 10.0}
-    act = flat_actuals(flat_plan(), g_meas=1000.0)
-    realised = dict(realised, cash_eur=7.2)
-    row = core.score_row(date(2026, 9, 2), flat_plan(), realised, 48.0, 0.9, {"status": "ok", "eur": 1.5}, act)
-    assert row["hindsight_eur"] == 1.5 and row["hindsight_status"] == "ok" and row["flags"] == ""
-    row = core.score_row(date(2026, 9, 2), flat_plan(), realised, 48.0, 0.9, {"status": "no_actuals", "eur": None}, act)
-    assert row["hindsight_eur"] is None and row["hindsight_status"] == "no_actuals"
-    assert "no_hindsight" in row["flags"]
-
-
-def test_score_day_keeps_an_ok_hindsight_over_a_failed_rescore(tmp_path):
-    arch, csvp = str(tmp_path / "plans"), str(tmp_path / "scores.csv")
-    made = local(2026, 9, 1, 13, 2)
-    t0, n = core.horizon(made, AMS)
-    core.write_plan_archive(arch, made, {"plan_ts": made.isoformat(), "t0": t0.isoformat(), "n": n, "tz": AMS,
-                                         "soc_init": 0.5, "soc_final": 0.5, "optim_status": "Optimal",
-                                         "n_predicted_steps": 0, "pv_gap_steps": 0, "rows": make_rows(t0, n)})
-    realised = {"cash_eur": 3.0, "soc_start_pct": 50.0, "soc_end_pct": 50.0, "pv_kwh": 1.0, "load_kwh": 1.0}
-    r1 = core.score_day(arch, csvp, "2026-09-02", AMS, realised, 48.0, 0.9, {"status": "ok", "eur": 1.5})["row"]
-    assert r1["hindsight_eur"] == 1.5
-    empty = {k: None for k in realised}
-    r2 = core.score_day(arch, csvp, "2026-09-02", AMS, empty, 48.0, 0.9, {"status": "solve_failed", "eur": None})["row"]
-    assert r2["hindsight_eur"] == 1.5 and r2["hindsight_status"] == "ok" and "no_hindsight" not in r2["flags"]
-    r3 = core.score_day(arch, csvp, "2026-09-02", AMS, empty, 48.0, 0.9, None)["row"]
-    assert r3["hindsight_eur"] == 1.5
-    r4 = core.score_day(arch, csvp, "2026-09-02", AMS, empty, 48.0, 0.9, {"status": "ok", "eur": 1.2})["row"]
-    assert r4["hindsight_eur"] == 1.2
-
-
-def test_rolling_windows_and_capture():
-    rows = []
-    for k in range(10):
-        d = (date(2026, 9, 1) + timedelta(days=k)).isoformat()
-        # earnings: actual -6, theoretical max -8, so gap = actual - max = +2 regret
-        rows.append({c: None for c in core.SCORE_COLUMNS} | {
-            "date": d, "planned_eur": -9.0, "replayed_eur": -6.0, "realised_eur": -3.0,
-            "hindsight_eur": -8.0, "gap_eur": 2.0, "forecast_gap_eur": 3.0})
-    r = core.rolling(rows)
-    w = r["windows"]
-    assert w["d1"]["gap"] == 2.0 and w["d7"]["gap"] == 14.0 and w["d30"]["gap"] == 20.0 and w["all"]["gap"] == 20.0
-    assert w["all"]["n"] == 10 and w["all"]["replayed"] == -60.0 and w["all"]["hindsight"] == -80.0
-    assert w["all"]["planned"] == -90.0 and w["all"]["forecast_gap"] == 30.0
-    cap = r["capture"]
-    # captured -60 of a possible -80: 75 % of the theoretical maximum
-    assert cap["n_days"] == 10 and cap["captured_eur"] == -60.0 and cap["max_eur"] == -80.0 and cap["pct"] == 75.0
-    # a net-cost window (hindsight above the -0,50 guard) yields no ratio
-    flat = [dict(rows[0], replayed_eur=0.2, hindsight_eur=0.1)]
-    assert core.rolling(flat)["capture"]["pct"] is None
-
-
-# ---- load forecast -----------------------------------------------------------
 
 def diurnal_day(day, tz=AMS, night=100.0, peak=3000.0):
     """A day with an unmistakable shape: `peak` W from 12:00 to 13:00 local,
@@ -2536,7 +2419,7 @@ def test_run_plan_without_history_leaves_the_load_to_emhass(stub, tmp_path):
     assert core.load_plan(res["archive_path"])["load_source"] == "emhass"
 
 
-# ---- replay: re-run a past day under current logic ---------------------------
+# ---- replay docs in the archive (replay_plan retired 2026-09-27) ---------------
 
 def _source_plan(arch, made, tariff_dict):
     """Write an organic plan of record and return (t0, n, raw_da)."""
@@ -2554,65 +2437,18 @@ def _source_plan(arch, made, tariff_dict):
     return t0, n, da
 
 
-def _seven_days_before(day, w=400.0):
-    return {day - timedelta(days=k): [w] * 96 for k in range(1, 8)}
-
-
-def test_replay_plan_reruns_on_source_shoes_under_current_tariff(stub, tmp_path):
-    arch = str(tmp_path / "plans")
-    old = {"energy_tax": 0.0, "supplier_fee": 0.0, "btw_pct": 0.0, "feedin_fee": 0.0}
-    made = local(2026, 9, 1, 13, 0, 30)
-    t0, n, da = _source_plan(arch, made, old)
-    stamped = local(2026, 9, 4, 10, 0)                         # the MPC anchors rows at now, not the source day
-    stub.plan_fn = lambda posts: make_rows(stamped, n)
-    new = {"energy_tax": 0.11, "supplier_fee": 0.019, "btw_pct": 21.0, "feedin_fee": 0.019}
-    out = core.replay_plan(arch, stub.url, "2026-09-02", AMS, new,
-                           _seven_days_before(date(2026, 9, 2)), 48.0, 0.9)
-    assert out["status"] == "ok" and out["n"] == n and out["load_ref_days"] == 7
-    body = stub.posts[-1][1]
-    assert body["prediction_horizon"] == n
-    assert body["load_power_forecast"][10] == 400.0            # rebuilt profile, never EMHASS naive
-    exp_buy, exp_sell = core.tariff(da, 0.11, 0.019, 21.0, 0.019)
-    assert body["load_cost_forecast"][5] == pytest.approx(exp_buy[5])   # source DA, current frame
-    assert body["prod_price_forecast"][5] == pytest.approx(exp_sell[5])
-    assert body["pv_power_forecast"][7] == pytest.approx(700.0)         # source PV preserved
-    assert body["battery_stress_cost"] > 0 and body["inverter_stress_cost"] > 0
-    # the replay doc is now the plan of record, marked, rows re-stamped to the source horizon
-    doc, sl = core.plan_for_day(arch, date(2026, 9, 2), AMS)
-    assert doc.get("replay") is True and doc["t0"] == t0.isoformat()
-    assert doc["tariff"] == new and doc["load_source"] == "profile"
-    assert core._parse_ts(doc["rows"][0]["timestamp"]) == t0.astimezone(timezone.utc)
-    assert sl["n"] == 96
-    # the untouched organic source is still findable, so a re-replay is idempotent
-    src = core.original_plan_for_day(arch, date(2026, 9, 2), AMS)
-    assert src.get("replay") is None and src["plan_ts"] == made.isoformat()
-
-
-def test_replay_plan_refuses_thin_load_history_without_solving(stub, tmp_path):
-    arch = str(tmp_path / "plans")
-    tf = {"energy_tax": 0.0, "supplier_fee": 0.0, "btw_pct": 0.0, "feedin_fee": 0.0}
-    _source_plan(arch, local(2026, 9, 1, 13, 0, 30), tf)
-    out = core.replay_plan(arch, stub.url, "2026-09-02", AMS, tf,
-                           {date(2026, 9, 1): [400.0] * 96}, 48.0, 0.9)      # one day < LOAD_MIN_REF_DAYS
-    assert out["status"] == "insufficient_load" and out["load_ref_days"] == 1
-    assert stub.posts == []                                    # never posted a solve
-
-
-def test_replay_plan_no_source_plan(stub, tmp_path):
-    out = core.replay_plan(str(tmp_path / "plans"), stub.url, "2026-09-02", AMS,
-                           {"energy_tax": 0.0, "supplier_fee": 0.0, "btw_pct": 0.0, "feedin_fee": 0.0},
-                           _seven_days_before(date(2026, 9, 2)), 48.0, 0.9)
-    assert out["status"] == "no_plan" and stub.posts == []
-
-
-def test_original_plan_for_day_skips_replay_docs(stub, tmp_path):
+def test_original_plan_for_day_skips_replay_docs(tmp_path):
+    """The archive still holds the replay docs the retired replay_plan wrote: a
+    re-solve archived under a later filename, carrying its source's plan_ts."""
     arch = str(tmp_path / "plans")
     tf = {"energy_tax": 0.0, "supplier_fee": 0.0, "btw_pct": 0.0, "feedin_fee": 0.0}
     made = local(2026, 9, 1, 13, 0, 30)
-    _source_plan(arch, made, tf)
-    _, n = core.horizon(made, AMS)
-    stub.plan_fn = lambda posts: make_rows(local(2026, 9, 4, 10, 0), n)
-    core.replay_plan(arch, stub.url, "2026-09-02", AMS, tf, _seven_days_before(date(2026, 9, 2)), 48.0, 0.9)
+    t0, n, _da = _source_plan(arch, made, tf)
+    core.write_plan_archive(arch, local(2026, 9, 4, 10, 0), {
+        "plan_ts": made.isoformat(), "t0": t0.isoformat(), "n": n, "tz": AMS, "soc_init": 0.5,
+        "soc_final": 0.5, "tariff": dict(tf), "n_predicted_steps": 0, "pv_gap_steps": 0,
+        "optim_status": "Optimal", "rows": make_rows(t0, n), "replay": True,
+        "source_plan_ts": made.isoformat()})
     doc, _ = core.plan_for_day(arch, date(2026, 9, 2), AMS)
     assert doc.get("replay") is True                          # the record is the replay
     assert core.original_plan_for_day(arch, date(2026, 9, 2), AMS)["plan_ts"] == made.isoformat()
@@ -2677,7 +2513,7 @@ def test_rolled_slices_day_after_is_none_when_no_plan_reaches_it(tmp_path):
 
 
 def test_a_replay_doc_never_shadows_the_plans_that_actually_ran(tmp_path):
-    """replay_plan archives a re-solve under TODAY's filename while keeping the
+    """replay_plan (retired 2026-09-27) archived a re-solve under TODAY's filename while keeping the
     source plan's pre-midnight plan_ts, so filename order stops meaning plan_ts
     order. Found live 2026-09-04: the whole of yesterday's virtual lane was
     served by one plan stamped two days earlier, every hourly re-plan of that
@@ -2714,25 +2550,22 @@ def test_a_replay_doc_never_shadows_the_plans_that_actually_ran(tmp_path):
     assert core.plan_for_day(arch, day, AMS)[0].get("replay") is True
 
 
-def test_deye_response_tou_target_stops_at_the_target_not_the_clamp():
-    """2 points of SOC is 3,9 kW over one step, well inside the 8 kW cap, so the
-    TARGET binds and the pack stops there."""
+def test_deye_response_ignores_a_tou_target_the_record_no_longer_carries():
+    """The TOU-target branch was never bench-verified and the go-live trials
+    (2026-09-25/26) showed the pack follows the discharge clamp under Export
+    First; `target_soc` is accepted and ignored, so the clamp binds."""
     cmd = core.deye_command(p_grid_w=-9000.0, p_batt_w=8000.0, pack_v=51.2, target_soc=0.78)
     r = core.deye_response(cmd, main_pot_w=0.0, micro_w=0.0, load_w=500.0, soc=0.80)
-    assert r["batt_w"] == pytest.approx(0.02 * core.CAPACITY_KWH * 1000.0 / core.STEP_H, abs=1.0)
+    assert r["batt_w"] == pytest.approx(7987.2, abs=1.0)           # 156 A x 51,2 V, not 2 SOC points
 
 
-def test_deye_response_tou_power_cap_binds_when_the_target_is_far():
-    """5 points would be 9,6 kW, past the cap, so the CAP binds instead."""
-    cmd = core.deye_command(p_grid_w=-9000.0, p_batt_w=8000.0, pack_v=51.2, target_soc=0.30)
-    r = core.deye_response(cmd, main_pot_w=0.0, micro_w=0.0, load_w=500.0, soc=0.80)
-    assert r["batt_w"] == pytest.approx(8000.0, abs=64.0)
-
-
-def test_deye_response_tou_target_charges_when_the_pack_is_below_it():
-    cmd = core.deye_command(p_grid_w=-9000.0, p_batt_w=8000.0, pack_v=51.2, target_soc=0.60)
+def test_deye_response_export_first_charges_the_surplus_beyond_the_setpoint():
+    """Sun past load + setpoint has nowhere else to go (2026-09-24 history under
+    the supplier: 5,5 kW setpoint, 5,4 kW of sun, pack charging)."""
+    cmd = dict(core.deye_command(p_grid_w=-9000.0, p_batt_w=8000.0, pack_v=51.2), export_surplus_power=3000.0)
     r = core.deye_response(cmd, main_pot_w=9000.0, micro_w=0.0, load_w=500.0, soc=0.55)
-    assert r["batt_w"] < 0
+    assert r["batt_w"] == pytest.approx(-5500.0, abs=1.0)
+    assert r["grid_w"] == pytest.approx(-3000.0, abs=1.0)
 
 
 # ---- rehydrate: republish only the solve the archive knows ---------------------
@@ -2767,7 +2600,7 @@ def test_rehydrate_reports_the_newest_organic_plans_last_run(stub, tmp_path):
     res = core.run_plan(plan_inputs(now, tmp_path, stub.url))
     assert res["ok"], res
     doc = core.load_plan(res["archive_path"])
-    out = core.rehydrate(str(tmp_path / "plans"), str(tmp_path / "scores.csv"), AMS,
+    out = core.rehydrate(str(tmp_path / "plans"), AMS,
                          (now + timedelta(minutes=20)).isoformat(), 26.0)
     assert out["plan_fresh"] is True
     assert out["newest_last_run"] == doc["last_run"]
@@ -2803,18 +2636,21 @@ def test_run_plan_applies_the_live_knobs(stub, tmp_path):
     inp["knobs"] = {"stress_scale": 2.0, "soc_final": 0.6, "weight_battery_discharge": 0.02,
                     "batt_power_max_w": 8000.0, "soc_min": 0.15, "soc_max": 0.95,
                     "soc_target": 1.0, "soc_target_at": "17:00",
-                    "deficit_threshold": 0.25, "deficit_cost": 0.02, "surplus_base": 0.01}
+                    "deficit_threshold": 0.25, "deficit_cost": 0.02, "surplus_base": 0.01,
+                    "surplus_threshold": 0.92}
     res = core.run_plan(inp)
     assert res["ok"], res
     body = stub.posts[0][1]
     buy, sell = body["load_cost_forecast"], body["prod_price_forecast"]
     pi = sum((b + s_) / 2.0 for b, s_ in zip(buy, sell)) / len(buy)
-    assert body["battery_stress_cost"] == pytest.approx(2 * round(12.5 * core.Q_PORT * pi, 5), abs=2e-5)
+    assert body["battery_stress_cost"] == pytest.approx(2 * round(8359.5 / 1000.0 * core.Q_PORT * pi, 5), abs=2e-5)
     assert body["soc_final"] == 0.6 and body["weight_battery_discharge"] == 0.02
-    assert body["battery_charge_power_max"] == 8000.0 and body["battery_discharge_power_max"] == 8000.0
+    # the knob is port power: charge raw, discharge / 0,957
+    assert body["battery_charge_power_max"] == 8000.0 and body["battery_discharge_power_max"] == 8359.5
     assert body["battery_minimum_state_of_charge"] == 0.15 and body["battery_maximum_state_of_charge"] == 0.95
     assert body["soc_target"] == 1.0 and body["soc_target_timestep"] == 11            # 17:00 from a 14:15 start
     assert body["battery_soc_deficit_threshold"] == 0.25 and body["battery_soc_deficit_cost"] == 0.02
+    assert body["battery_soc_surplus_threshold"] == 0.92
     doc = core.load_plan(res["archive_path"])
     assert doc["knobs"]["soc_final"] == 0.6 and doc["soc_final"] == 0.6 and doc["knobs"]["aux_cut_on_ratio"] == 1.5
     assert res["knobs"]["stress_scale"] == 2.0
@@ -2886,7 +2722,8 @@ def test_ab_payload_shifts_and_applies_the_knobs(tmp_path):
     assert pay["battery_stress_cost"] == pytest.approx(0.008) and pay["inverter_stress_cost"] == pytest.approx(0.002)
     assert pay["soc_final"] == 0.7 and pay["soc_target"] == 1.0
     assert pay["soc_target_timestep"] == core.soc_target_timestep(t0, n, date(2026, 9, 2), "17:00")
-    assert pay["battery_charge_power_max"] == 9000.0 and pay["battery_minimum_state_of_charge"] == 0.2
+    assert pay["battery_charge_power_max"] == 9000.0 and pay["battery_discharge_power_max"] == 9404.4
+    assert pay["battery_minimum_state_of_charge"] == 0.2
     assert pay["weight_battery_discharge"] == 0.03 and pay["battery_soc_deficit_cost"] == 0.02
     assert pay["battery_soc_surplus_cost"] == pytest.approx(0.01)                         # 0,005 x 0,01 / 0,005
     # the mix pulls the total from 1000 to 900 and the must-take lane scales with it (300 x 2 for the share, x 0,9)
@@ -3017,7 +2854,7 @@ def test_ab_store_and_load_roundtrip(tmp_path):
     assert core.ab_load(ab, "nope") is None
 
 
-# ---- no curtailment on residuals while selling pays (2026-09-08) -------------------
+# ---- no curtailment on residuals while selling pays (2026-09-08) --------------
 # On 2026-09-07 the self_balance command shut export and pinned the clamp to the
 # plan's P_batt on every charging step, so 2,3 kWh of sun above forecast was
 # thrown away at sell prices of 0,04 to 0,19 while the pack had headroom. The
@@ -3135,7 +2972,7 @@ def test_settle_slice_reads_the_sell_lane():
     assert out["p_grid_w"][1] == pytest.approx(0.0, abs=1.0)          # the same windfall banked, export shut at -0,01
 
 
-# ---- replaying the writer's margin through the settlement (2026-09-08) -------------
+# ---- replaying the writer's margin through the settlement (2026-09-08) --------
 
 def test_settle_step_with_margin_charges_faster_on_a_curtailed_step():
     """Plan declines 1.500 of 7.000 W at grid zero, charging 5.000. Same sun, same
@@ -3202,7 +3039,7 @@ def test_clamp_write_boundary_and_grid_charge_lift():
 
 def test_wanted_clamp_reports_grid_charge():
     amps, lift = core.wanted_clamp(4500.0, -7294.0)
-    assert lift is True and amps == pytest.approx(core.deye_amps(7294.0))
+    assert lift is True and amps == core.DEYE_CURRENT_MAX_A              # the grid current is the floor, the clamp stays open
     amps, lift = core.wanted_clamp(0.0, -5000.0, sell=-0.01, pv_curtail_w=800.0)
     assert lift is False and amps == pytest.approx(core.deye_amps(5000.0))
 
@@ -3222,7 +3059,7 @@ def test_settlement_carries_the_margin_by_default():
 
 
 
-# ---- the pack's own limits close the books (2026-09-08) -------------------------------
+# ---- the pack's own limits close the books (2026-09-08) --------------------------
 # The delta method kept the plan's P_batt on a step where the virtual pack had no
 # headroom left (base and actual run were both at zero charge, delta zero, plan
 # figure survives), and integrate_soc then clamped the energy away: 4,5 kWh over
@@ -3308,7 +3145,7 @@ def test_ab_walk_margin_override_charges_faster_and_chains_the_higher_soc(stub, 
     assert applied == {} and "margin" in skipped
 
 
-# ---- dwell above 95 % (2026-09-08) -------------------------------------------------
+# ---- dwell above 95 % (2026-09-08) --------------------------------------------
 # How long the virtual pack sits near full is the cost side of front-loading, so
 # it is counted wherever a settled SOC lane exists: the A/B summary, the live
 # day slices and the score row.
@@ -3336,23 +3173,6 @@ def test_virtual_day_carries_dwell_above_95(tmp_path):
     half = core.virtual_day(arch, day, AMS, local(2026, 9, 2, 12, 0))       # only the past half counts
     assert half["dwell_95_h"] == pytest.approx(12.0)
 
-
-def test_score_row_carries_dwell_above_95():
-    plan = flat_plan()
-    act = flat_actuals(plan, g_meas=2000.0)
-    realised = {"cash_eur": 7.2, "soc_start_pct": 50.0, "soc_end_pct": 50.0, "pv_kwh": 40.0, "load_kwh": 10.0}
-    row = core.score_row(date(2026, 9, 2), plan, realised, 48.0, 0.9, actuals=act)
-    assert "dwell_95_h" in core.SCORE_COLUMNS
-    assert row["dwell_95_h"] == pytest.approx(0.0)            # a flat 50 % day never sits near full
-
-
-# ---- the clamp deadband inside the settlement (2026-09-08) ---------------------------
-# The writer rewrites battery_max_charging_current only when the wanted value has
-# moved by more than DEYE_CLAMP_DEADBAND_A from what is standing. The settlement
-# now keeps that standing clamp per day and drives the ACTUAL run with it (the
-# base run stays on the plan's own command), and counts the writes, so the live
-# slices, the scoreboard and the A/B tester settle the way the inverter will
-# really be driven.
 
 def test_settle_step_drives_the_actual_run_with_the_standing_clamp():
     """Plan banks 5 kW at grid zero and declines 1,5 of 7 kW, sell negative,
@@ -3769,3 +3589,44 @@ def test_hindsight_solve_retries_once_when_a_foreign_solve_lands(stub, tmp_path)
     row = res["rows"][-1]
     assert row["omni2_status"] == "ok", row
     assert calls["n"] == 3                                  # the bad read, its retry, then the 13:00 solve
+
+
+# ---- absolute stress knobs (2026-09-26) -----------------------------------------
+
+def test_apply_knobs_absolute_stress_ct_replaces_the_derived_unit_costs_and_the_scale_still_multiplies():
+    """Two knobs in ct/kWh at nominal power. Set, they replace the loss-map
+    figures stress_costs() derived (0,61 and 0,23 ct on 2026-09-27); unset
+    (None or 0) the derived figures stand. stress_scale multiplies either."""
+    t0, n = core.horizon(local(2026, 9, 27, 13, 0, 4), AMS)
+    kn = core.knobs(None)
+    assert kn["battery_stress_ct"] is None and kn["inverter_stress_ct"] is None
+    assert core.LIVE_KNOBS["battery_stress_ct"] == (None, "input_number.emhass_battery_stress_ct")
+    assert core.LIVE_KNOBS["inverter_stress_ct"] == (None, "input_number.emhass_inverter_stress_ct")
+    p = core.apply_knobs({"battery_stress_cost": 0.0061, "inverter_stress_cost": 0.0023}, kn, t0, n, t0.date())
+    assert p["battery_stress_cost"] == pytest.approx(0.0061) and p["inverter_stress_cost"] == pytest.approx(0.0023)
+    kn2 = dict(kn, battery_stress_ct=1.0, inverter_stress_ct=1.0, stress_scale=2.0)
+    p = core.apply_knobs({"battery_stress_cost": 0.0061, "inverter_stress_cost": 0.0023}, kn2, t0, n, t0.date())
+    assert p["battery_stress_cost"] == pytest.approx(0.02) and p["inverter_stress_cost"] == pytest.approx(0.02)
+    kn3 = dict(kn, battery_stress_ct=0.0, inverter_stress_ct=None, stress_scale=1.0)   # 0 and None both mean derived
+    p = core.apply_knobs({"battery_stress_cost": 0.0061, "inverter_stress_cost": 0.0023}, kn3, t0, n, t0.date())
+    assert p["battery_stress_cost"] == pytest.approx(0.0061) and p["inverter_stress_cost"] == pytest.approx(0.0023)
+
+
+def test_apply_knobs_passes_the_mip_gap_as_a_runtime_parameter():
+    """The add-on ignores lp_solver_mip_rel_gap in config.json (2026-09-26:
+    the file said 1e-5, /get-config kept reporting 0.01) but honours it as a
+    runtime parameter through the associations pass-through. A 1 % gap on a
+    30 EUR objective is 0,30 EUR of slack, more than the whole flattening
+    gain the stress cost buys, so the plan hopped between vertices at random."""
+    t0, n = core.horizon(local(2026, 9, 27, 13, 0, 4), AMS)
+    p = core.apply_knobs({"battery_stress_cost": 0.01, "inverter_stress_cost": 0.01}, core.knobs(None), t0, n, t0.date())
+    assert p["lp_solver_mip_rel_gap"] == core.LP_MIP_REL_GAP == 0.001
+
+
+def test_batt_power_limits_bound_the_port_at_the_knob():
+    """2026-09-29: the add-on bounds the port discharge at eff_dis * max and
+    the port charge at max, so the knob, which is what the pack port does,
+    goes out as knob / eff_dis and knob. Both land the port on the knob."""
+    ch, dis = core.batt_power_limits(12250.0)
+    assert dis * core.ETA_D == pytest.approx(12250.0, abs=0.1)
+    assert ch == 12250.0

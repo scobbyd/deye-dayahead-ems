@@ -1,7 +1,4 @@
-# EMHASS shadow planner: the 2027 tariff right now.
-#
-# Outside entities this file expects (rename to yours):
-#   sensor.nord_pool_nl_current_price   the built-in Nord Pool integration, EUR/kWh
+# Energy package - EMHASS shadow planner: the 2027 tariff right now.
 #
 # buy  = (day-ahead + energy tax + supplier fee) x (1 + BTW)
 # sell = (day-ahead - feed-in fee) x (1 + BTW)

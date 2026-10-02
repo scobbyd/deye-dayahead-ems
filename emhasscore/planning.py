@@ -17,6 +17,7 @@ from .objective import (
     knobs,
     plan_cost,
     rebalance_schedule,
+    rebalance_soc_final,
     rows_to_gross,
     SOC_MAX,
     SOC_MIN,
@@ -121,6 +122,10 @@ def _plan_payload(inp: dict, t0: datetime, n: int, now: datetime, tz: str, soc: 
     payload["battery_soc_surplus_threshold"] = float(kn["surplus_threshold"])
     out["days_since_full"] = dsf
     apply_knobs(payload, kn, t0, n, now.astimezone(ZoneInfo(tz)).date())
+    # after the knobs: apply_knobs writes the soc_final knob, the overdue
+    # rebalance replaces it with full (rebalance_soc_final, 2026-10-02)
+    payload["soc_final"] = rebalance_soc_final(dsf, payload["soc_final"], kn["soc_max"])
+    out["soc_final"] = payload["soc_final"]
     out["knobs"] = kn
     return payload
 

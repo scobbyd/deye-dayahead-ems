@@ -543,7 +543,7 @@ def test_run_plan_happy_path_archives_and_rolls(stub, tmp_path):
     assert res["optim_status"] == "Optimal"
     path, body = stub.posts[0]
     assert path == "/action/naive-mpc-optim"
-    assert body["prediction_horizon"] == n and body["soc_init"] == 0.8 and body["soc_final"] == 0.5
+    assert body["prediction_horizon"] == n and body["soc_init"] == 0.8 and body["soc_final"] == 0.5   # the overdue full end target is OFF (REBALANCE_SOC_FINAL_ON)
     # 14:15 is Nord Pool step 57 of today: (0,157 + 0,11 + 0,02) x 1,21
     assert len(body["pv_power_forecast"]) == n and body["load_cost_forecast"][0] == pytest.approx(0.34727, abs=1e-5)
     assert res["archive_path"].endswith(".json.gz") and (tmp_path / "plans").exists()
@@ -822,11 +822,22 @@ def test_rebalance_schedule_fades_then_pulls():
     overdue = core.rebalance_schedule(10.5)
     assert overdue["battery_soc_surplus_cost"] == 0.0
     assert overdue["battery_soc_deficit_threshold"] == 1.0
-    assert overdue["battery_soc_deficit_cost"] == pytest.approx(0.0015)
-    assert core.rebalance_schedule(21)["battery_soc_deficit_cost"] == pytest.approx(0.003)
+    assert overdue["battery_soc_deficit_cost"] == pytest.approx(0.0035)
+    assert core.rebalance_schedule(21)["battery_soc_deficit_cost"] == pytest.approx(0.007)   # 0,003 until 2026-10-02
     # nothing on record is overdue, not relaxed (2026-09-15): the pull at full strength
     assert core.rebalance_schedule(None) == core.rebalance_schedule(14)
     assert core.rebalance_schedule(None)["battery_soc_deficit_threshold"] == 1.0
+
+
+def test_rebalance_soc_final_full_from_target_day(monkeypatch):
+    monkeypatch.setattr(core.objective, "REBALANCE_SOC_FINAL_ON", True)
+    rebalance_soc_final = core.objective.rebalance_soc_final
+    assert rebalance_soc_final(6.9, 0.5) == 0.5
+    assert rebalance_soc_final(7, 0.5) == 1.0
+    assert rebalance_soc_final(None, 0.5) == 1.0          # nothing on record = overdue
+    assert rebalance_soc_final(10, 0.5, soc_max=0.95) == 0.95
+    monkeypatch.setattr(core.objective, "REBALANCE_SOC_FINAL_ON", False)
+    assert rebalance_soc_final(10, 0.5) == 0.5
 
 
 def test_days_since_full_walks_the_plan_of_record(tmp_path):

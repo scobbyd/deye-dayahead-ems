@@ -265,7 +265,7 @@ DEFICIT_BASE = (0.20, 0.01)     # (threshold, EUR/kWh/h) for the 10-20% band
 REBALANCE_TARGET_DAYS = 7.0
 
 
-REBALANCE_PULL = 0.003          # full pull strength at 2x target
+REBALANCE_PULL = 0.007          # full pull strength at 2x target (0,003 until 2026-10-02, the site)
 
 
 REBALANCE_FULL_LEVEL = 0.995
@@ -291,6 +291,31 @@ def rebalance_schedule(days_since_full, surplus_base: float = SURPLUS_BASE,
     return {"battery_soc_surplus_cost": surplus,
             "battery_soc_deficit_threshold": thr,
             "battery_soc_deficit_cost": cost}
+
+
+# Overdue end-of-horizon target (2026-10-02): from day REBALANCE_TARGET_DAYS
+# on, the plan's horizon-end SOC (soc_final, normally the 50 % knob) becomes
+# full, capped by the soc_max knob. The horizon always ends at 24:00 tomorrow,
+# so the target is at least a day away and stays reachable. Summer days rarely
+# need it, because the pull already books a full charge from surplus; in winter,
+# with flatter prices and little sun, it makes the planner buy the top-up.
+REBALANCE_SOC_FINAL = 1.0
+# OFF since 2026-10-02 18:10: the first live overdue solve (soc_final 1,0 with
+# deficit threshold 1,0) hit the add-on's MIP time limit (status user_limit, the
+# relaxed LP retry too) and the plan failed. Off until the solve is understood.
+REBALANCE_SOC_FINAL_ON = False
+
+
+def rebalance_soc_final(days_since_full, soc_final: float, soc_max: float = 1.0) -> float:
+    """Horizon-end SOC for the rebalancing dynamic: REBALANCE_SOC_FINAL (capped
+    by soc_max) once the clock reaches REBALANCE_TARGET_DAYS, else soc_final
+    unchanged. None (no full on record) counts as overdue, like the schedule."""
+    if not REBALANCE_SOC_FINAL_ON:
+        return float(soc_final)
+    d = 2.0 * REBALANCE_TARGET_DAYS if days_since_full is None else float(days_since_full)
+    if d >= REBALANCE_TARGET_DAYS:
+        return round(min(REBALANCE_SOC_FINAL, float(soc_max)), 4)
+    return float(soc_final)
 
 
 # When to switch the Growatt off (2026-09-06, rule fixed 2026-09-07). The

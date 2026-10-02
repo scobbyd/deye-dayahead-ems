@@ -1320,3 +1320,70 @@ def test_compile_step_reads_the_plan_soc_for_the_export_rule():
     step["row"]["SOC_opt"] = step["next_row"]["SOC_opt"] = 0.95
     cur, _ = core.compile_step(step, 51.2)
     assert cur["export_surplus"] is False
+
+
+# ---- a full-power step takes the nameplate (2026-10-02) ---------------------
+
+def test_step_in_force_carries_the_plans_port_power_knob(tmp_path):
+    arch = str(tmp_path / "plans")
+    doc = _doc(local(2026, 9, 27, 10, 13), local(2026, 9, 27, 10, 15), 4, ["export"])
+    doc["knobs"] = {"batt_power_max_w": 12000.0, "physics_v2": 1.0}
+    core.write_plan_archive(arch, local(2026, 9, 27, 10, 13), doc)
+    assert core.step_in_force(arch, local(2026, 9, 27, 10, 15, 20))["p_max_w"] == 12000.0
+    old = str(tmp_path / "old")
+    core.write_plan_archive(old, local(2026, 9, 27, 10, 13),
+                            _doc(local(2026, 9, 27, 10, 13), local(2026, 9, 27, 10, 15), 4, ["export"]))
+    assert core.step_in_force(old, local(2026, 9, 27, 10, 15, 20))["p_max_w"] is None
+
+
+def test_compile_step_puts_a_full_power_step_on_the_nameplate():
+    """The 2 October 2026 evening sale: the plan sold at the 12 kW knob from
+    18:30 to 19:30, the amps at the measured voltage came to 233-235 A, and
+    the 20 A deadband held the 216 A of an earlier step for the whole run
+    (~0,9 kW short at the day's best price). A step at the knob is not a
+    current to track: it asks the register for everything it has."""
+    D, G = "battery_max_discharging_current", "battery_grid_charging_current"
+    full = _step("export", "export")
+    full["p_max_w"] = 12000.0
+    full["row"]["P_batt"] = full["next_row"]["P_batt"] = 11992.4       # within the solver's slack of the bound
+    cur, nxt = core.compile_step(full, 53.5)
+    assert cur[D] == 240.0 and nxt[D] == 240.0
+    part = dict(full, row=dict(full["row"], P_batt=11000.0))
+    assert core.compile_step(part, 53.5)[0][D] < 220.0                 # under the knob: the plan's own current
+    assert core.compile_step(dict(full, p_max_w=None), 53.5)[0][D] < 240.0   # an old plan without the knob: unchanged
+    gc = _step("grid_charge", "grid_charge")
+    gc["p_max_w"] = 6000.0                                             # INTENT_ROW grid charge is 6 kW
+    assert core.compile_step(gc, 54.0)[0][G] == 240.0
+    ss = _step("self_supply", "self_supply")
+    ss["p_max_w"] = 800.0
+    assert core.compile_step(ss, 51.2)[0][D] == 240.0
+
+
+def test_compile_step_full_power_stays_under_a_heat_ceiling():
+    full = _step("export", "export")
+    full["p_max_w"] = 12000.0
+    full["row"]["P_batt"] = full["next_row"]["P_batt"] = 12000.0
+    doc = core.writer_tick("live", STANDING_BASELINE, full, 53.5, NOW,
+                           ceilings=core.writer_ceilings(heat_cut_a={"battery_max_discharging_current": 115.0}))
+    assert doc["record"]["battery_max_discharging_current"] == 115.0
+
+
+def test_writer_diff_always_moves_a_setpoint_to_and_from_the_nameplate():
+    """The nameplate is a rest like 0 A: a sale at 225 A standing in front of
+    a full-power step moves to 240 A through the deadband, and a 240 A left
+    by a full step or the baseline does not keep selling over a 225 A step.
+    The charge clamp is a ceiling and keeps its deadband either way."""
+    D, G, C = "battery_max_discharging_current", "battery_grid_charging_current", "battery_max_charging_current"
+    rec = dict(CMD_EXPORT, battery_max_discharging_current=240.0)
+    st = _standing_of(rec)
+    assert core.writer_diff(dict(st, **{D: 225.0}), rec) == {D: [225.0, 240.0]}
+    assert core.writer_diff(dict(st, **{D: 240.0}), dict(rec, **{D: 225.0})) == {D: [240.0, 225.0]}
+    assert core.writer_diff(dict(st, **{D: 230.0}), dict(rec, **{D: 225.0})) == {}   # off the nameplate: the deadband
+    gc = dict(CMD_GRID_CHARGE, battery_grid_charging_current=240.0)
+    gs = _standing_of(gc)
+    assert core.writer_diff(dict(gs, **{G: 229.0}), gc) == {G: [229.0, 240.0]}
+    assert core.writer_diff(dict(gs, **{G: 240.0}), dict(gc, **{G: 229.0})) == {G: [240.0, 229.0]}
+    sb = dict(core.deye_command(0.0, -5000.0, 51.2), battery_max_charging_current=240.0)
+    ss = _standing_of(sb)
+    assert core.writer_diff(dict(ss, **{C: 225.0}), sb) == {}
+    assert core.writer_diff(dict(ss, **{C: 240.0}), dict(sb, **{C: 225.0})) == {}

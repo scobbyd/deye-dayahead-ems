@@ -50,6 +50,7 @@ def step_in_force(archive_dir: str, now: datetime, stale_min: float = WRITER_STA
                 "next_micro_cut": bool(cuts[i + 1]) if i + 1 < len(cuts) else False,
                 "rows": rows, "cuts": [bool(cuts[j]) if j < len(cuts) else False for j in range(n)],
                 "physics_v2": is_v2(doc.get("knobs")),
+                "p_max_w": _as_float((doc.get("knobs") or {}).get("batt_power_max_w")),
                 "stale": age > timedelta(minutes=float(stale_min))}
     return None
 
@@ -180,6 +181,24 @@ def segment_of(intents: list, i: int) -> tuple[int, int]:
     return a, b
 
 
+# A FULL-POWER STEP TAKES THE NAMEPLATE (2026-10-02). On 2 October the
+# plan sold at the 12 kW knob from 18:30 to 19:30; at the measured voltage
+# that came to 233-235 A, and the 20 A deadband held the 216 A of an earlier
+# step for the whole run, ~0,9 kW short at the day's best price. A step at
+# the knob is not a current to track but "everything the pack has": its
+# setpoint goes to the nameplate, one write for the run however the voltage
+# sags, and writer_diff moves to and from the nameplate through any deadband.
+# The register delivers ~236 A there, a few % over the knob; the next solve
+# starts from the real SOC. The heat ceiling still caps it. A plan archived
+# without the knob compiles as before. Only the two SETPOINTS: a full-power
+# solar charge already compiles to the nameplate (the margin is +20 %), and a
+# grid charge lifts its clamp to it.
+FULL_POWER_FRAC = 0.99      # the port power at the bound is the knob to ~10 W (solver slack)
+FULL_POWER_FIELD = {"export": "battery_max_discharging_current",
+                    "self_supply": "battery_max_discharging_current",
+                    "grid_charge": "battery_grid_charging_current"}
+
+
 def compile_step(step: dict, pack_v: float | None, margin: bool = True,
                  knobs: dict | None = None, pack_i: float | None = None) -> tuple[dict, dict | None]:
     """The step in force and the step after it, each through deye_command with
@@ -204,6 +223,7 @@ def compile_step(step: dict, pack_v: float | None, margin: bool = True,
     v = float(pack_v) if pack_v else DEYE_PACK_V
     v_oc = v + DEYE_PACK_R_OHM * float(pack_i) if (pack_v and pack_i is not None) else None
     k = _knobs(knobs)
+    p_max = step.get("p_max_w")
 
     def raw(row, cut):
         sell = row.get("unit_prod_price")
@@ -216,10 +236,14 @@ def compile_step(step: dict, pack_v: float | None, margin: bool = True,
             # the stress cost already prices it.
             p_batt = bus_to_port_w(p_batt, ETA_C_V2, ETA_D_V2)
         v_row = loaded_voltage(v_oc, p_batt) if v_oc is not None else v
-        return deye_command(float(row["P_grid"]), p_batt, v_row, micro_cut=bool(cut),
-                            pv_curtail_w=float(row.get("P_PV_curtailment") or 0.0),
-                            sell=float(sell) if sell is not None else None, margin=margin,
-                            soc_pct=float(soc) * 100.0 if soc is not None else None)
+        cmd = deye_command(float(row["P_grid"]), p_batt, v_row, micro_cut=bool(cut),
+                           pv_curtail_w=float(row.get("P_PV_curtailment") or 0.0),
+                           sell=float(sell) if sell is not None else None, margin=margin,
+                           soc_pct=float(soc) * 100.0 if soc is not None else None)
+        f = FULL_POWER_FIELD.get(cmd["intent"])
+        if f and p_max and abs(p_batt) >= FULL_POWER_FRAC * p_max:
+            cmd[f] = DEYE_CURRENT_MAX_A
+        return cmd
 
     def finish(cmd):
         for f in CURRENT_FIELDS:
@@ -295,12 +319,14 @@ def writer_diff(standing: dict, record: dict, deadband_a: float = DEYE_CLAMP_DEA
             # there), so a move to or from it is always written: a 20 A band
             # would otherwise keep a small self-supply (6-12 A at night) from
             # ever starting, or from ever stopping on the next idle step.
-            v, wrote = setpoint_write(_as_float(s), float(w), k["discharge_deadband_a"], baseline=0.0)
+            # The nameplate is the other rest (a full-power step, compile_step).
+            v, wrote = setpoint_write(_as_float(s), float(w), k["discharge_deadband_a"], baseline=0.0,
+                                      top=DEYE_CURRENT_MAX_A)
             if wrote:
                 out[f] = [s, v]
         elif f == "battery_grid_charging_current":
             v, wrote = setpoint_write(_as_float(s), float(w), k["grid_deadband_a"],
-                                      baseline=float(DEYE_BASELINE[f]))
+                                      baseline=float(DEYE_BASELINE[f]), top=DEYE_CURRENT_MAX_A)
             if wrote:
                 out[f] = [s, v]
         elif not same(s, w):

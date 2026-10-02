@@ -281,11 +281,21 @@ def writer_diff(standing: dict, record: dict, deadband_a: float = DEYE_CLAMP_DEA
     for f in WRITER_FIELDS:
         s, w = standing.get(f), record[f]
         if f == "battery_max_charging_current":
-            v, wrote = clamp_write(_as_float(s), float(w), deadband_a, lift=bool(record.get("battery_grid_charging")))
+            # the charge clamp rests at 0 A too (pv_export banks nothing), so
+            # a small solar charge (7 A seen 2026-10-02 11:15) starts and stops
+            sa = _as_float(s)
+            if sa is not None and (abs(sa) < 0.5) != (abs(float(w)) < 0.5):
+                v, wrote = float(w), True
+            else:
+                v, wrote = clamp_write(sa, float(w), deadband_a, lift=bool(record.get("battery_grid_charging")))
             if wrote:
                 out[f] = [s, v]
         elif f == "battery_max_discharging_current":
-            v, wrote = clamp_write(_as_float(s), float(w), k["discharge_deadband_a"])
+            # 0 A is the discharge clamp's rest (an idle step holds the pack
+            # there), so a move to or from it is always written: a 20 A band
+            # would otherwise keep a small self-supply (6-12 A at night) from
+            # ever starting, or from ever stopping on the next idle step.
+            v, wrote = setpoint_write(_as_float(s), float(w), k["discharge_deadband_a"], baseline=0.0)
             if wrote:
                 out[f] = [s, v]
         elif f == "battery_grid_charging_current":

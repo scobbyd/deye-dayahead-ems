@@ -62,7 +62,12 @@ DEYE_CLAMP_DEADBAND_A = 20.0
 # is about 250 W, inside the meter noise the sun already makes, and absorbs
 # that jitter and the offset creep between re-plans. A move to or from the
 # 240 A baseline is always far outside it.
-DEYE_DISCHARGE_DEADBAND_A = 5.0
+# 20 A since 2026-10-02 ("20 A everywhere seems prudent for now"), the
+# same as the charge clamp and the grid charge: ~1 kW of tracking against a
+# few writes a day (5 live days walked: 425 -> 411 writes, at most 0,25 EUR a
+# day either way). A move to or from 0 A is always written (writer_diff), so
+# a small self-supply still starts and stops.
+DEYE_DISCHARGE_DEADBAND_A = 20.0
 
 
 # The writer's deadband on the GRID CHARGING CURRENT (handoff 2026-09-26): a

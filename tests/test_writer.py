@@ -617,18 +617,19 @@ def test_calibrate_amps_inverts_the_measured_shortfall_per_field():
             assert reg == 240.0 or abs(core.deye_delivered_a(f, reg) - a) <= 0.55, (f, a, reg)
 
 
-def test_writer_diff_keeps_the_discharge_clamp_inside_a_5A_deadband():
+def test_writer_diff_keeps_the_discharge_clamp_inside_a_20A_deadband():
     """The amps come from watts over the MEASURED pack voltage, which sags
     under load: the 12:00 tick wrote 136 A and the 12:15 tick 141 A for the
-    same 7,4 kW. A 5 A deadband (about 250 W) absorbs that and the offset
-    creep between re-plans; a move to or from the baseline is always written."""
-    assert core.DEYE_DISCHARGE_DEADBAND_A == 5.0
+    same 7,4 kW. 5 A absorbed that; 20 A since 2026-10-02 (the same band as
+    the charge clamp and the grid charge). A move of exactly the band, or to
+    or from the baseline, is written."""
+    assert core.DEYE_DISCHARGE_DEADBAND_A == 20.0
     rec = dict(CMD_EXPORT, battery_max_discharging_current=141.0)
     st = _standing_of(rec)
-    assert core.writer_diff(dict(st, battery_max_discharging_current=137.0), rec) == {}
-    assert core.writer_diff(dict(st, battery_max_discharging_current=145.0), rec) == {}
-    assert core.writer_diff(dict(st, battery_max_discharging_current=136.0), rec) == {"battery_max_discharging_current": [136.0, 141.0]}
-    assert core.writer_diff(dict(st, battery_max_discharging_current=146.0), rec) == {"battery_max_discharging_current": [146.0, 141.0]}
+    assert core.writer_diff(dict(st, battery_max_discharging_current=122.0), rec) == {}
+    assert core.writer_diff(dict(st, battery_max_discharging_current=160.0), rec) == {}
+    assert core.writer_diff(dict(st, battery_max_discharging_current=121.0), rec) == {"battery_max_discharging_current": [121.0, 141.0]}
+    assert core.writer_diff(dict(st, battery_max_discharging_current=161.0), rec) == {"battery_max_discharging_current": [161.0, 141.0]}
     assert core.writer_diff(dict(st, battery_max_discharging_current=240.0), rec) == {"battery_max_discharging_current": [240.0, 141.0]}
     back = core.writer_diff(dict(st, battery_max_discharging_current=141.0), dict(core.DEYE_BASELINE))
     assert back["battery_max_discharging_current"] == [141.0, 240.0]
@@ -835,8 +836,34 @@ def test_guard_memory_trusts_the_next_read_after_a_late_landing_write():
 # levers the site picks values for; the defaults are today's behaviour, so nothing
 # moves live until a value is chosen.
 
+def test_the_discharge_clamp_always_moves_to_and_from_its_zero_rest():
+    """0 A is where an idle step holds the pack. Inside a 20 A band a night
+    self-supply of 6-12 A would otherwise never start from it, and never
+    stop back on it at the next idle step (the grid charge's rule)."""
+    rec = dict(CMD_EXPORT, battery_max_discharging_current=8.0)
+    st = _standing_of(rec)
+    assert core.writer_diff(dict(st, battery_max_discharging_current=0.0), rec) == {"battery_max_discharging_current": [0.0, 8.0]}
+    rest = dict(rec, battery_max_discharging_current=0.0)
+    assert core.writer_diff(dict(st, battery_max_discharging_current=8.0), rest) == {"battery_max_discharging_current": [8.0, 0.0]}
+    assert core.writer_diff(dict(st, battery_max_discharging_current=8.0), dict(rec, battery_max_discharging_current=20.0)) == {}
+    assert core.writer_diff(dict(st, battery_max_discharging_current=0.0), rest) == {}
+
+
+def test_the_charge_clamp_always_moves_to_and_from_its_zero_rest():
+    """pv_export holds the pack with a zero charge clamp; a small solar charge
+    (7 A on 2026-10-02 11:15) inside the 20 A band must still start from it
+    and stop back on it."""
+    rec = dict(CMD_EXPORT, battery_max_charging_current=7.0)
+    st = _standing_of(rec)
+    assert core.writer_diff(dict(st, battery_max_charging_current=0.0), rec)["battery_max_charging_current"] == [0.0, 7.0]
+    rest = dict(rec, battery_max_charging_current=0.0)
+    assert core.writer_diff(dict(st, battery_max_charging_current=7.0), rest)["battery_max_charging_current"] == [7.0, 0.0]
+    assert "battery_max_charging_current" not in core.writer_diff(dict(st, battery_max_charging_current=7.0),
+                                                                  dict(rec, battery_max_charging_current=20.0))
+
+
 def test_writer_knobs_default_to_todays_behaviour():
-    assert core.WRITER_KNOBS == {"charge_deadband_a": 20.0, "discharge_deadband_a": 5.0,
+    assert core.WRITER_KNOBS == {"charge_deadband_a": 20.0, "discharge_deadband_a": 20.0,
                                  "grid_deadband_a": 20.0, "quant_a": 1.0, "segment_mean": False}
     assert core.DEYE_GRID_CHARGE_DEADBAND_A == 20.0 and core.DEYE_CURRENT_QUANT_A == 1.0
 
@@ -901,7 +928,7 @@ def test_writer_diff_takes_the_grid_and_discharge_deadbands_from_the_knobs():
     es = _standing_of(rec)
     assert core.writer_diff(dict(es, battery_max_discharging_current=150.0), rec, knobs=k) == {}
     assert core.writer_diff(dict(es, battery_max_discharging_current=156.0), rec, knobs=k) == {"battery_max_discharging_current": [156.0, 141.0]}
-    assert core.writer_diff(dict(es, battery_max_discharging_current=150.0), rec) == {"battery_max_discharging_current": [150.0, 141.0]}
+    assert core.writer_diff(dict(es, battery_max_discharging_current=150.0), rec) == {}                # the default is 20 A now
 
 
 def test_writer_tick_carries_the_knobs_into_the_record_and_the_diff():

@@ -268,6 +268,16 @@ REBALANCE_TARGET_DAYS = 7.0
 REBALANCE_PULL = 0.007          # full pull strength at 2x target (0,003 until 2026-10-02, the site)
 
 
+# THE SCHEDULE MOVES IN WHOLE DAYS (2026-10-02): the pull is 0,1 ct per
+# overdue day (0,001 on the first, 0,002 on the second, up to REBALANCE_PULL),
+# and the surplus cost fades by a seventh per whole day. The continuous ramps
+# passed through 0,00001 EUR/kWh/h, which EMHASS turns into a 2,5e-9 per Wh
+# coefficient beside a 48.200 Wh pack: the 17:13 (surplus) and 17:58 (deficit)
+# solves of that day hit the 120 s limit, MIP and LP retry both, and solved in
+# under 2 s at 0 or 2e-5 (offline, the logged payloads).
+REBALANCE_PULL_PER_DAY = 0.001
+
+
 REBALANCE_FULL_LEVEL = 0.995
 
 
@@ -282,10 +292,10 @@ def rebalance_schedule(days_since_full, surplus_base: float = SURPLUS_BASE,
     (2026-09-15; until then None read as exactly the target, relaxed).
     The bases are parameters since 2026-09-07 so the live knob layer can move them."""
     d = 2.0 * REBALANCE_TARGET_DAYS if days_since_full is None else float(days_since_full)
-    surplus = round(float(surplus_base) * max(0.0, 1.0 - d / REBALANCE_TARGET_DAYS), 5)
+    surplus = round(float(surplus_base) * max(0.0, 1.0 - math.floor(d) / REBALANCE_TARGET_DAYS), 5)
     if d > REBALANCE_TARGET_DAYS:
-        ramp = min(1.0, (d - REBALANCE_TARGET_DAYS) / REBALANCE_TARGET_DAYS)
-        thr, cost = 1.0, round(REBALANCE_PULL * ramp, 5)
+        overdue_days = math.ceil(d - REBALANCE_TARGET_DAYS)
+        thr, cost = 1.0, round(min(REBALANCE_PULL, REBALANCE_PULL_PER_DAY * overdue_days), 5)
     else:
         thr, cost = float(deficit_threshold), float(deficit_cost)
     return {"battery_soc_surplus_cost": surplus,
@@ -300,10 +310,11 @@ def rebalance_schedule(days_since_full, surplus_base: float = SURPLUS_BASE,
 # need it, because the pull already books a full charge from surplus; in winter,
 # with flatter prices and little sun, it makes the planner buy the top-up.
 REBALANCE_SOC_FINAL = 1.0
-# OFF since 2026-10-02 18:10: the first live overdue solve (soc_final 1,0 with
-# deficit threshold 1,0) hit the add-on's MIP time limit (status user_limit, the
-# relaxed LP retry too) and the plan failed. Off until the solve is understood.
-REBALANCE_SOC_FINAL_ON = False
+# Off 2026-10-02 18:10, back on the same evening: the first live overdue solve hit the add-on's
+# time limit. The end target was not the cause: the same payload at soc_final
+# 0,5 fails too, and at 1,0 it solves in 1,4 s once the 1e-5 pull is gone (the
+# whole-day schedule above). Kept as a switch.
+REBALANCE_SOC_FINAL_ON = True
 
 
 def rebalance_soc_final(days_since_full, soc_final: float, soc_max: float = 1.0) -> float:

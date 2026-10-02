@@ -543,7 +543,7 @@ def test_run_plan_happy_path_archives_and_rolls(stub, tmp_path):
     assert res["optim_status"] == "Optimal"
     path, body = stub.posts[0]
     assert path == "/action/naive-mpc-optim"
-    assert body["prediction_horizon"] == n and body["soc_init"] == 0.8 and body["soc_final"] == 0.5   # the overdue full end target is OFF (REBALANCE_SOC_FINAL_ON)
+    assert body["prediction_horizon"] == n and body["soc_init"] == 0.8 and body["soc_final"] == 1.0   # no full on record: overdue, horizon end at full (2026-10-02)
     # 14:15 is Nord Pool step 57 of today: (0,157 + 0,11 + 0,02) x 1,21
     assert len(body["pv_power_forecast"]) == n and body["load_cost_forecast"][0] == pytest.approx(0.34727, abs=1e-5)
     assert res["archive_path"].endswith(".json.gz") and (tmp_path / "plans").exists()
@@ -814,7 +814,8 @@ def test_rebalance_schedule_fades_then_pulls():
                      "battery_soc_deficit_threshold": 0.20,
                      "battery_soc_deficit_cost": 0.01}
     half = core.rebalance_schedule(3.5)
-    assert half["battery_soc_surplus_cost"] == pytest.approx(0.0025)
+    assert half["battery_soc_surplus_cost"] == pytest.approx(0.00286)       # whole days: 3 of 7 gone
+    assert core.rebalance_schedule(6.99)["battery_soc_surplus_cost"] == pytest.approx(0.00071)   # never a sliver
     assert half["battery_soc_deficit_threshold"] == 0.20
     at_target = core.rebalance_schedule(7)
     assert at_target["battery_soc_surplus_cost"] == 0.0
@@ -822,7 +823,16 @@ def test_rebalance_schedule_fades_then_pulls():
     overdue = core.rebalance_schedule(10.5)
     assert overdue["battery_soc_surplus_cost"] == 0.0
     assert overdue["battery_soc_deficit_threshold"] == 1.0
-    assert overdue["battery_soc_deficit_cost"] == pytest.approx(0.0035)
+    assert overdue["battery_soc_deficit_cost"] == pytest.approx(0.004)        # 0,1 ct per overdue day, the 4th day
+    # whole overdue days (2026-10-02): the continuous ramp gave 1e-5 just past
+    # day 7, a 2,5e-9 coefficient inside EMHASS, and the 17:58 solve hit the time limit
+    assert core.rebalance_schedule(7.01)["battery_soc_deficit_cost"] == pytest.approx(0.001)
+    assert core.rebalance_schedule(8.0)["battery_soc_deficit_cost"] == pytest.approx(0.001)
+    assert core.rebalance_schedule(8.2)["battery_soc_deficit_cost"] == pytest.approx(0.002)
+    for d in (0.0, 2.5, 6.99, 7.0, 7.001, 7.5, 9.3, 13.9, 30.0):
+        s = core.rebalance_schedule(d)
+        for k in ("battery_soc_deficit_cost", "battery_soc_surplus_cost"):
+            assert s[k] == 0.0 or s[k] >= 0.0007, (d, k, s[k])     # zero or a real cost, never a sliver
     assert core.rebalance_schedule(21)["battery_soc_deficit_cost"] == pytest.approx(0.007)   # 0,003 until 2026-10-02
     # nothing on record is overdue, not relaxed (2026-09-15): the pull at full strength
     assert core.rebalance_schedule(None) == core.rebalance_schedule(14)

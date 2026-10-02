@@ -15,8 +15,8 @@ below.
 only) and to `/config/emhass/config.json` (the copy the health check compares
 the live add-on against). Edit the file and deploy; never save the add-on's
 own configuration page, which rewrites the live file with a defaults-expanded
-blob and resets keys you did not touch (`ha/README.md`, "Where each knob
-lives").
+blob and resets keys you did not touch ([Where each knob
+lives](../README.md#where-each-knob-lives)).
 
 ## Keys that describe the plant: set yours
 
@@ -54,7 +54,7 @@ solve cannot produce the default grid-charging plan.
 
 The same names appear in `entities` in your `plant.json` (which both
 pyscript wrappers read) and, for a few of them, hard-coded in the package
-YAML (`ha/README.md`, "The entity map"). Rename them in all three places.
+YAML ([The entity map](../README.md#the-entity-map)). Rename them in all three places.
 
 ## Keys the runtime payload overrides (dead in this file)
 

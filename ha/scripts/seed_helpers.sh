@@ -63,11 +63,11 @@ curl -sf -X POST -H "Authorization: Bearer $HA_LLAT" -H "Content-Type: applicati
 # The writer starts DRY and DISARMED. Disarmed (input_boolean.emhass_writer_armed
 # off, a fresh install) nothing writes to the inverter, the safety backstops
 # included. Armed, dry writes only a ceiling that LOWERS a current and the
-# baseline after leaving live (see ha/README.md, "Going live").
+# baseline after leaving live (see README.md, "Going live").
 # Do not pick "off" as a resting state: off ENFORCES the plant.json baseline on
 # every tick. This script never arms the writer and never sets live.
 curl -sf -X POST -H "Authorization: Bearer $HA_LLAT" -H "Content-Type: application/json" \
   "$HA_URL/api/services/input_select/select_option" \
   -d '{"entity_id":"input_select.emhass_writer_mode","option":"dry"}' >/dev/null && echo "  emhass_writer_mode = dry"
 echo "input_boolean.emhass_shadow_enabled is left as it is; turn it on after the first verified plan"
-echo "input_boolean.emhass_writer_armed is left as it is (off on a fresh install); arm it by hand after the going-live checklist in ha/README.md"
+echo "input_boolean.emhass_writer_armed is left as it is (off on a fresh install); arm it by hand after the going-live checklist in README.md"

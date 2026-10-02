@@ -98,12 +98,13 @@ input_number:
     step: 0.001
     mode: box
     icon: mdi:solar-panel
-  # Hours the SETTLED pack must sit at or above 99,5 % for a full charge to
-  # reset the rebalancing clock (emhasscore/rebalance.py, 2026-09-15). The
-  # planner's pull holds the pack at the top for this long; the core's default
-  # is 2,0 h when the helper is unset. What the PACE BMS needs to top-balance.
+  # The shortest stretch at the top that counts toward the rebalancing budget
+  # (emhasscore/rebalance.py, 2026-10-03): a stretch of bank voltage at or above
+  # 56,0 V counts once it has lasted this long, so a half-hour touch does
+  # nothing. The clock is the age of the newest 8 h of counted top time. 1,0 h
+  #; the core's default when the helper is unset is the same.
   emhass_rebalance_dwell_h:
-    name: EMHASS rebalance dwell at full
+    name: EMHASS rebalance minimum stretch at the top
     min: 0
     max: 8
     step: 0.25

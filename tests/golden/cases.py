@@ -663,7 +663,9 @@ def inputs_table(core):
                                                     "SOC_MIN", "SOC_MAX", "SOC_FINAL_TARGET", "GROWATT_SHARE", "PV_P10_MIX", "AUX_CUT_ON_RATIO",
                                                     "AUX_CUT_ON_MIN_KWH", "AUX_CUT_OFF_RATIO", "AUX_CUT_OFF_MIN_KWH", "LOAD_REF_DAYS",
                                                     "LOAD_MIN_REF_DAYS", "LOAD_MIX_ALPHA", "Q_PORT", "Q_BRIDGE", "P_NOM_BATT_KW", "P_NOM_INV_KW",
-                                                    "SURPLUS_BASE", "DEFICIT_BASE", "REBALANCE_TARGET_DAYS", "REBALANCE_PULL", "REBALANCE_FULL_LEVEL",
+                                                    "SURPLUS_BASE", "DEFICIT_BASE", "REBALANCE_SURPLUS_OFF_DAY", "REBALANCE_SOC_FINAL_DAY", "REBALANCE_PULL_DAY",
+                                                    "REBALANCE_PULL_PER_DAY", "REBALANCE_PULL", "REBALANCE_FULL_LEVEL", "REBALANCE_TOP_V",
+                                                    "REBALANCE_DWELL_H", "REBALANCE_BUDGET_H", "REBALANCE_LOOKBACK_D",
                                                     "ARCHIVE_SUFFIX", "PV_CURTAIL_SOC_PCT", "PV_DAYLIGHT_W", "PUBLISH_MAP",
                                                     "OMITTED_CONFIG_KEYS", "LIVE_KNOBS")}
                      | {"ARCHIVE_REACH_s": core.ARCHIVE_REACH.total_seconds()},

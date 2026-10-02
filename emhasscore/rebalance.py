@@ -1,51 +1,52 @@
-"""The rebalancing clock, kept on the SETTLED pack.
+"""The rebalancing clock: how long ago the pack last had its budget of time at the top.
 
-Until 2026-09-15 `days_since_full` read the plan-of-record chain: the clock
-reset when a plan's past rows showed SOC_opt at or above 99,5 %, whether or
-not the virtual pack got there (the clamp margin, a dull afternoon, a Growatt
-cut), and it reset the instant the plan touched full, so the surplus penalty
-returned at full strength and the planner left 100 % at once: over 208
-replayed days 5 to 14 % of the resets had no settled full behind them and the
-median stay at full was 1 to 2 h, the lower quartile under an hour on the
-taxed lanes. The BMS balances the cells while they sit at the top, so the
-clock now counts what the pack actually did:
+History. Until 2026-09-15 `days_since_full` read the plan-of-record chain and
+reset the instant a plan touched full. From 2026-09-15 the clock counted one
+consecutive dwell of the settled SOC at or above 99,5 %. Both read the SOC, and
+the SOC is the wrong instrument: pack 3 reports 99,5 % on few days while its
+cells sit exactly as high as packs 1/2 (its full-charge voltage is set higher),
+and the inverter SOC follows the mean of the three.
 
-  - a full charge COUNTS when the settled trajectory (virtual_day's soc_pct,
-    the past half) has sat at or above REBALANCE_FULL_LEVEL for at least the
-    dwell (REBALANCE_DWELL_H, live knob rebalance_dwell_h), consecutive
-    quarters, across midnight if need be;
-  - until then the clock keeps counting, so the pull that took the pack up
-    holds it there for the dwell before the surplus penalty sends it back
-    down;
-  - no full on record (a fresh install, a state file lost) counts as OVERDUE,
-    not as relaxed: the pack is assumed to need a balance until it has had
-    one (2026-09-15).
+The clock since 2026-10-03:
+  - TIME AT THE TOP is a settled quarter whose series is at or above the level:
+    the bank voltage at or above REBALANCE_TOP_V live (the PACE packs bleed
+    their high cells only in the knee), the SOC at or above REBALANCE_FULL_LEVEL
+    for a pack known only by its SOC (the replay's virtual pack);
+  - a STRETCH counts only once it has lasted REBALANCE_DWELL_H (live knob
+    rebalance_dwell_h, 1 h): a half-hour touch of the top does nothing for the
+    cells and must not reset anything;
+  - the CLOCK is the age of the newest REBALANCE_BUDGET_H hours of counted top
+    time, looking back from now across as many stretches as it takes. Summer
+    tops of 1 to 4 h a day keep it at a few days; in winter one long night
+    hold resets it, or two shorter holds add up. A hold keeps the clock high
+    until the whole budget is in, so the pull holds the pack at the top for
+    the budget and lets go after it (the hysteresis the site asked for);
+  - nothing counted inside REBALANCE_LOOKBACK_D (a fresh install, a lost state
+    file) reads as OVERDUE: the pack is assumed to need a balance.
 
 The state is a small dict the caller persists (the wrapper in
 /config/emhass/rebalance.json, the replay walk in its state.json):
-
-  last_full     ISO instant the last qualifying dwell completed, or None
-  run_quarters  consecutive settled quarters at or above the level so far
-  run_end       ISO end instant of the last quarter counted in the run
-  seen          ISO end instant of the newest settled quarter processed
-
+  runs       [[start, end], ...] the counted stretches inside the lookback, oldest first
+  run_start  ISO start of the stretch in progress (counted or not yet), or None
+  run_end    ISO end of the last quarter in that stretch, or None
+  seen       ISO end of the newest settled quarter processed
 `update` is idempotent over a re-read of the same settled day (it only
 consumes quarters after `seen`), and a quarter that is not the immediate
-successor of `run_end` starts a new run, so a gap in the settlement cannot
-bridge two half-dwells.
+successor of `run_end` starts a new stretch, so a gap in the settlement cannot
+bridge two half-stretches.
 """
 from __future__ import annotations
 
 from datetime import datetime, timedelta
 
 from .grid import STEP_MIN
-from .objective import REBALANCE_DWELL_H, REBALANCE_FULL_LEVEL, REBALANCE_TARGET_DAYS
+from .objective import REBALANCE_BUDGET_H, REBALANCE_DWELL_H, REBALANCE_LOOKBACK_D, rebalance_clock_days
 
-STATE_KEYS = ("last_full", "run_quarters", "run_end", "seen")
+STATE_KEYS = ("runs", "run_start", "run_end", "seen")
 
 
 def empty_state() -> dict:
-    return {"last_full": None, "run_quarters": 0, "run_end": None, "seen": None}
+    return {"runs": [], "run_start": None, "run_end": None, "seen": None}
 
 
 def _iso(t: datetime | None) -> str | None:
@@ -56,48 +57,81 @@ def _parse(s: str | None) -> datetime | None:
     return datetime.fromisoformat(s) if s else None
 
 
-def update(state: dict | None, slice_start: str | datetime, soc_pct: list, n_past: int,
-           level_pct: float = REBALANCE_FULL_LEVEL * 100.0, dwell_h: float = REBALANCE_DWELL_H,
+def load_state(state: dict | None) -> dict:
+    """The state with every key present; a state from before 2026-10-03 (the
+    single-dwell clock: last_full, run_quarters) carries nothing this clock
+    can use and starts empty."""
+    st = empty_state()
+    st.update({k: v for k, v in (state or {}).items() if k in STATE_KEYS})
+    st["runs"] = [list(r) for r in (st["runs"] or [])]
+    return st
+
+
+def update(state: dict | None, slice_start: str | datetime, series: list, n_past: int, level: float,
+           dwell_h: float = REBALANCE_DWELL_H, lookback_d: float = REBALANCE_LOOKBACK_D,
            step_min: int = STEP_MIN) -> dict:
-    """Fold a settled slice into the clock: soc_pct[k] is the pack AFTER step k,
-    so quarter k ends at slice_start + (k + 1) steps; only the first `n_past`
-    steps are settled, the rest are the plan's own. Returns the new state."""
-    st = dict(empty_state(), **{k: v for k, v in (state or {}).items() if k in STATE_KEYS})
+    """Fold a settled slice into the clock. series[k] is the quarter ending at
+    slice_start + (k + 1) steps (a 15-minute mean: the bank voltage live, the
+    SOC % in the replay); only the first `n_past` are settled. A quarter at or
+    above `level` is time at the top; None (an unsettled hole) ends a stretch.
+    Returns the new state."""
+    st = load_state(state)
     t0 = slice_start if isinstance(slice_start, datetime) else datetime.fromisoformat(str(slice_start))
     step = timedelta(minutes=step_min)
-    need = max(1, int(round(float(dwell_h) * 60.0 / step_min)))
-    seen, run_end = _parse(st["seen"]), _parse(st["run_end"])
-    run = int(st["run_quarters"] or 0)
-    last_full = _parse(st["last_full"])
-    for k in range(min(int(n_past), len(soc_pct))):
-        v = soc_pct[k]
+    need = timedelta(hours=float(dwell_h))
+    seen, run_start, run_end = _parse(st["seen"]), _parse(st["run_start"]), _parse(st["run_end"])
+    runs = [[_parse(a), _parse(b)] for a, b in st["runs"]]
+    for k in range(min(int(n_past), len(series))):
         end = t0 + step * (k + 1)
         if seen is not None and end <= seen:
             continue
         seen = end
-        if v is None:
-            run, run_end = 0, None
+        v = series[k]
+        if v is None or float(v) < float(level):
+            run_start = run_end = None
             continue
-        if float(v) >= float(level_pct):
-            run = run + 1 if (run_end is not None and end - run_end == step) else 1
-            run_end = end
-            if run >= need and (last_full is None or end > last_full):
-                last_full = end
-        else:
-            run, run_end = 0, None
-    return {"last_full": _iso(last_full), "run_quarters": run, "run_end": _iso(run_end), "seen": _iso(seen)}
+        if run_end is None or end - run_end != step:
+            run_start = end - step
+        run_end = end
+        if run_end - run_start >= need:
+            if runs and runs[-1][0] == run_start:
+                runs[-1][1] = run_end                  # the stretch in progress grows
+            else:
+                runs.append([run_start, run_end])
+    if seen is not None:
+        runs = [r for r in runs if r[1] > seen - timedelta(days=float(lookback_d))]
+    return {"runs": [[_iso(a), _iso(b)] for a, b in runs], "run_start": _iso(run_start),
+            "run_end": _iso(run_end), "seen": _iso(seen)}
 
 
-def days_since(state: dict | None, now: datetime) -> float | None:
-    """Days since the last qualifying full, or None when there is none on
-    record (which the schedule treats as overdue)."""
-    lf = _parse((state or {}).get("last_full"))
-    if lf is None:
+def budget_start(state: dict | None, budget_h: float = REBALANCE_BUDGET_H) -> datetime | None:
+    """The instant from which the counted top time up to the newest stretch adds
+    up to `budget_h`, walking the stretches back from the newest; None when the
+    lookback does not hold that much."""
+    left = timedelta(hours=float(budget_h))
+    for a, b in reversed(load_state(state)["runs"]):
+        a, b = _parse(a), _parse(b)
+        if b - a >= left:
+            return b - left
+        left -= b - a
+    return None
+
+
+def days_since(state: dict | None, now: datetime, budget_h: float = REBALANCE_BUDGET_H) -> float | None:
+    """The clock: days since the newest `budget_h` hours of counted top time
+    began, or None when the lookback does not hold them (which the schedule
+    treats as overdue)."""
+    t = budget_start(state, budget_h)
+    if t is None:
         return None
-    return max(0.0, (now - lf).total_seconds() / 86400.0)
+    return max(0.0, (now - t).total_seconds() / 86400.0)
+
+
+def top_hours(state: dict | None) -> float:
+    """Counted top time inside the lookback, hours (for the published state)."""
+    return round(sum((_parse(b) - _parse(a)).total_seconds() for a, b in load_state(state)["runs"]) / 3600.0, 2)
 
 
 def overdue_days() -> float:
-    """What a clock with nothing on record counts as: twice the target, the
-    pull at full strength."""
-    return 2.0 * REBALANCE_TARGET_DAYS
+    """What a clock with nothing on record counts as: the pull at its ceiling."""
+    return rebalance_clock_days(None)

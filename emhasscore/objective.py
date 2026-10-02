@@ -244,13 +244,14 @@ def loss_adjustment(rows) -> float:
 # Rebalancing stressor (2026-09-02). EMHASS has no native "days since
 # the pack was balanced" state, but every SOC knob is runtime-overridable, so
 # run_plan carries the dynamic: fresh after a full charge the high-SOC dwell
-# penalty is at full strength; it fades to zero over REBALANCE_TARGET_DAYS;
-# past the target an active pull ramps in (deficit threshold 1,0 with a small
-# cost, so every kWh below full is charged per hour and the planner books a
-# top-up in the cheapest slots). Since 2026-09-15 the clock is the SETTLED
-# pack's (rebalance.py): it resets when the virtual pack has sat at or above
-# REBALANCE_FULL_LEVEL for REBALANCE_DWELL_H, and nothing on record counts as
-# overdue, not as relaxed. The low band gets the same dwell treatment
+# penalty is at full strength; it goes off at REBALANCE_SURPLUS_OFF_DAY; the
+# horizon end aims at full from REBALANCE_SOC_FINAL_DAY; from REBALANCE_PULL_DAY
+# an active pull steps in (deficit threshold 1,0 with a small cost, so every
+# kWh below full is charged per hour and the planner books a top-up in the
+# cheapest slots). The clock (rebalance.py, 2026-10-03) is the age of the
+# newest REBALANCE_BUDGET_H hours of counted time at the top (bank voltage at
+# or above REBALANCE_TOP_V, stretches of REBALANCE_DWELL_H and longer), and
+# nothing on record counts as overdue, not as relaxed. The low band gets the same dwell treatment
 # statically: DEFICIT_BASE below 20% keeps an overnight cushion priced, not
 # fenced (brief dips stay allowed).
 SURPLUS_BASE = 0.005            # EUR/kWh/h above battery_soc_surplus_threshold
@@ -262,40 +263,66 @@ SURPLUS_THRESHOLD = 0.85        # config.json's value; a live knob since 2026-09
 DEFICIT_BASE = (0.20, 0.01)     # (threshold, EUR/kWh/h) for the 10-20% band
 
 
-REBALANCE_TARGET_DAYS = 7.0
-
-
-REBALANCE_PULL = 0.007          # full pull strength at 2x target (0,003 until 2026-10-02, the site)
-
-
-# THE SCHEDULE MOVES IN WHOLE DAYS (2026-10-02): the pull is 0,1 ct per
-# overdue day (0,001 on the first, 0,002 on the second, up to REBALANCE_PULL),
-# and the surplus cost fades by a seventh per whole day. The continuous ramps
+# THE SCHEDULE IN WHOLE DAYS (2026-10-02, evening). Day 0 to 7: the surplus
+# cost at full strength, the pack is not held at the top. From day 7: the
+# surplus cost is off. From day 12: the horizon-end SOC is full. From day 14:
+# the pull below 100 %, 0,1 ct a day (0,001 EUR/kWh/h on day 14, 0,002 on day
+# 15, up to REBALANCE_PULL). Never a fraction of a step: the continuous ramps
 # passed through 0,00001 EUR/kWh/h, which EMHASS turns into a 2,5e-9 per Wh
-# coefficient beside a 48.200 Wh pack: the 17:13 (surplus) and 17:58 (deficit)
-# solves of that day hit the 120 s limit, MIP and LP retry both, and solved in
-# under 2 s at 0 or 2e-5 (offline, the logged payloads).
+# coefficient beside a 48.200 Wh pack, and the 17:13 (surplus) and 17:58
+# (deficit) solves of 2 October hit the 120 s limit, MIP and LP retry both.
+REBALANCE_SURPLUS_OFF_DAY = 7.0
+REBALANCE_SOC_FINAL_DAY = 12.0
+REBALANCE_PULL_DAY = 14.0
+
+
+REBALANCE_PULL = 0.007          # the pull's ceiling, day 20 on (0,003 until 2026-10-02, the site)
+
+
 REBALANCE_PULL_PER_DAY = 0.001
 
 
-REBALANCE_FULL_LEVEL = 0.995
+REBALANCE_FULL_LEVEL = 0.995    # "at the top" for a pack known only by its SOC (the replay's virtual pack)
 
 
-REBALANCE_DWELL_H = 2.0         # hours the settled pack must sit at or above the level for a full to count
+# WHAT COUNTS AS TIME AT THE TOP (2026-10-03). The PACE packs bleed their
+# high cells only while the cells sit in the knee, so the live clock counts the
+# BANK VOLTAGE, not the SOC: pack 3 reported 99,5 % on 3 days of a month while it
+# sat at the same top voltage as packs 1/2 (its full-charge voltage is set
+# higher), and the inverter SOC follows the mean. 56,0 V is 3,50 V a cell; the
+# holds float at ~56,6 V, and 55,2 V (3,45 V) matched "every pack's max cell at
+# or above 3,45 V" to 5 of 2.742 minutes over 09-02..10-02 (VM, 15 s).
+REBALANCE_TOP_V = 56.0
+
+
+REBALANCE_DWELL_H = 1.0         # a stretch at the top counts only from this long on (the hysteresis)
+
+
+REBALANCE_BUDGET_H = 8.0        # the clock is the age of the newest BUDGET hours of counted top time
+
+
+REBALANCE_LOOKBACK_D = 30.0     # older stretches are dropped; nothing inside it reads as overdue
+
+
+def rebalance_clock_days(days_since_full) -> float:
+    """The clock as the schedule reads it. None (no full charge on record)
+    counts as OVERDUE with the pull at its ceiling, because a pack with no
+    balance on record is assumed to need one (2026-09-15)."""
+    if days_since_full is None:
+        return REBALANCE_PULL_DAY + REBALANCE_PULL / REBALANCE_PULL_PER_DAY
+    return float(days_since_full)
 
 
 def rebalance_schedule(days_since_full, surplus_base: float = SURPLUS_BASE,
                        deficit_threshold: float = DEFICIT_BASE[0], deficit_cost: float = DEFICIT_BASE[1]):
-    """Runtime SOC-knob overrides for the rebalancing dynamic. None (no full
-    charge on record) counts as OVERDUE, twice the target: the pull at full
-    strength, because a pack with no balance on record is assumed to need one
-    (2026-09-15; until then None read as exactly the target, relaxed).
-    The bases are parameters since 2026-09-07 so the live knob layer can move them."""
-    d = 2.0 * REBALANCE_TARGET_DAYS if days_since_full is None else float(days_since_full)
-    surplus = round(float(surplus_base) * max(0.0, 1.0 - math.floor(d) / REBALANCE_TARGET_DAYS), 5)
-    if d > REBALANCE_TARGET_DAYS:
-        overdue_days = math.ceil(d - REBALANCE_TARGET_DAYS)
-        thr, cost = 1.0, round(min(REBALANCE_PULL, REBALANCE_PULL_PER_DAY * overdue_days), 5)
+    """Runtime SOC-knob overrides for the rebalancing dynamic (the whole-day
+    schedule above). The bases are parameters since 2026-09-07 so the live
+    knob layer can move them."""
+    d = rebalance_clock_days(days_since_full)
+    surplus = float(surplus_base) if d < REBALANCE_SURPLUS_OFF_DAY else 0.0
+    if d >= REBALANCE_PULL_DAY:
+        pull_days = math.floor(d - REBALANCE_PULL_DAY) + 1
+        thr, cost = 1.0, round(min(REBALANCE_PULL, REBALANCE_PULL_PER_DAY * pull_days), 5)
     else:
         thr, cost = float(deficit_threshold), float(deficit_cost)
     return {"battery_soc_surplus_cost": surplus,
@@ -303,12 +330,13 @@ def rebalance_schedule(days_since_full, surplus_base: float = SURPLUS_BASE,
             "battery_soc_deficit_cost": cost}
 
 
-# Overdue end-of-horizon target (2026-10-02): from day REBALANCE_TARGET_DAYS
+# Overdue end-of-horizon target (2026-10-02): from REBALANCE_SOC_FINAL_DAY
 # on, the plan's horizon-end SOC (soc_final, normally the 50 % knob) becomes
 # full, capped by the soc_max knob. The horizon always ends at 24:00 tomorrow,
 # so the target is at least a day away and stays reachable. Summer days rarely
-# need it, because the pull already books a full charge from surplus; in winter,
-# with flatter prices and little sun, it makes the planner buy the top-up.
+# need it, because surplus fills the pack once the surplus cost is off; in
+# winter, with flatter prices and little sun, it makes the planner buy the
+# top-up, two days before the pull starts.
 REBALANCE_SOC_FINAL = 1.0
 # Off 2026-10-02 18:10, back on the same evening: the first live overdue solve hit the add-on's
 # time limit. The end target was not the cause: the same payload at soc_final
@@ -319,12 +347,11 @@ REBALANCE_SOC_FINAL_ON = True
 
 def rebalance_soc_final(days_since_full, soc_final: float, soc_max: float = 1.0) -> float:
     """Horizon-end SOC for the rebalancing dynamic: REBALANCE_SOC_FINAL (capped
-    by soc_max) once the clock reaches REBALANCE_TARGET_DAYS, else soc_final
+    by soc_max) once the clock reaches REBALANCE_SOC_FINAL_DAY, else soc_final
     unchanged. None (no full on record) counts as overdue, like the schedule."""
     if not REBALANCE_SOC_FINAL_ON:
         return float(soc_final)
-    d = 2.0 * REBALANCE_TARGET_DAYS if days_since_full is None else float(days_since_full)
-    if d >= REBALANCE_TARGET_DAYS:
+    if rebalance_clock_days(days_since_full) >= REBALANCE_SOC_FINAL_DAY:
         return round(min(REBALANCE_SOC_FINAL, float(soc_max)), 4)
     return float(soc_final)
 

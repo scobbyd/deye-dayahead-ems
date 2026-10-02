@@ -77,6 +77,7 @@ ACTUAL_BATT = ENTITIES["batt_power"]                    # W at the DC port, + = 
 ACTUAL_CURTAIL = ENTITIES["curtailed"]                  # 0/1; a 15-min mean is the fraction
 ACTUAL_MICRO = ENTITIES["micro"]             # W, the must-take half (never curtailed)
 ACTUAL_SOC = ENTITIES["soc"]                           # % pack state of charge
+ACTUAL_BATT_V = ENTITIES["batt_voltage"]                # V at the DC port: the rebalancing clock's top time
 
 
 def _now():
@@ -354,11 +355,14 @@ def _plan_day(dry_run=False):
     # Unreadable helpers fall back to the core constants.
     _pack_temp_latch()
     inp["knobs"] = _knobs()
-    # The rebalancing clock on the SETTLED pack (2026-09-15): today's settled
-    # slice is folded into /config/emhass/rebalance.json every tick, and the
-    # core prices the SOC knobs off that state instead of the plan chain. No
-    # state on record reads as overdue: the pack is assumed to need a balance.
-    inp["rebalance"] = task.executor(core.rebalance_step, REBALANCE, settled, inp["knobs"].get("rebalance_dwell_h"))
+    # The rebalancing clock (rebalance.py, 2026-10-03): today's settled quarters
+    # of the BANK VOLTAGE are folded into /config/emhass/rebalance.json every
+    # tick; a quarter at or above REBALANCE_TOP_V is time at the top, a stretch
+    # counts from the dwell knob on, and the clock is the age of the newest
+    # REBALANCE_BUDGET_H hours of it. No state on record reads as overdue.
+    inp["rebalance"] = task.executor(core.rebalance_step, REBALANCE, (settled or {}).get("slice_start"),
+                                     act.get("batt_v"), int((settled or {}).get("n_past") or 0),
+                                     core.REBALANCE_TOP_V, inp["knobs"].get("rebalance_dwell_h"))
     # The running day's hours for the period charts (2026-09-17): the settled
     # slice's past steps, written to the hourly sidecar and imported now, so
     # the shadow lanes reach `now` like the hero graphs; the ladder's nightly
@@ -430,7 +434,7 @@ def _actuals_15min(day, gap_upto=None):
     gap-holds is worse than no lane, and each lane then fails on its own. The
     recorder keeps 5-minute statistics ~10 days, plenty for scoring yesterday."""
     ids = {ACTUAL_PV, ACTUAL_LOAD, ACTUAL_GRID_IMP, ACTUAL_GRID_EXP, ACTUAL_BATT, ACTUAL_SOC,
-           ACTUAL_CURTAIL, ACTUAL_MICRO}
+           ACTUAL_CURTAIL, ACTUAL_MICRO, ACTUAL_BATT_V}
     a = datetime.combine(day, datetime.min.time(), tzinfo=TZ).astimezone(timezone.utc)
     b = a + timedelta(days=2)                    # cover DST long days too
     try:
@@ -442,7 +446,7 @@ def _actuals_15min(day, gap_upto=None):
     got = {}
     for key, eid in (("pv_w", ACTUAL_PV), ("load_w", ACTUAL_LOAD), ("imp", ACTUAL_GRID_IMP),
                      ("exp", ACTUAL_GRID_EXP), ("batt_dc_w", ACTUAL_BATT), ("soc_pct", ACTUAL_SOC),
-                     ("curtailed", ACTUAL_CURTAIL), ("micro_w", ACTUAL_MICRO)):
+                     ("curtailed", ACTUAL_CURTAIL), ("micro_w", ACTUAL_MICRO), ("batt_v", ACTUAL_BATT_V)):
         vals, gaps = task.executor(core.fifteen_min_series, day, TZ_NAME, (stats or {}).get(eid), gap_upto)
         if gaps > core.MAX_PV_GAPS:
             log.warning(f"emhass: actuals too gappy for {day}: {eid} {gaps} steps")

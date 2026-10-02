@@ -1,60 +1,98 @@
-"""The settled rebalancing clock (emhasscore.rebalance) and its schedule."""
+"""The rebalancing clock (emhasscore.rebalance) and its schedule."""
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from emhasscore import rebalance as rb
-from emhasscore.objective import REBALANCE_PULL, REBALANCE_TARGET_DAYS, rebalance_schedule
+from emhasscore.objective import (REBALANCE_BUDGET_H, REBALANCE_DWELL_H, REBALANCE_PULL, REBALANCE_TOP_V,
+                                  rebalance_clock_days, rebalance_schedule)
 
 AMS = ZoneInfo("Europe/Amsterdam")
 T0 = datetime(2026, 9, 10, 0, 0, tzinfo=AMS)
+TOP = REBALANCE_TOP_V
 
 
-def _soc(full_from, full_to, n=96, hi=100.0, lo=60.0):
-    return [hi if full_from <= k < full_to else lo for k in range(n)]
+def _volts(top_from, top_to, n=96, hi=56.6, lo=53.0):
+    """A day of 15-minute bank-voltage means: at the top from quarter top_from to top_to."""
+    return [hi if top_from <= k < top_to else lo for k in range(n)]
+
+
+def _q(k):
+    return T0 + timedelta(minutes=15 * k)
+
+
+def test_the_defaults_are_seans_2026_10_03():
+    assert REBALANCE_TOP_V == 56.0 and REBALANCE_DWELL_H == 1.0 and REBALANCE_BUDGET_H == 8.0
 
 
 def test_nothing_on_record_is_overdue():
     s = rebalance_schedule(None)
     assert s["battery_soc_deficit_threshold"] == 1.0 and s["battery_soc_deficit_cost"] == REBALANCE_PULL
     assert s["battery_soc_surplus_cost"] == 0.0
-    assert rb.days_since(None, T0) is None and rb.overdue_days() == 2 * REBALANCE_TARGET_DAYS
+    assert rb.days_since(None, T0) is None and rb.overdue_days() == rebalance_clock_days(None)
 
 
-def test_a_full_counts_only_after_the_dwell():
-    # 100 % from 12:00 to 13:30 (6 quarters): under a 2 h dwell, no reset
-    st = rb.update(None, T0, _soc(48, 54), n_past=96, dwell_h=2.0)
-    assert st["last_full"] is None and st["run_quarters"] == 0
-    # 12:00 to 14:15 (9 quarters): the dwell completes at 14:00 and the clock
-    # follows the END of the stay, 14:15, so days_since counts from when the
-    # pack last left the top
-    st = rb.update(None, T0, _soc(48, 57), n_past=96, dwell_h=2.0)
-    assert st["last_full"] == (T0 + timedelta(hours=14, minutes=15)).isoformat()
-    assert rb.days_since(st, T0 + timedelta(days=3, hours=14, minutes=15)) == 3.0
+def test_a_stretch_counts_only_from_the_minimum_on():
+    # 45 minutes at the top: nothing counts
+    st = rb.update(None, T0, _volts(48, 51), 96, TOP)
+    assert st["runs"] == [] and rb.top_hours(st) == 0.0
+    # exactly 60 minutes: the stretch counts, all of it
+    st = rb.update(None, T0, _volts(48, 52), 96, TOP)
+    assert st["runs"] == [[_q(48).isoformat(), _q(52).isoformat()]] and rb.top_hours(st) == 1.0
 
 
-def test_the_run_continues_across_midnight_and_ticks_are_idempotent():
-    day1 = _soc(90, 96)                              # full from 22:30 to midnight, 6 quarters
-    st = rb.update(None, T0, day1, n_past=96, dwell_h=2.0)
-    assert st["last_full"] is None and st["run_quarters"] == 6
-    # the same day folded again (a later tick re-reads it): nothing double-counted
-    st2 = rb.update(st, T0, day1, n_past=96, dwell_h=2.0)
-    assert st2 == st
-    # the next day's first half hour (the only settled quarters so far) completes the dwell at 00:30
-    day2 = _soc(0, 2)
-    st3 = rb.update(st2, T0 + timedelta(days=1), day2, n_past=2, dwell_h=2.0)
-    assert st3["last_full"] == (T0 + timedelta(days=1, minutes=30)).isoformat() and st3["run_quarters"] == 8
+def test_the_clock_is_the_age_of_the_newest_budget_hours():
+    # 8 h at the top from 12:00 to 20:00 on day 0: the budget began at 12:00
+    st = rb.update(None, T0, _volts(48, 80), 96, TOP)
+    assert rb.days_since(st, T0 + timedelta(days=3, hours=12)) == 3.0
+    # 7 h only: the lookback does not hold the budget, overdue
+    st7 = rb.update(None, T0, _volts(48, 76), 96, TOP)
+    assert rb.days_since(st7, T0 + timedelta(days=1)) is None
 
 
-def test_a_gap_breaks_the_run_and_only_the_settled_half_counts():
-    soc = _soc(48, 56) + []                          # 8 quarters at full, but only 52 are settled
-    st = rb.update(None, T0, soc, n_past=52, dwell_h=2.0)
-    assert st["last_full"] is None and st["run_quarters"] == 4
-    # a None quarter (an unsettled hole) resets the run
-    soc2 = [100.0] * 4 + [None] + [100.0] * 8
-    st = rb.update(None, T0, soc2, n_past=13, dwell_h=2.0)
-    assert st["last_full"] == (T0 + timedelta(minutes=15 * 13)).isoformat() and st["run_quarters"] == 8
+def test_shorter_stretches_on_several_days_add_up():
+    st = None
+    for d in range(4):                                  # 2 h a day at the top, 14:00 to 16:00
+        st = rb.update(st, T0 + timedelta(days=d), _volts(56, 64), 96, TOP)
+    assert rb.top_hours(st) == 8.0
+    # the newest 8 h began with the first stretch: day 0, 14:00
+    assert rb.days_since(st, T0 + timedelta(days=4, hours=14)) == 4.0
+    # a 30-minute touch on day 4 adds nothing
+    st = rb.update(st, T0 + timedelta(days=4), _volts(56, 58), 96, TOP)
+    assert rb.top_hours(st) == 8.0
 
 
-def test_days_since_runs_from_the_last_dwell_not_the_first():
-    st = rb.update(None, T0, _soc(0, 96), n_past=96, dwell_h=2.0)   # full all day: the last quarter is the newest full
-    assert st["last_full"] == (T0 + timedelta(days=1)).isoformat()
+def test_a_hold_keeps_the_clock_high_until_the_budget_is_in():
+    old = rb.update(None, T0, _volts(0, 32), 96, TOP)                     # 8 h on day 0, 00:00-08:00
+    hold_day = T0 + timedelta(days=15)
+    for k in (4, 16, 31):                                                 # 1 h, 4 h, 7 h 45 into a night hold
+        st = rb.update(old, hold_day, _volts(0, k), k, TOP)
+        assert rb.days_since(st, hold_day + timedelta(minutes=15 * k)) > 14.0, k
+    st = rb.update(old, hold_day, _volts(0, 32), 32, TOP)                 # the 8th hour: the budget is in
+    assert rb.days_since(st, hold_day + timedelta(hours=8)) == 8 / 24
+
+
+def test_the_stretch_continues_across_midnight_and_ticks_are_idempotent():
+    day1 = _volts(92, 96)                              # 23:00 to midnight: 1 h, counts
+    st = rb.update(None, T0, day1, 96, TOP)
+    assert rb.top_hours(st) == 1.0
+    assert rb.update(st, T0, day1, 96, TOP) == st      # the same day folded again: nothing double-counted
+    st = rb.update(st, T0 + timedelta(days=1), _volts(0, 8), 8, TOP)   # on to 02:00 the next day: one stretch
+    assert st["runs"] == [[_q(92).isoformat(), (T0 + timedelta(days=1, hours=2)).isoformat()]]
+
+
+def test_a_gap_breaks_the_stretch_and_only_the_settled_part_counts():
+    st = rb.update(None, T0, _volts(48, 56), 51, TOP)  # 8 quarters at the top, 3 settled
+    assert st["runs"] == [] and st["run_start"] == _q(48).isoformat()
+    v = [56.6] * 3 + [None] + [56.6] * 3               # 45 min, a hole, 45 min: neither counts
+    assert rb.update(None, T0, v, 7, TOP)["runs"] == []
+
+
+def test_stretches_older_than_the_lookback_are_dropped():
+    st = rb.update(None, T0, _volts(0, 32), 96, TOP)
+    st = rb.update(st, T0 + timedelta(days=31), _volts(0, 0), 96, TOP)
+    assert st["runs"] == [] and rb.days_since(st, T0 + timedelta(days=32)) is None
+
+
+def test_a_state_from_the_single_dwell_clock_starts_empty():
+    old = {"last_full": "2026-09-25T17:45:00+02:00", "run_quarters": 0, "run_end": None, "seen": None}
+    assert rb.load_state(old)["runs"] == [] and rb.days_since(old, T0) is None

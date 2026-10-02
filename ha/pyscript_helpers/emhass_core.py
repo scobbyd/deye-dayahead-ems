@@ -42,7 +42,7 @@ from emhasscore.objective import (  # noqa: E402
     ETA_C_V2, ETA_D_V2, ETA_DC_AC_V2, GRID_CHARGE_AC_MAX_W, STANDBY_LOAD_W, AUX_CUT_OFF_MIN_KWH, AUX_CUT_OFF_RATIO, AUX_CUT_ON_MIN_KWH, batt_power_limits,
     AUX_CUT_ON_RATIO, build_payload, CAPACITY_KWH, cut_thresholds, DEFICIT_BASE, ETA_BRIDGE, GRID_CAP_W,
     is_v2, knobs, LIVE_KNOBS, loss_adjustment, LP_MIP_REL_GAP, P_NOM_BATT_KW, P_NOM_INV_KW, Q_BRIDGE, Q_PORT,
-    REBALANCE_DWELL_H, REBALANCE_FULL_LEVEL, REBALANCE_PULL, rebalance_schedule, REBALANCE_TARGET_DAYS, SOC_FINAL_TARGET,
+    REBALANCE_BUDGET_H, REBALANCE_DWELL_H, REBALANCE_FULL_LEVEL, REBALANCE_LOOKBACK_D, REBALANCE_PULL, REBALANCE_TOP_V, rebalance_schedule, REBALANCE_SURPLUS_OFF_DAY, REBALANCE_SOC_FINAL_DAY, REBALANCE_PULL_DAY, REBALANCE_PULL_PER_DAY, rebalance_clock_days, SOC_FINAL_TARGET,
     SOC_MAX, SOC_MIN, soc_target_timestep, step_cost, stress_costs, SURPLUS_BASE, plan_etas, temp_latch, temp_ramp,
 )
 from emhasscore.deye import (  # noqa: E402
@@ -93,11 +93,13 @@ from emhasscore.ab import (  # noqa: E402
 )
 
 
-def rebalance_step(path: str, settled: dict | None, dwell_h: float | None = None) -> dict:
-    """The wrapper's one call per tick for the settled rebalancing clock
-    (emhasscore.rebalance): load the state file, fold today's settled slice
-    into it, save, return the state for inp["rebalance"]. A missing or
-    unreadable file starts empty, which the schedule reads as overdue."""
+def rebalance_step(path: str, slice_start, series: list | None, n_past: int, level: float,
+                   dwell_h: float | None = None) -> dict:
+    """The wrapper's one call per tick for the rebalancing clock
+    (emhasscore.rebalance): load the state file, fold today's settled quarters
+    of `series` (the bank voltage's 15-minute means live) into it at `level`,
+    save, return the state for inp["rebalance"]. A missing or unreadable file
+    starts empty, which the schedule reads as overdue."""
     import json as _json
     import os as _os
     state = None
@@ -106,11 +108,11 @@ def rebalance_step(path: str, settled: dict | None, dwell_h: float | None = None
             state = _json.load(f)
     except (OSError, ValueError):
         state = None
-    if settled and settled.get("soc_pct") is not None and settled.get("slice_start"):
-        state = rebalance.update(state, settled["slice_start"], settled["soc_pct"], int(settled.get("n_past") or 0),
+    if series is not None and slice_start:
+        state = rebalance.update(state, slice_start, series, int(n_past or 0), level,
                                  dwell_h=float(dwell_h) if dwell_h is not None else REBALANCE_DWELL_H)
     else:
-        state = dict(rebalance.empty_state(), **{k: v for k, v in (state or {}).items() if k in rebalance.STATE_KEYS})
+        state = rebalance.load_state(state)
     _os.makedirs(_os.path.dirname(path) or ".", exist_ok=True)
     tmp = path + ".tmp"
     with open(tmp, "w") as f:

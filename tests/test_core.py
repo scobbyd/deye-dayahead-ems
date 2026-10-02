@@ -808,46 +808,42 @@ def test_stress_costs_scale_with_the_price_level_and_floor_at_zero():
     assert core.stress_costs([], []) == (0.0, 0.0)
 
 
-def test_rebalance_schedule_fades_then_pulls():
-    fresh = core.rebalance_schedule(0)
-    assert fresh == {"battery_soc_surplus_cost": 0.005,
-                     "battery_soc_deficit_threshold": 0.20,
-                     "battery_soc_deficit_cost": 0.01}
-    half = core.rebalance_schedule(3.5)
-    assert half["battery_soc_surplus_cost"] == pytest.approx(0.00286)       # whole days: 3 of 7 gone
-    assert core.rebalance_schedule(6.99)["battery_soc_surplus_cost"] == pytest.approx(0.00071)   # never a sliver
-    assert half["battery_soc_deficit_threshold"] == 0.20
-    at_target = core.rebalance_schedule(7)
-    assert at_target["battery_soc_surplus_cost"] == 0.0
-    assert at_target["battery_soc_deficit_threshold"] == 0.20
-    overdue = core.rebalance_schedule(10.5)
-    assert overdue["battery_soc_surplus_cost"] == 0.0
-    assert overdue["battery_soc_deficit_threshold"] == 1.0
-    assert overdue["battery_soc_deficit_cost"] == pytest.approx(0.004)        # 0,1 ct per overdue day, the 4th day
-    # whole overdue days (2026-10-02): the continuous ramp gave 1e-5 just past
-    # day 7, a 2,5e-9 coefficient inside EMHASS, and the 17:58 solve hit the time limit
-    assert core.rebalance_schedule(7.01)["battery_soc_deficit_cost"] == pytest.approx(0.001)
-    assert core.rebalance_schedule(8.0)["battery_soc_deficit_cost"] == pytest.approx(0.001)
-    assert core.rebalance_schedule(8.2)["battery_soc_deficit_cost"] == pytest.approx(0.002)
-    for d in (0.0, 2.5, 6.99, 7.0, 7.001, 7.5, 9.3, 13.9, 30.0):
+def test_rebalance_schedule_moves_in_whole_days():
+    """The site 2026-10-02: day 0-7 the surplus cost at full strength, from day 7
+    off; from day 12 the horizon end at full; from day 14 the pull below 100 %,
+    0,1 ct a day up to the ceiling. Never a sliver: the continuous ramps gave
+    1e-5 EUR/kWh/h, a 2,5e-9 coefficient inside EMHASS, and two live solves
+    hit the time limit."""
+    base = {"battery_soc_surplus_cost": core.SURPLUS_BASE, "battery_soc_deficit_threshold": 0.20,
+            "battery_soc_deficit_cost": 0.01}
+    for d in (0, 3.5, 6.99):
+        assert core.rebalance_schedule(d) == base, d
+    for d in (7, 10.5, 13.99):
+        assert core.rebalance_schedule(d) == dict(base, battery_soc_surplus_cost=0.0), d
+    pull = {14: 0.001, 14.99: 0.001, 15: 0.002, 16.5: 0.003, 20: 0.007, 30: 0.007}
+    for d, cost in pull.items():
+        s = core.rebalance_schedule(d)
+        assert s == {"battery_soc_surplus_cost": 0.0, "battery_soc_deficit_threshold": 1.0,
+                     "battery_soc_deficit_cost": pytest.approx(cost)}, d
+    for d in (0.0, 2.5, 6.99, 7.0, 7.001, 13.99, 14.0, 14.001, 19.9, 30.0):
         s = core.rebalance_schedule(d)
         for k in ("battery_soc_deficit_cost", "battery_soc_surplus_cost"):
-            assert s[k] == 0.0 or s[k] >= 0.0007, (d, k, s[k])     # zero or a real cost, never a sliver
-    assert core.rebalance_schedule(21)["battery_soc_deficit_cost"] == pytest.approx(0.007)   # 0,003 until 2026-10-02
-    # nothing on record is overdue, not relaxed (2026-09-15): the pull at full strength
-    assert core.rebalance_schedule(None) == core.rebalance_schedule(14)
-    assert core.rebalance_schedule(None)["battery_soc_deficit_threshold"] == 1.0
+            assert s[k] == 0.0 or s[k] >= 0.001, (d, k, s[k])     # zero or a real cost, never a sliver
+    # nothing on record is overdue, not relaxed (2026-09-15): the pull at its ceiling
+    assert core.rebalance_schedule(None) == core.rebalance_schedule(30)
+    assert core.rebalance_schedule(None)["battery_soc_deficit_cost"] == core.REBALANCE_PULL
 
 
-def test_rebalance_soc_final_full_from_target_day(monkeypatch):
+def test_rebalance_soc_final_full_from_day_12(monkeypatch):
     monkeypatch.setattr(core.objective, "REBALANCE_SOC_FINAL_ON", True)
     rebalance_soc_final = core.objective.rebalance_soc_final
-    assert rebalance_soc_final(6.9, 0.5) == 0.5
-    assert rebalance_soc_final(7, 0.5) == 1.0
+    assert rebalance_soc_final(7, 0.5) == 0.5
+    assert rebalance_soc_final(11.99, 0.5) == 0.5
+    assert rebalance_soc_final(12, 0.5) == 1.0
     assert rebalance_soc_final(None, 0.5) == 1.0          # nothing on record = overdue
-    assert rebalance_soc_final(10, 0.5, soc_max=0.95) == 0.95
+    assert rebalance_soc_final(13, 0.5, soc_max=0.95) == 0.95
     monkeypatch.setattr(core.objective, "REBALANCE_SOC_FINAL_ON", False)
-    assert rebalance_soc_final(10, 0.5) == 0.5
+    assert rebalance_soc_final(13, 0.5) == 0.5
 
 
 def test_days_since_full_walks_the_plan_of_record(tmp_path):
@@ -2652,8 +2648,8 @@ def test_run_plan_applies_the_live_knobs(stub, tmp_path):
     t0, n = core.horizon(now, AMS)
     stub.plan_fn = lambda posts: make_rows(t0, n)
     inp = plan_inputs(now, tmp_path, stub.url)
-    # a settled clock with a full on record yesterday, so the deficit knobs (not the pull) show
-    inp["rebalance"] = {"last_full": (now - timedelta(days=1)).isoformat()}
+    # a clock with the 8 h budget at the top yesterday, so the deficit knobs (not the pull) show
+    inp["rebalance"] = {"runs": [[(now - timedelta(days=1, hours=8)).isoformat(), (now - timedelta(days=1)).isoformat()]]}
     inp["knobs"] = {"stress_scale": 2.0, "soc_final": 0.6, "weight_battery_discharge": 0.02,
                     "batt_power_max_w": 8000.0, "soc_min": 0.15, "soc_max": 0.95,
                     "soc_target": 1.0, "soc_target_at": "17:00",

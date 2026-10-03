@@ -65,7 +65,7 @@ from emhasscore.writer import (  # noqa: E402
     append_tick, apply_ceilings, baseline_record, calibrate_amps, ceiling_writes, compile_step, CURRENT_FIELDS, day_step, day_was_live, fold_writes,
     guard_memory, guard_standing, soc_floor_tripped, SOC_FLOOR_RELEASE_PTS, writer_ceilings,
     heat_cut_tripped, heat_cut_amps, HEAT_CUT_RELEASE_C, HEAT_CUT_FIELDS, HEAT_CUT_FALLBACK_V,
-    held_record, last_counts, off_baseline, quantise_record, segment_of, SEGMENT_MEAN_INTENTS, WRITER_KNOBS,
+    idle_record, last_counts, standing_trade, trade_floor, TRADE_FLOOR_A, TRADE_FLOOR_FIELD, off_baseline, quantise_record, segment_of, SEGMENT_MEAN_INTENTS, WRITER_KNOBS,
     order_writes, read_anchor, soc_anchor_for_day, write_anchor,
     RESTORE_ORDER, same, step_in_force, wants_writes, writer_diff, WRITER_ENTITY, WRITER_FIELDS, WRITER_NEVER,
     WRITER_STALE_MIN, writer_tick,

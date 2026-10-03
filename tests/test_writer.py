@@ -214,14 +214,35 @@ def test_compile_step_uses_the_writer_margin_on_a_curtailed_plateau():
     assert cur["battery_max_charging_current"] == pytest.approx(119.0)     # 5.000 W + 20 % -> 6.000 W, or + 20 A -> 6.024 W = 118 A, + 1 A charge-clamp shortfall
 
 
-def test_held_record_falls_back_to_baseline_on_a_marginal_step():
-    rec, held = core.held_record(CMD_EXPORT, CMD_GRID_CHARGE)
-    assert held is True and rec["intent"] == "baseline"
-    assert {f: rec[f] for f in core.WRITER_FIELDS} == STANDING_BASELINE
-    rec, held = core.held_record(CMD_EXPORT, core.deye_command(-5000.0, 4000.0, 51.2))
+def test_trade_floor_writes_every_step_but_a_small_trade():
+    """The site 2026-10-03, in place of the hold rule: every step is written, a
+    single-step 7,5 kW sale and the last quarter of a run too. A sale or a
+    grid charge under 60 A is not worth a mode switch: what stands stays,
+    a standing trade of its own kind is continued, a standing trade of the
+    other kind (or a grid charge) goes to idle, never to the baseline."""
+    assert core.TRADE_FLOOR_A == 60.0
+    rec, held = core.trade_floor(CMD_EXPORT, STANDING_BASELINE)                 # 156 A: written, whatever comes next
     assert held is False and rec is CMD_EXPORT
-    rec, held = core.held_record(CMD_EXPORT, None)
-    assert held is True
+    small_sale = core.deye_command(-2500.0, 2500.0, 51.2)                         # 49 A
+    small_gc = core.deye_command(2000.0, -2000.0, 51.2)                           # 39 A
+    assert small_sale["intent"] == "export" and small_sale["battery_max_discharging_current"] < 60.0
+    assert small_gc["intent"] == "grid_charge" and small_gc["battery_grid_charging_current"] < 60.0
+    idle = _standing_of(core.deye_command(-3000.0, 0.0, 51.2))                    # pv_export: pack at 0 A
+    supply = _standing_of(core.deye_command(0.0, 800.0, 51.2))                    # self_supply: live from battery
+    for st in (idle, supply, STANDING_BASELINE):                                 # not a trade: what stands stays
+        for small in (small_sale, small_gc):
+            rec, held = core.trade_floor(small, st)
+            assert held is True and rec["intent"] == "kept"
+            assert core.writer_diff(st, rec) == {}
+    rec, held = core.trade_floor(small_sale, _standing_of(CMD_EXPORT))           # continues a standing sale
+    assert held is False and rec is small_sale
+    rec, held = core.trade_floor(small_gc, _standing_of(CMD_GRID_CHARGE))        # continues a standing grid charge
+    assert held is False and rec is small_gc
+    for small, st in ((small_sale, CMD_GRID_CHARGE), (small_gc, CMD_EXPORT)):    # against the other trade: idle
+        rec, held = core.trade_floor(small, _standing_of(st))
+        assert held is True and rec["intent"] == "pv_export"
+        assert rec["battery_grid_charging"] is False and rec["work_mode"] == "Zero Export To Load"
+        assert rec["battery_max_discharging_current"] == 0.0 and rec["battery_max_charging_current"] == 0.0
 
 
 def test_off_baseline_lists_only_the_fields_that_differ():
@@ -310,14 +331,18 @@ def test_writer_tick_dry_mode_reports_the_diff_and_the_ordered_writes():
     assert doc["written"] == [] and doc["write_counts"] == {"work_mode": 2}
 
 
-def test_writer_tick_live_mode_is_ok_and_holds_a_marginal_step_at_the_baseline():
+def test_writer_tick_live_mode_writes_a_single_step_trade_and_keeps_what_stands_for_a_small_one():
     doc = core.writer_tick("live", STANDING_BASELINE, _step("export", "export"), 51.2, NOW)
     assert doc["status"] == "ok" and doc["record"] != {}
-    held = core.writer_tick("live", _standing_of(CMD_EXPORT), _step("export", "grid_charge"), 51.2, NOW)
-    assert held["status"] == "ok" and held["held"] is True
-    assert held["intent"] == "export" and held["next_intent"] == "grid_charge"
-    assert held["record"] == {}
-    assert [f for f, _v in held["writes"]] == ["work_mode", "grid_peak_shaving", "battery_max_discharging_current"]
+    one = core.writer_tick("live", STANDING_BASELINE, _step("export", "grid_charge"), 51.2, NOW)
+    assert one["held"] is False and one["intent"] == "export" and one["next_intent"] == "grid_charge"
+    assert one["record"]["work_mode"] == "Export First"                       # the hold rule wrote the baseline here
+    small = _step("export", "export")
+    small["row"]["P_batt"] = small["next_row"]["P_batt"] = 2500.0               # 49 A
+    small["row"]["P_grid"] = small["next_row"]["P_grid"] = -2500.0
+    idle = _standing_of(core.deye_command(-3000.0, 0.0, 51.2))
+    kept = core.writer_tick("live", idle, small, 51.2, NOW)
+    assert kept["held"] is True and kept["intent"] == "export" and kept["writes"] == []
 
 
 def test_writer_tick_stale_or_missing_plan_wants_the_baseline():
@@ -424,17 +449,18 @@ def _walk_0905(mode="live"):
 
 
 def test_writer_day_0905_never_writes_a_dangerous_field_the_plan_did_not_import():
-    """The dry-day acceptance rule (spec section 5) as a unit test: a held
-    step writes the baseline, and a dangerous field stands only under a
-    grid-charge intent the plan holds for two steps."""
+    """The dry-day acceptance rule (spec section 5) as a unit test: a step
+    that is not ok writes the baseline, and a dangerous field stands only
+    under a grid-charge intent (the trade floor never carries a grid charge
+    into a step that does not charge from the grid)."""
     docs = _walk_0905()
     assert sum(1 for d in docs if d["status"] == "ok") >= 90
     for d in docs:
-        if d["held"] or d["status"] != "ok":
+        if d["status"] != "ok":
             assert d["record"] == {}, d["tick_ts"]
         dangerous = [f for f in d["record"] if core.DEYE_TIER[f] == "dangerous"]
         if dangerous:
-            assert d["intent"] == "grid_charge" and d["next_intent"] == "grid_charge", d["tick_ts"]
+            assert d["intent"] == "grid_charge", d["tick_ts"]
         for f in core.WRITER_NEVER:
             assert f not in d["diff"]
     assert any(d["record"] for d in docs)                       # the day is not all baseline
@@ -814,7 +840,7 @@ def test_guard_memory_takes_a_written_value_and_forgets_a_failed_one():
 
 def test_guard_memory_trusts_the_next_read_after_a_late_landing_write():
     """The 2026-10-01 21:30 -> 21:45 ticks replayed: the late write is read at
-    21:45 as it stands and the held baseline is written back at once."""
+    21:45 as it stands, with no suspect, and the idle step finds it standing."""
     raw_2130 = dict(STANDING_BASELINE, battery_max_discharging_current=99.0, work_mode="Export First",
                     grid_peak_shaving=False)
     believed, seen = core.guard_memory(raw_2130, dict(raw_2130),
@@ -825,8 +851,8 @@ def test_guard_memory_trusts_the_next_read_after_a_late_landing_write():
     raw_2145 = dict(STANDING_BASELINE, battery_max_charging_current=0.0, battery_max_discharging_current=0.0)
     used, suspect = core.guard_standing(believed, seen, raw_2145)
     assert suspect == [] and used == raw_2145
-    held = core.writer_tick("live", used, _step("pv_export", "export"), 51.2, NOW, suspect=suspect)
-    assert held["held"] and ["battery_max_charging_current", 240.0] in held["writes"]
+    tick = core.writer_tick("live", used, _step("pv_export", "export"), 51.2, NOW, suspect=suspect)
+    assert tick["held"] is False and tick["intent"] == "pv_export" and tick["writes"] == []
 
 
 # ---- the write budget knobs: deadbands and quantisation (handoff 2026-09-26) -------

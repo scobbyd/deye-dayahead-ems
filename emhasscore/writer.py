@@ -277,14 +277,55 @@ def baseline_record() -> dict:
     return rec
 
 
-def held_record(cmd: dict, next_cmd: dict | None) -> tuple[dict, bool]:
-    """THE HOLD RULE: a register is written only for an intent the plan holds
-    for two consecutive steps. The LP's marginal step (one step of export
-    between two of self-balance, the last step of the horizon) is the
-    baseline. (record, held)."""
-    if next_cmd is None or next_cmd.get("intent") != cmd.get("intent"):
-        return baseline_record(), True
-    return cmd, False
+# THE TRADE FLOOR (2026-10-03), in place of the hold rule. The hold rule
+# wrote the baseline for every step whose NEXT step had another intent: the last
+# quarter of every run and every single-step trade, 7-10 kW ones included (the
+# 09:00 sale of 10-03 at 7,5 kW ran as baseline and charged 2,2 kW from the sun;
+# 85 quarters, ~76 kWh of planned grid charges and sales in the first live
+# week). Every step is now written, except a small trade: a sale or a grid
+# charge under TRADE_FLOOR_A is not worth a mode switch, so what stands stays.
+# A small trade that continues a standing trade of its own kind is written
+# (the deadbands decide); a small trade against a standing trade of the other
+# kind, or after a standing grid charge, goes to the idle record (pack at 0 A,
+# the house on the grid), so a grid charge never outlives the plan's charge.
+# The baseline is never used as a "do nothing": it is "live from battery".
+TRADE_FLOOR_A = 60.0
+
+
+TRADE_FLOOR_FIELD = {"export": "battery_max_discharging_current", "grid_charge": "battery_grid_charging_current"}
+
+
+def standing_trade(standing: dict) -> str | None:
+    """The trade a standing record carries: 'grid_charge' (grid charging on),
+    'export' (Export First), else None."""
+    if _as_bool(standing.get("battery_grid_charging")):
+        return "grid_charge"
+    if str(standing.get("work_mode")) == "Export First":
+        return "export"
+    return None
+
+
+def idle_record() -> dict:
+    """The pack at 0 A both ways and the house on the grid (the pv_export record)."""
+    return deye_command(0.0, 0.0)
+
+
+def trade_floor(cmd: dict, standing: dict, floor_a: float = TRADE_FLOOR_A) -> tuple[dict, bool]:
+    """(record, skipped): the compiled step, or for a small trade the record
+    that stands (or idle, see above). `skipped` is True when the step's own
+    record is not the one written."""
+    f = TRADE_FLOOR_FIELD.get(cmd.get("intent"))
+    if f is None or float(cmd[f]) >= float(floor_a):
+        return cmd, False
+    st = standing_trade(standing)
+    if st == cmd["intent"]:
+        return cmd, False
+    if st is not None:
+        return idle_record(), True
+    kept = {fld: standing.get(fld) for fld in WRITER_FIELDS}
+    kept["intent"] = "kept"
+    kept["tier"] = DEYE_TIER
+    return kept, True
 
 
 def off_baseline(record: dict) -> dict:
@@ -535,7 +576,7 @@ def writer_tick(mode: str, standing: dict, step: dict | None, pack_v: float | No
         doc["plan_ts"] = step["plan_ts"] if step else None
     else:
         cmd, nxt = compile_step(step, pack_v, margin=True, knobs=knobs, pack_i=pack_i)
-        record, held = held_record(cmd, nxt)
+        record, held = trade_floor(cmd, standing)
         doc.update(plan_ts=step["plan_ts"], intent=cmd["intent"], next_intent=nxt["intent"] if nxt else None,
                    held=held, physics_v2=bool(step.get("physics_v2")))
     if doc["unavailable"] and mode != "off":

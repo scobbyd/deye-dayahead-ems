@@ -534,7 +534,7 @@ def deye_table(core):
 
 @case
 def writer_table(core):
-    """The writer's pure functions over the command grid: the hold rule, the
+    """The writer's pure functions over the command grid: the trade floor, the
     diff against four standing states, the write order, and a tick in each
     mode."""
     now = F.local(2026, 9, 27, 10, 30, 20)
@@ -545,10 +545,14 @@ def writer_table(core):
     grid = [(g, b, c, mc, s) for g in (-3000.0, 0.0, 2500.0) for b in (-6000.0, 0.0, 4000.0)
             for c in (0.0, 1500.0) for mc in (False, True) for s in (-0.01, 0.08)]
     cmds = [core.deye_command(g, b, 51.2, micro_cut=mc, pv_curtail_w=c, sell=s, margin=True) for g, b, c, mc, s in grid]
+    # the trade floor (2026-10-03, in place of the hold rule): each command
+    # against a standing command picked across the grid
     for i, cur in enumerate(cmds):
-        nxt = cmds[(i * 7 + 3) % len(cmds)]
-        rec, held = core.held_record(cur, nxt)
-        out["held"].append({"cur": cur["intent"], "next": nxt["intent"], "held": held, "record": core.off_baseline(rec)})
+        prev = cmds[(i * 7 + 3) % len(cmds)]
+        st = {f: prev[f] for f in core.WRITER_FIELDS}
+        rec, held = core.trade_floor(cur, st)
+        out["held"].append({"cur": cur["intent"], "standing": prev["intent"], "held": held,
+                            "record": core.off_baseline(rec)})
     base = {f: core.DEYE_BASELINE[f] for f in core.WRITER_FIELDS}
     standings = {"baseline": base,
                  "export": {f: cmds[grid.index((-3000.0, 4000.0, 0.0, False, 0.08))][f] for f in core.WRITER_FIELDS},

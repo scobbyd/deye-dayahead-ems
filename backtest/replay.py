@@ -278,21 +278,24 @@ class Walk:
                          act["pv_peak_w"], act["micro_w"], capacity_kwh=self.hw["capacity_kwh"], soc_start_pct=prev_end)
         if not vd:
             return None
-        self._fold_rebalance(vd)
+        self._fold_rebalance(vd, tick)
         return vd.get("soc_now_pct")
 
-    def _fold_rebalance(self, vd: dict) -> None:
+    def _fold_rebalance(self, vd: dict, now: datetime) -> None:
         """The settled rebalancing clock (emhasscore.rebalance), as the wrapper
         keeps it in /config/emhass/rebalance.json: every settled slice is folded
         in, the state travels in state.json, and run_plan prices the SOC knobs
         off it. A walk starts with nothing on record, which reads as overdue."""
         from emhasscore import rebalance
+        from emhasscore.objective import REBALANCE_DWELL_H, REBALANCE_FULL_LEVEL
         if vd.get("soc_pct") is None or not vd.get("slice_start"):
             return
         dwell = self.knobs.get("rebalance_dwell_h")
+        # the virtual pack has no voltage: its top is the SOC level
         self.state["rebalance"] = rebalance.update(self.state.get("rebalance"), vd["slice_start"], vd["soc_pct"],
-                                                   int(vd.get("n_past") or 0),
-                                                   dwell_h=float(dwell) if dwell is not None else rebalance.REBALANCE_DWELL_H)
+                                                   int(vd.get("n_past") or 0), REBALANCE_FULL_LEVEL * 100.0,
+                                                   dwell_h=float(dwell) if dwell is not None else REBALANCE_DWELL_H)
+        self.state["rebalance"] = rebalance.latch(self.state["rebalance"], now)
 
     def run_tick(self, tick: datetime) -> dict:
         """One solve. Returns run_plan's result plus soc_pct / soc_source /
@@ -349,7 +352,7 @@ class Walk:
         if not vd or vd.get("soc_now_pct") is None:
             raise RuntimeError(f"cannot settle {day}: virtual chain broken")
         self.state["soc_end_pct"][day.isoformat()] = float(vd["soc_now_pct"])
-        self._fold_rebalance(vd)                      # the day's last quarters, which no tick saw
+        self._fold_rebalance(vd, midnight_next)       # the day's last quarters, which no tick saw
         self._save_state()
         path = os.path.join(self.slices_dir, f"{day.isoformat()}.parquet")
         tmp = path + ".tmp"

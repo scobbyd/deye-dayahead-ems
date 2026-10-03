@@ -417,7 +417,14 @@ def deye_command(p_grid_w: float, p_batt_w: float, pack_v: float = DEYE_PACK_V,
         if intent == "export":
             cmd.update(work_mode="Export First", grid_peak_shaving=False)
         else:
-            cmd["export_surplus"] = False
+            # LIVE FROM BATTERY KEEPS EXPORT SURPLUS ON (2026-10-03), under
+            # the same rule as every other intent. Turning it off dates from
+            # before the go-live trials, when it was read as the permission that
+            # lets the pack discharge into the grid; peak shaving (on here) is
+            # what blocks a pack sale. Off it only kept PV from being sold, and
+            # cost flips (~9 writes a day in the spread-tariff backtest). Without
+            # a SOC (settlement, replay) the old export-off stands.
+            cmd["export_surplus"] = soc_pct is not None and not export_shuts(sell, soc_pct)
     elif intent == "pv_export":
         # Sell PV now, bank nothing: hold the pack with a ZERO CHARGE CLAMP and
         # let the surplus leave. Deliberately NOT Export First (2026-09-06):

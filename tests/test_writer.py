@@ -929,8 +929,8 @@ def test_compile_step_quantises_the_currents_up_for_a_grid_charge_and_down_for_a
     s["row"]["P_PV_curtailment"] = 800.0
     plateau, _ = core.compile_step(s, 51.2, knobs=k)
     assert plateau["battery_max_charging_current"] == 100.0               # 119 asked, a ceiling with the margin: down
-    small = _step("self_supply", "self_supply")                            # 800 W = 16 A, 16,3 asked: never under one step
-    assert core.compile_step(small, 51.2, knobs=k)[0]["battery_max_discharging_current"] == 20.0
+    small = _step("self_supply", "self_supply")                            # live from battery: the open clamp (2026-10-03)
+    assert core.compile_step(small, 51.2, knobs=k)[0]["battery_max_discharging_current"] == 240.0
     pv, _ = core.compile_step(_step("pv_export", "pv_export"), 51.2, knobs=k)
     assert pv["battery_max_charging_current"] == 0.0 and pv["battery_max_discharging_current"] == 0.0
     same_as_before, _ = core.compile_step(_step("export", "export"), 51.2)

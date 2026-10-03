@@ -285,9 +285,9 @@ def deye_command(p_grid_w: float, p_batt_w: float, pack_v: float = DEYE_PACK_V,
                                                  clamp, error on the battery up to it
       grid_charge   import is the goal        -> grid charging ON, error on the grid
       export        discharging to sell       -> Export First, error on the grid
-      self_supply   discharging into the load -> zero export, discharge clamp at the
-                                                 plan; error on the battery up to
-                                                 the clamp, then on the grid
+      self_supply   discharging into the load -> zero export, discharge clamp open
+                                                 (240 A): the pack follows the
+                                                 house, the error lands on the pack
       pv_export     battery idle              -> no freedom; the grid takes it
 
     `sell` is the step's sell price; None (unknown) is read as paying, so a
@@ -413,10 +413,18 @@ def deye_command(p_grid_w: float, p_batt_w: float, pack_v: float = DEYE_PACK_V,
         # settlement's delta already books it. The other two stay wide open.
         # With peak shaving ON the inverter sells NOTHING from the pack, so the
         # export intent turns it off and the baseline turns it back on.
-        cmd.update(battery_max_discharging_current=deye_amps(p_batt_w, pack_v))
         if intent == "export":
-            cmd.update(work_mode="Export First", grid_peak_shaving=False)
+            cmd.update(battery_max_discharging_current=deye_amps(p_batt_w, pack_v),
+                       work_mode="Export First", grid_peak_shaving=False)
         else:
+            # LIVE FROM BATTERY IS THE OPEN CLAMP (2026-10-03): the pack
+            # follows the house's actual draw, so the load error lands on the
+            # pack, not the meter. Under Zero Export To Load with peak shaving on
+            # the pack can only feed the house, and the plan never covered just
+            # part of the load (0 of 179 self-supply quarters in the 10 ct
+            # spread-tariff backtest of 09-26..10-02), so the clamp at the plan
+            # enforced nothing. The SOC-floor kill still stops it at the floor.
+            cmd.update(battery_max_discharging_current=DEYE_CURRENT_MAX_A)
             # LIVE FROM BATTERY KEEPS EXPORT SURPLUS ON (2026-10-03), under
             # the same rule as every other intent. Turning it off dates from
             # before the go-live trials, when it was read as the permission that

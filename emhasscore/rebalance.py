@@ -22,7 +22,14 @@ The clock since 2026-10-03:
     until the whole budget is in, so the pull holds the pack at the top for
     the budget and lets go after it (the hysteresis the site asked for);
   - nothing counted inside REBALANCE_LOOKBACK_D (a fresh install, a lost state
-    file) reads as OVERDUE: the pack is assumed to need a balance.
+    file) reads as OVERDUE: the pack is assumed to need a balance;
+  - THE PULL LATCHES (2026-10-03, `latch`): once the clock reaches
+    REBALANCE_PULL_DAY (or reads overdue) it stays at least REBALANCE_PULL_DAY
+    plus the days since it latched, so the end target, the surplus-off and the
+    pull hold and the pull keeps stepping up, until REBALANCE_RELEASE_H of
+    counted top time fall inside the last REBALANCE_RELEASE_WINDOW_H. The
+    release is a balance: from then on the clock reads at most the time since
+    it, so older stretches cannot drag it straight back past day 14.
 
 The state is a small dict the caller persists (the wrapper in
 /config/emhass/rebalance.json, the replay walk in its state.json):
@@ -30,6 +37,8 @@ The state is a small dict the caller persists (the wrapper in
   run_start  ISO start of the stretch in progress (counted or not yet), or None
   run_end    ISO end of the last quarter in that stretch, or None
   seen       ISO end of the newest settled quarter processed
+  latch_since  ISO instant the pull latched, or None
+  released     ISO instant the last latch released (a balance), or None
 `update` is idempotent over a re-read of the same settled day (it only
 consumes quarters after `seen`), and a quarter that is not the immediate
 successor of `run_end` starts a new stretch, so a gap in the settlement cannot
@@ -40,13 +49,15 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 
 from .grid import STEP_MIN
-from .objective import REBALANCE_BUDGET_H, REBALANCE_DWELL_H, REBALANCE_LOOKBACK_D, rebalance_clock_days
+from .objective import (REBALANCE_BUDGET_H, REBALANCE_DWELL_H, REBALANCE_LOOKBACK_D, REBALANCE_PULL_DAY,
+                        REBALANCE_RELEASE_H, REBALANCE_RELEASE_WINDOW_H, REBALANCE_SOC_FINAL_DAY,
+                        REBALANCE_SURPLUS_OFF_DAY, rebalance_clock_days)
 
-STATE_KEYS = ("runs", "run_start", "run_end", "seen")
+STATE_KEYS = ("runs", "run_start", "run_end", "seen", "latch_since", "released")
 
 
 def empty_state() -> dict:
-    return {"runs": [], "run_start": None, "run_end": None, "seen": None}
+    return {"runs": [], "run_start": None, "run_end": None, "seen": None, "latch_since": None, "released": None}
 
 
 def _iso(t: datetime | None) -> str | None:
@@ -101,7 +112,7 @@ def update(state: dict | None, slice_start: str | datetime, series: list, n_past
     if seen is not None:
         runs = [r for r in runs if r[1] > seen - timedelta(days=float(lookback_d))]
     return {"runs": [[_iso(a), _iso(b)] for a, b in runs], "run_start": _iso(run_start),
-            "run_end": _iso(run_end), "seen": _iso(seen)}
+            "run_end": _iso(run_end), "seen": _iso(seen), "latch_since": st["latch_since"], "released": st["released"]}
 
 
 def budget_start(state: dict | None, budget_h: float = REBALANCE_BUDGET_H) -> datetime | None:
@@ -117,14 +128,57 @@ def budget_start(state: dict | None, budget_h: float = REBALANCE_BUDGET_H) -> da
     return None
 
 
-def days_since(state: dict | None, now: datetime, budget_h: float = REBALANCE_BUDGET_H) -> float | None:
-    """The clock: days since the newest `budget_h` hours of counted top time
-    began, or None when the lookback does not hold them (which the schedule
-    treats as overdue)."""
+def _days(a: datetime, b: datetime) -> float:
+    return max(0.0, (b - a).total_seconds() / 86400.0)
+
+
+def raw_days(state: dict | None, now: datetime, budget_h: float = REBALANCE_BUDGET_H) -> float | None:
+    """The budget clock before the latch: days since the newest `budget_h` hours
+    of counted top time began, at most the days since the last release; None
+    when neither exists."""
     t = budget_start(state, budget_h)
-    if t is None:
-        return None
-    return max(0.0, (now - t).total_seconds() / 86400.0)
+    rel = _parse(load_state(state)["released"])
+    ds = [_days(x, now) for x in (t, rel) if x is not None]
+    return min(ds) if ds else None
+
+
+def days_since(state: dict | None, now: datetime, budget_h: float = REBALANCE_BUDGET_H) -> float | None:
+    """The clock the schedule reads: the raw clock, held at REBALANCE_PULL_DAY
+    plus the latch's age while the pull is latched; None (overdue) when there
+    is nothing on record and no latch."""
+    d = raw_days(state, now, budget_h)
+    since = _parse(load_state(state)["latch_since"])
+    if since is None:
+        return d
+    held = REBALANCE_PULL_DAY + _days(since, now)
+    return held if d is None else max(d, held)
+
+
+def hours_within(state: dict | None, now: datetime, window_h: float = REBALANCE_RELEASE_WINDOW_H) -> float:
+    """Counted top time inside the last `window_h` hours, hours."""
+    a0 = now - timedelta(hours=float(window_h))
+    tot = 0.0
+    for a, b in load_state(state)["runs"]:
+        a, b = max(_parse(a), a0), min(_parse(b), now)
+        if b > a:
+            tot += (b - a).total_seconds()
+    return round(tot / 3600.0, 2)
+
+
+def latch(state: dict | None, now: datetime, release_h: float = REBALANCE_RELEASE_H,
+          window_h: float = REBALANCE_RELEASE_WINDOW_H, budget_h: float = REBALANCE_BUDGET_H) -> dict:
+    """One latch step at `now`: a latched pull releases once `release_h` of
+    counted top time lie inside the last `window_h` (the release is a balance);
+    an unlatched clock latches at REBALANCE_PULL_DAY or when overdue."""
+    st = load_state(state)
+    if st["latch_since"] is not None:
+        if hours_within(st, now, window_h) >= float(release_h):
+            st["latch_since"], st["released"] = None, _iso(now)
+    else:
+        d = raw_days(st, now, budget_h)
+        if d is None or d >= REBALANCE_PULL_DAY:
+            st["latch_since"] = _iso(now)
+    return st
 
 
 def top_hours(state: dict | None) -> float:
@@ -135,3 +189,30 @@ def top_hours(state: dict | None) -> float:
 def overdue_days() -> float:
     """What a clock with nothing on record counts as: the pull at its ceiling."""
     return rebalance_clock_days(None)
+
+
+def published(state: dict | None, now: datetime, budget_h: float = REBALANCE_BUDGET_H) -> dict:
+    """The two numbers the dashboard plots (2026-10-03): `top_hours` is the
+    counted top time inside the lookback ("balanced, 30 d"); `clock_days` is
+    the clock, or the lookback when the budget is not in it (overdue: the
+    graph keeps a value instead of a hole); `phase` names the schedule stage
+    the clock is in."""
+    d = days_since(state, now, budget_h)
+    clock = rebalance_clock_days(d)
+    if d is None:
+        phase = "overdue"
+    elif clock >= REBALANCE_PULL_DAY:
+        phase = "pulling"
+    elif clock >= REBALANCE_SOC_FINAL_DAY:
+        phase = "end target"
+    elif clock >= REBALANCE_SURPLUS_OFF_DAY:
+        phase = "surplus off"
+    else:
+        phase = "fresh"
+    st = load_state(state)
+    t = budget_start(state, budget_h)
+    return {"top_hours": top_hours(state), "clock_days": round(d, 2) if d is not None else REBALANCE_LOOKBACK_D,
+            "phase": phase, "budget_start": _iso(t), "stretches": len(st["runs"]),
+            "last_stretch_end": st["runs"][-1][1] if st["runs"] else None,
+            "latch_since": st["latch_since"], "released": st["released"],
+            "release_hours": hours_within(state, now)}

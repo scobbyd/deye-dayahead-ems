@@ -304,6 +304,17 @@ REBALANCE_BUDGET_H = 8.0        # the clock is the age of the newest BUDGET hour
 REBALANCE_LOOKBACK_D = 30.0     # older stretches are dropped; nothing inside it reads as overdue
 
 
+# THE PULL LATCHES (2026-10-03). Once the clock reaches REBALANCE_PULL_DAY the
+# pull stays on until the pack has had REBALANCE_RELEASE_H of counted top time
+# inside the last REBALANCE_RELEASE_WINDOW_H, "mostly" a full balance. Without
+# it the pull let go as soon as a short hold plus older stretches made up the
+# budget, and the clock was back at day 12-14 a few days later.
+REBALANCE_RELEASE_H = 6.0
+
+
+REBALANCE_RELEASE_WINDOW_H = 48.0
+
+
 def rebalance_clock_days(days_since_full) -> float:
     """The clock as the schedule reads it. None (no full charge on record)
     counts as OVERDUE with the pull at its ceiling, because a pack with no

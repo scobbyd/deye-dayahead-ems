@@ -156,6 +156,27 @@ def _yesterday_lanes(prev, yday):
     return out
 
 
+REBALANCE_TOP_HOURS = "sensor.emhass_rebalance_top_hours"
+REBALANCE_CLOCK = "sensor.emhass_rebalance_clock"
+
+
+def _publish_rebalance(state_doc, now):
+    """The rebalancing clock as two plottable sensors (2026-10-03, the Battery
+    tab's balance tiles): counted hours at the top in the last 30 days, and
+    the clock in days with its schedule phase."""
+    p = core.rebalance.published(state_doc, now)
+    common = {"phase": p["phase"], "budget_start": p["budget_start"], "stretches": p["stretches"],
+              "last_stretch_end": p["last_stretch_end"], "budget_h": core.REBALANCE_BUDGET_H,
+              "top_v": core.REBALANCE_TOP_V, "latch_since": p["latch_since"], "released": p["released"],
+              "release_hours_48h": p["release_hours"], "release_h": core.REBALANCE_RELEASE_H}
+    state.set(REBALANCE_TOP_HOURS, p["top_hours"], new_attributes=dict(common, **{
+        "friendly_name": "EMHASS balanced, 30 d", "unit_of_measurement": "h", "state_class": "measurement",
+        "icon": "mdi:battery-sync"}))
+    state.set(REBALANCE_CLOCK, p["clock_days"], new_attributes=dict(common, **{
+        "friendly_name": "EMHASS balance clock", "unit_of_measurement": "d", "state_class": "measurement",
+        "icon": "mdi:timer-sand"}))
+
+
 PACK_TEMP_MEAN = "sensor.emhass_pack_temp_1h"
 PACK_TEMP_USED = "sensor.emhass_pack_temp_used"
 
@@ -362,7 +383,8 @@ def _plan_day(dry_run=False):
     # REBALANCE_BUDGET_H hours of it. No state on record reads as overdue.
     inp["rebalance"] = task.executor(core.rebalance_step, REBALANCE, (settled or {}).get("slice_start"),
                                      act.get("batt_v"), int((settled or {}).get("n_past") or 0),
-                                     core.REBALANCE_TOP_V, inp["knobs"].get("rebalance_dwell_h"))
+                                     core.REBALANCE_TOP_V, inp["knobs"].get("rebalance_dwell_h"), now)
+    _publish_rebalance(inp["rebalance"], now)
     # The running day's hours for the period charts (2026-09-17): the settled
     # slice's past steps, written to the hourly sidecar and imported now, so
     # the shadow lanes reach `now` like the hero graphs; the ladder's nightly

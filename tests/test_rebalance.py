@@ -96,3 +96,61 @@ def test_stretches_older_than_the_lookback_are_dropped():
 def test_a_state_from_the_single_dwell_clock_starts_empty():
     old = {"last_full": "2026-09-25T17:45:00+02:00", "run_quarters": 0, "run_end": None, "seen": None}
     assert rb.load_state(old)["runs"] == [] and rb.days_since(old, T0) is None
+
+
+def test_published_numbers_and_phases():
+    st = rb.update(None, T0, _volts(48, 80), 96, TOP)                     # 8 h, day 0 12:00-20:00
+    p = rb.published(st, T0 + timedelta(days=3, hours=12))
+    assert p["top_hours"] == 8.0 and p["clock_days"] == 3.0 and p["phase"] == "fresh"
+    assert p["stretches"] == 1 and p["budget_start"] == _q(48).isoformat() and p["last_stretch_end"] == _q(80).isoformat()
+    for days, phase in ((7.5, "surplus off"), (12.5, "end target"), (14.5, "pulling")):
+        assert rb.published(st, T0 + timedelta(days=days, hours=12))["phase"] == phase, days
+    # overdue: the graph keeps a value (the lookback), the phase says so
+    p = rb.published(None, T0)
+    assert p["top_hours"] == 0.0 and p["clock_days"] == 30.0 and p["phase"] == "overdue" and p["budget_start"] is None
+
+
+# ---- the pull latch (2026-10-03): on at day 14, off at 6 h at the top in 48 h ----
+
+def _hold(state, day, q_from, q_to, n_past=96):
+    """Fold a day with a stretch at the top from quarter q_from to q_to, then step the latch at the slice's end."""
+    t = T0 + timedelta(days=day)
+    st = rb.update(state, t, _volts(q_from, q_to), n_past, TOP)
+    return rb.latch(st, t + timedelta(minutes=15 * n_past))
+
+
+def test_the_latch_engages_at_day_14_and_when_overdue():
+    st = rb.update(None, T0, _volts(48, 80), 96, TOP)                     # 8 h on day 0, 12:00-20:00
+    assert rb.latch(st, T0 + timedelta(days=13, hours=12))["latch_since"] is None
+    on = rb.latch(st, T0 + timedelta(days=14, hours=12))
+    assert on["latch_since"] == (T0 + timedelta(days=14, hours=12)).isoformat()
+    assert rb.latch(None, T0)["latch_since"] == T0.isoformat()             # nothing on record: overdue, latched
+
+
+def test_a_short_hold_does_not_release_the_latch_and_the_pull_keeps_stepping_up():
+    # 6 h of short tops 4-10 days ago, 2 h older: the old clock dropped to ~10 d after 2 h at the top
+    st = rb.update(None, T0, _volts(48, 56), 96, TOP)                     # 2 h on day 0
+    for d in (6, 8, 10):
+        st = rb.update(st, T0 + timedelta(days=d), _volts(64, 72), 96, TOP)   # 2 h on days 6, 8, 10
+    st = rb.latch(st, T0 + timedelta(days=14, hours=12))                   # day 14,5 since day 0: latched
+    assert st["latch_since"] is not None
+    st = _hold(st, 15, 48, 56)                                            # 2 h at the top on day 15
+    now = T0 + timedelta(days=16)
+    assert st["latch_since"] is not None
+    assert rb.raw_days(st, now) < 12                                      # the budget alone would let go
+    assert rb.days_since(st, now) >= 15.5                                 # the latch holds it: pull on, 2nd day
+    assert rebalance_schedule(rb.days_since(st, now))["battery_soc_deficit_cost"] == 0.002
+
+
+def test_six_hours_in_48_releases_and_the_release_counts_as_a_balance():
+    st = rb.update(None, T0, _volts(48, 80), 96, TOP)                     # 8 h on day 0
+    st = rb.latch(st, T0 + timedelta(days=14, hours=12))
+    st = _hold(st, 15, 40, 56)                                            # 4 h on day 15, 10:00-14:00
+    assert st["latch_since"] is not None                                  # 4 h of 6
+    st = _hold(st, 16, 72, 80)                                            # 2 h on day 16, 18:00-20:00: 6 h in 48 h
+    assert st["latch_since"] is None and st["released"] == (T0 + timedelta(days=17)).isoformat()
+    # the budget alone reaches back to day 0 (6 h now + 2 h then): the release keeps the clock fresh
+    later = T0 + timedelta(days=18)
+    assert rb.days_since(st, later) == 1.0
+    assert rb.latch(st, later)["latch_since"] is None                     # and it does not re-latch
+    assert rb.published(st, later)["phase"] == "fresh"

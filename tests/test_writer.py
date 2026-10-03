@@ -1368,21 +1368,23 @@ def test_compile_step_full_power_stays_under_a_heat_ceiling():
     assert doc["record"]["battery_max_discharging_current"] == 115.0
 
 
-def test_writer_diff_always_moves_a_setpoint_to_and_from_the_nameplate():
-    """The nameplate is a rest like 0 A: a sale at 225 A standing in front of
-    a full-power step moves to 240 A through the deadband, and a 240 A left
-    by a full step or the baseline does not keep selling over a 225 A step.
-    The charge clamp is a ceiling and keeps its deadband either way."""
+def test_writer_diff_always_moves_a_setpoint_to_the_nameplate_and_down_through_the_deadband():
+    """A sale at 225 A standing in front of a full-power step moves to 240 A
+    through the deadband. Down from 240 A (a full step's tail, the baseline)
+    goes through the deadband like any other move (2026-10-03): a
+    standing nameplate errs toward selling at full power. The charge clamp
+    is a ceiling and keeps its deadband either way."""
     D, G, C = "battery_max_discharging_current", "battery_grid_charging_current", "battery_max_charging_current"
     rec = dict(CMD_EXPORT, battery_max_discharging_current=240.0)
     st = _standing_of(rec)
     assert core.writer_diff(dict(st, **{D: 225.0}), rec) == {D: [225.0, 240.0]}
-    assert core.writer_diff(dict(st, **{D: 240.0}), dict(rec, **{D: 225.0})) == {D: [240.0, 225.0]}
+    assert core.writer_diff(dict(st, **{D: 240.0}), dict(rec, **{D: 221.0})) == {}            # 19 A down: held
+    assert core.writer_diff(dict(st, **{D: 240.0}), dict(rec, **{D: 220.0})) == {D: [240.0, 220.0]}   # 20 A: written
     assert core.writer_diff(dict(st, **{D: 230.0}), dict(rec, **{D: 225.0})) == {}   # off the nameplate: the deadband
     gc = dict(CMD_GRID_CHARGE, battery_grid_charging_current=240.0)
     gs = _standing_of(gc)
     assert core.writer_diff(dict(gs, **{G: 229.0}), gc) == {G: [229.0, 240.0]}
-    assert core.writer_diff(dict(gs, **{G: 240.0}), dict(gc, **{G: 229.0})) == {G: [240.0, 229.0]}
+    assert core.writer_diff(dict(gs, **{G: 240.0}), dict(gc, **{G: 229.0})) == {}
     sb = dict(core.deye_command(0.0, -5000.0, 51.2), battery_max_charging_current=240.0)
     ss = _standing_of(sb)
     assert core.writer_diff(dict(ss, **{C: 225.0}), sb) == {}

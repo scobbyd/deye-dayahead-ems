@@ -182,17 +182,20 @@ def setpoint_write(standing_a: float | None, wanted_a: float, deadband_a: float,
     """clamp_write for a register that is a SETPOINT rather than a ceiling: a
     move to or from the baseline is always written (0 A to 15 A is inside a
     20 A deadband but starves a grid charge the plan pays for), and so is a
-    move to or from `top` (the nameplate a full-power step asks for, 2026-10-02:
+    move TO `top` (the nameplate a full-power step asks for, 2026-10-02:
     225 A standing under a 240 A sale is ~0,8 kW short at the best price);
-    any other move goes through the deadband."""
+    any other move, a move down from `top` too, goes through the deadband
+    (2026-10-03: a standing nameplate errs toward selling at full power;
+    the forced move down cost one write a week and tracked no better)."""
     if standing_a is None:
         return float(wanted_a), True
     s, w = float(standing_a), float(wanted_a)
     if abs(s - w) < 0.5:
         return s, False                          # the register resolves to 1 A: nothing to write
-    for anchor in (baseline, top):
-        if anchor is not None and (abs(s - float(anchor)) < 0.5) != (abs(w - float(anchor)) < 0.5):
-            return w, True
+    if (abs(s - float(baseline)) < 0.5) != (abs(w - float(baseline)) < 0.5):
+        return w, True
+    if top is not None and abs(w - float(top)) < 0.5:
+        return w, True
     return clamp_write(s, w, deadband_a)
 
 

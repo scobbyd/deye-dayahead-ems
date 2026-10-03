@@ -187,7 +187,8 @@ def segment_of(intents: list, i: int) -> tuple[int, int]:
 # step for the whole run, ~0,9 kW short at the day's best price. A step at
 # the knob is not a current to track but "everything the pack has": its
 # setpoint goes to the nameplate, one write for the run however the voltage
-# sags, and writer_diff moves to and from the nameplate through any deadband.
+# sags, and writer_diff moves TO the nameplate through any deadband (down from
+# it through the deadband, the site 2026-10-03).
 # The register delivers ~236 A there, a few % over the knob; the next solve
 # starts from the real SOC. The heat ceiling still caps it. A plan archived
 # without the knob compiles as before. Only the two SETPOINTS: a full-power
@@ -319,7 +320,8 @@ def writer_diff(standing: dict, record: dict, deadband_a: float = DEYE_CLAMP_DEA
             # there), so a move to or from it is always written: a 20 A band
             # would otherwise keep a small self-supply (6-12 A at night) from
             # ever starting, or from ever stopping on the next idle step.
-            # The nameplate is the other rest (a full-power step, compile_step).
+            # A move TO the nameplate is always written too (a full-power step,
+            # compile_step); down from it goes through the deadband.
             v, wrote = setpoint_write(_as_float(s), float(w), k["discharge_deadband_a"], baseline=0.0,
                                       top=DEYE_CURRENT_MAX_A)
             if wrote:

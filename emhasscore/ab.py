@@ -15,6 +15,8 @@ from .objective import (
     batt_power_limits,
     CAPACITY_KWH,
     cut_payload,
+    lp_lists,
+    micro_netted,
     cut_thresholds,
     is_v2,
     apply_plant,
@@ -36,8 +38,12 @@ from .objective import (
 from .deye import clamp_write, DEYE_CLAMP_DEADBAND_A, SETTLE_MARGIN, integrate_soc, settle_step, soc_dwell_h, wanted_clamp
 from .addon import solve
 from .archive import iter_organic_plans
+from .actuals import DayActuals
 from .slices import virtual_day
 from .scoring import lambda_for, soc_term
+
+# the standby a v2 document from before 2026-10-09 carries in its load
+ARCHIVED_STANDBY_W = 90.0
 
 
 #
@@ -107,12 +113,17 @@ def _ab_solves(archive_dir: str, day: date, tz: str, cadence_min: int) -> list[t
     return picked
 
 
-def _ab_payload(doc: dict, shift: int, overrides: dict, day: date, tz: str, load_actual_w: list | None):
+def _ab_payload(doc: dict, shift: int, overrides: dict, day: date, tz: str, load_actual_w: list | None,
+                micro_in_load=None):
     """The archived payload, shifted, with the overrides applied. Returns
     (payload, micro_w, cut_ready, notes): micro_w is the must-take lane on the
     same shifted grid, cut_ready says whether the cut rule can run (a split is
-    on), notes lists approximations taken."""
+    on), notes lists approximations taken. The document's own convention says
+    how its lists are read back to gross (a document without micro_in_load was
+    archived under the legacy netting); the lists go out under the plant's
+    convention, or the one pinned with `micro_in_load`."""
     pay = dict(doc.get("payload") or {})
+    doc_in_load = bool(doc.get("micro_in_load", True))
     n = int(doc["n"]) - shift
     for k in AB_LIST_KEYS:
         if k in pay:
@@ -135,15 +146,19 @@ def _ab_payload(doc: dict, shift: int, overrides: dict, day: date, tz: str, load
     z = ZoneInfo(tz)
     t0 = _parse_ts(doc["t0"]).astimezone(z) + timedelta(minutes=STEP_MIN * shift)
     times = step_times(t0, n)
-    # base load without the must-take lane, whatever the archived cut did
+    # the GROSS load and sun, whatever the archived cut and convention did: the
+    # legacy netting put the lane in the load (except on a cut step), gross
+    # lists kept it in the sun (except on a cut step, where it left the PV list)
     load_w = None
     if pay.get("load_power_forecast"):
-        load_w = [float(l) + (0.0 if c else m) for l, m, c in zip(pay["load_power_forecast"], micro, cuts)]
+        load_w = [float(l) + ((0.0 if c else m) if doc_in_load else 0.0)
+                  for l, m, c in zip(pay["load_power_forecast"], micro, cuts)]
     # own knobs that rebuild the lists. The TOTAL the planner saw is fixed first
-    # (archived main + archived lane); the lane and the main are then re-derived
-    # from it, so a share change moves watts between the two halves and a mix
-    # change moves the total, never both at once by accident.
-    total = [float(v) + m for v, m in zip(pay.get("pv_power_forecast") or [0.0] * n, micro)]
+    # (archived sun + archived lane where it was netted); the lane and the main
+    # are then re-derived from it, so a share change moves watts between the two
+    # halves and a mix change moves the total, never both at once by accident.
+    total = [float(v) + (m if (doc_in_load or c) else 0.0)
+             for v, m, c in zip(pay.get("pv_power_forecast") or [0.0] * n, micro, cuts)]
     if "growatt_share" in overrides and doc.get("growatt_share"):
         f = float(overrides["growatt_share"]) / float(doc["growatt_share"])
         micro = [min(m * f, t) for m, t in zip(micro, total)]
@@ -157,7 +172,6 @@ def _ab_payload(doc: dict, shift: int, overrides: dict, day: date, tz: str, load
             notes.append("pv_p10_mix rebuilt from the archived percentiles; the must-take lane scaled with the total")
         else:
             notes.append("pv_p10_mix unavailable: the document has no archived percentiles")
-    pay["pv_power_forecast"] = [round(max(0.0, t - m), 1) for t, m in zip(total, micro)]
     if overrides.get("load") == "actual" and load_actual_w is not None and load_w is not None:
         for k, t in enumerate(times):
             if t.date() == day:
@@ -165,8 +179,9 @@ def _ab_payload(doc: dict, shift: int, overrides: dict, day: date, tz: str, load
                 if i < len(load_actual_w) and load_actual_w[i] is not None:
                     load_w[k] = float(load_actual_w[i])
         notes.append("load: measured load in place of the profile over the day")
-    if load_w is not None:
-        pay["load_power_forecast"] = [round(l - m, 1) for l, m in zip(load_w, micro)]
+    pay["pv_power_forecast"], load_lp = lp_lists(total, load_w, micro, micro_in_load)
+    if load_lp is not None:
+        pay["load_power_forecast"] = load_lp
     # The knob layer, on top of what the archived solve ran with: knobs not
     # overridden keep the ARCHIVED values (the document carries them from
     # 2026-09-07 on; older documents imply the constants of their day).
@@ -181,9 +196,11 @@ def _ab_payload(doc: dict, shift: int, overrides: dict, day: date, tz: str, load
         # The whole physics layer follows the flag (loss map v2): plant keys and
         # limits, the standby draw in the load, the SOC target margin.
         apply_plant(pay, kn)
-        sign = 1.0 if now_v2 else -1.0
+        # on: today's standby; off: the standby the archived solve added (the
+        # document carries it from 2026-10-09; older v2 documents added 90 W)
+        add = STANDBY_LOAD_W if now_v2 else -float(doc.get("standby_load_w") or ARCHIVED_STANDBY_W)
         if pay.get("load_power_forecast"):
-            pay["load_power_forecast"] = [round(l + sign * STANDBY_LOAD_W, 1) for l in pay["load_power_forecast"]]
+            pay["load_power_forecast"] = [round(l + add, 1) for l in pay["load_power_forecast"]]
         if pay.get("soc_target") is not None:
             t = float(pay["soc_target"])
             pay["soc_target"] = round(min(t + SOC_TARGET_MARGIN_V2, float(kn["soc_max"])) if now_v2
@@ -258,8 +275,9 @@ def _ab_inputs(archive_dir: str, day: date, tz: str, overrides: dict, actuals: d
     for k in ("pv_w", "load_w"):
         if not actuals.get(k) or len(actuals[k]) != n_day:
             return None, [], ("no_actuals", f"{k} missing or not {n_day} steps")
-    executed = virtual_day(archive_dir, day, tz, midnight + timedelta(days=1), actuals["pv_w"], actuals["load_w"],
-                           actuals.get("curtailed"), None, actuals.get("micro_w"))
+    executed = virtual_day(archive_dir, day, tz, midnight + timedelta(days=1),
+                           DayActuals(pv_w=actuals["pv_w"], load_w=actuals["load_w"],
+                                      curtailed=actuals.get("curtailed"), micro_w=actuals.get("micro_w")))
     if executed is None or executed["soc_pct"][0] is None:
         return None, [], ("no_chain", "no settled chain covers the day")
     solves = _ab_solves(archive_dir, day, tz, cadence_min)
@@ -288,7 +306,7 @@ def _ab_prefix(executed: dict, first_solve: datetime, midnight: datetime, n_day:
 
 
 def _ab_solve_once(base_url: str, pay: dict, micro: list, cut_ready: bool, today_idx: list, kn: dict,
-                   cut_active: bool, timeout: int, out: dict, t_solve: datetime, shift: int):
+                   cut_active: bool, timeout: int, out: dict, t_solve: datetime, shift: int, in_load=None):
     """One solve of the walk: the add-on, the row-count check, the Growatt cut
     second pass when the rule fires, then back to gross. Counts solves and
     seconds into `out`. Returns (rows, micro_cut, cut_active, log_row), or None
@@ -315,8 +333,9 @@ def _ab_solve_once(base_url: str, pay: dict, micro: list, cut_ready: bool, today
         dec = aux_cut_decision(sum(float(rows[k].get("P_PV_curtailment") or 0.0) for k in today_idx) * STEP_H / 1000.0,
                                sum(micro[k] for k in today_idx) * STEP_H / 1000.0, cut_active, **cut_thresholds(kn))
         if dec["active"]:
-            base_load = [float(l) + m for l, m in zip(pay["load_power_forecast"], micro)]
-            pay2 = cut_payload(pay, base_load, micro, today_set)
+            netted = micro_netted(in_load)
+            base_load = [float(l) + (m if netted else 0.0) for l, m in zip(pay["load_power_forecast"], micro)]
+            pay2 = cut_payload(pay, base_load, micro, today_set, in_load)
             res2 = solve(base_url, pay2, timeout)
             out["solves"] += 1
             out["seconds"] = round(out["seconds"] + res2.get("seconds", 0.0), 1)
@@ -328,7 +347,7 @@ def _ab_solve_once(base_url: str, pay: dict, micro: list, cut_ready: bool, today
                 dec["active"] = False
         cut_active = dec["active"]
     # gross, as run_plan archives it
-    rows_to_gross(rows, micro, micro_cut)
+    rows_to_gross(rows, micro, micro_cut, in_load)
     log_row = {"t": t_solve.isoformat(), "shift": shift, "soc_init": pay["soc_init"],
                "cut": bool(dec and dec["active"]), "ratio": (dec or {}).get("ratio"),
                "soc_target_timestep": pay.get("soc_target_timestep")}
@@ -385,10 +404,12 @@ def _ab_summaries(lanes: dict, executed: dict, n_day: int, capacity_kwh: float,
 
 def ab_walk(archive_dir: str, base_url: str, day_iso: str, tz: str, overrides: dict, actuals: dict,
             cadence_min: int = 30, settle: str = "closed", capacity_kwh: float = CAPACITY_KWH,
-            timeout: int = 180) -> dict:
+            timeout: int = 180, micro_in_load=None) -> dict:
     """One day, one variant. `actuals`: pv_w (measured), load_w, micro_w,
-    curtailed (mask), all per 15-minute step of the day. Returns the summary,
-    the settled lanes and the solve log; status != ok explains why not."""
+    curtailed (mask), all per 15-minute step of the day. `micro_in_load` pins
+    how the Growatt reaches the LP (see lp_lists); None takes the plant's
+    convention. Returns the summary, the settled lanes and the solve log;
+    status != ok explains why not."""
     day = date.fromisoformat(day_iso)
     midnight = local_midnight(day, tz)
     n_day = expected_steps(day, tz)
@@ -411,13 +432,14 @@ def ab_walk(archive_dir: str, base_url: str, day_iso: str, tz: str, overrides: d
     deadband_a = float(ov["clamp_deadband_a"]) if ov.get("clamp_deadband_a") is not None else DEYE_CLAMP_DEADBAND_A
     for j, (t_solve, doc, shift) in enumerate(solves):
         t_next = solves[j + 1][0] if j + 1 < len(solves) else midnight + timedelta(days=1)
-        pay, micro, cut_ready, notes, times, kn = _ab_payload(doc, shift, overrides, day, tz, load_a)
+        pay, micro, cut_ready, notes, times, kn = _ab_payload(doc, shift, overrides, day, tz, load_a, micro_in_load)
         for nt in notes:
             if nt not in out["notes"]:
                 out["notes"].append(nt)
         pay["soc_init"] = round(min(max(soc, SOC_MIN), SOC_MAX), 4)
         today_idx = [k for k, t in enumerate(times) if t.date() == day]
-        solved = _ab_solve_once(base_url, pay, micro, cut_ready, today_idx, kn, cut_active, timeout, out, t_solve, shift)
+        solved = _ab_solve_once(base_url, pay, micro, cut_ready, today_idx, kn, cut_active, timeout, out, t_solve, shift,
+                                micro_in_load)
         if solved is None:
             return out
         rows, micro_cut, cut_active, log_row = solved
@@ -451,6 +473,42 @@ def ab_load(ab_dir: str, label: str) -> dict | None:
         return None
     with gzip.open(path, "rt", encoding="utf-8") as f:
         return json.load(f)
+
+
+# The summary figures an A/B run sums over its days.
+AB_TOTAL_KEYS = ("declined_10_17_kwh", "declined_day_kwh", "growatt_cut_kwh", "import_day_kwh", "import_06_18_kwh",
+                 "export_day_kwh", "cash_eur", "soc_term_eur", "total_eur")
+
+
+def ab_totals(days: list) -> dict:
+    """The run's totals over its ok days (a None figure counts as 0), the mean
+    SOC at 17:00 over the days that have one, and days_ok."""
+    ok = [d for d in days if d.get("status") == "ok"]
+    tot = {k: round(sum([float(d["summary"][k] or 0.0) for d in ok]), 3) for k in AB_TOTAL_KEYS}
+    soc17 = [d["summary"]["soc_17h_pct"] for d in ok if d["summary"].get("soc_17h_pct") is not None]
+    tot["soc_17h_mean_pct"] = round(sum(soc17) / len(soc17), 1) if soc17 else None
+    tot["days_ok"] = len(ok)
+    return tot
+
+
+def ab_result(head: dict, days: list, base_days: list, baseline: bool) -> tuple[dict, dict]:
+    """The stored A/B result and the slim copy for sensor.emhass_ab_last, from
+    the walked days. `head` carries the run's own fields (label, start, end,
+    overrides, from_live, cadence_min, settle, ran_at, seconds), in order.
+    The result adds the totals, the baseline totals and the delta (None
+    without a baseline, and per figure where either side has no number) and
+    every day whole; the slim copy keeps each day's status and summary only.
+    The caller adds the stored path and the entity's own attributes."""
+    tot, base_tot = ab_totals(days), (ab_totals(base_days) if baseline else None)
+    delta = ({k: (round(tot[k] - base_tot[k], 3)
+                  if isinstance(tot.get(k), (int, float)) and isinstance(base_tot.get(k), (int, float)) else None)
+              for k in tot} if baseline else None)
+    result = dict(head, totals=tot, baseline_totals=base_tot, delta=delta, days=days, baseline_days=base_days)
+    slim = {k: v for k, v in result.items() if k not in ("days", "baseline_days")}
+    slim["days"] = [{"day": x["day"], "status": x["status"], "summary": x.get("summary"),
+                     "executed": x.get("executed"), "solves": x.get("solves"), "notes": x.get("notes")} for x in days]
+    slim["baseline_days"] = [{"day": x["day"], "status": x["status"], "summary": x.get("summary")} for x in base_days]
+    return result, slim
 
 
 def ab_apply_plan(overrides: dict) -> tuple[dict, dict]:

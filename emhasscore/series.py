@@ -2,7 +2,10 @@
 the Growatt split, the recorder's 5-minute statistics folded to the grid, and the same-clock load shape."""
 from __future__ import annotations
 
-from datetime import date, datetime, time, timezone
+import json
+import math
+import os
+from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from .grid import expected_steps, _parse_ts, _slot, STEP_MIN, step_times
@@ -40,11 +43,116 @@ def price_series(t0, n, np_today, np_tomorrow, epex) -> tuple[list[float], int]:
     return da, predicted
 
 
-def tariff(da, energy_tax, supplier_fee, btw_pct, feedin_fee) -> tuple[list[float], list[float]]:
+def tariff(da, energy_tax, supplier_fee, btw_pct, feedin_fee, bonus=None) -> tuple[list[float], list[float]]:
+    """Buy and sell EUR/kWh per step, BTW included. `bonus` is the sun-bonus
+    mask (sun_bonus_mask): on a masked step a positive feed-in rate earns
+    PLANT tariff.sun_bonus_pct on top. A rate at or below zero earns no bonus."""
     f = 1.0 + float(btw_pct) / 100.0
+    up = 1.0 + float(PLANT["tariff"]["sun_bonus_pct"]) / 100.0
     buy = [round((p + energy_tax + supplier_fee) * f, 5) for p in da]
-    sell = [round((p - feedin_fee) * f, 5) for p in da]
+    sell = []
+    for i, p in enumerate(da):
+        rate = p - feedin_fee
+        if bonus and bonus[i] and rate > 0:
+            rate *= up
+        sell.append(round(rate * f, 5))
     return buy, sell
+
+
+def tariff_frame(da, tf: dict, t0, n) -> tuple[list[float], list[float]]:
+    """tariff() from a tariff frame dict on the grid t0 x n: the sun-bonus
+    mask applies when the frame carries sun_bonus true (a frame archived
+    before the bonus existed has no key and prices without it)."""
+    bonus = sun_bonus_mask(t0, n) if tf.get("sun_bonus") else None
+    return tariff(da, tf["energy_tax"], tf["supplier_fee"], tf["btw_pct"], tf["feedin_fee"], bonus=bonus)
+
+
+def solver_buy(buy, sell) -> list[float]:
+    """The buy price the LP sees: never below sell. A step where sell beats buy
+    (the sun bonus under netting) makes a relaxed import/export binary pay,
+    and HiGHS then cannot close the MIP gap. Raising buy to sell overstates an
+    import on such a step by the bonus only. The archived rows keep the true
+    buy (planning restores it after the solve)."""
+    return [max(b, s) for b, s in zip(buy, sell)]
+
+
+def _sun_events(day: date, lat: float, lon: float) -> tuple[datetime, datetime] | None:
+    """Sunrise and sunset (UTC) of `day` at lat/lon, upper limb with standard
+    refraction (-0,833 degrees). The sunrise equation, good to about a minute
+    at these latitudes. None on a polar day or night."""
+    rad = math.radians
+    n = (day - date(2000, 1, 1)).days
+    j_star = n - lon / 360.0
+    m = (357.5291 + 0.98560028 * j_star) % 360.0
+    c = 1.9148 * math.sin(rad(m)) + 0.02 * math.sin(rad(2 * m)) + 0.0003 * math.sin(rad(3 * m))
+    lam = (m + c + 180.0 + 102.9372) % 360.0
+    transit = 2451545.0 + j_star + 0.0053 * math.sin(rad(m)) - 0.0069 * math.sin(rad(2 * lam))
+    sin_d = math.sin(rad(lam)) * math.sin(rad(23.4397))
+    cos_d = math.cos(math.asin(sin_d))
+    cos_w = (math.sin(rad(-0.833)) - math.sin(rad(lat)) * sin_d) / (math.cos(rad(lat)) * cos_d)
+    if not -1.0 <= cos_w <= 1.0:
+        return None
+    w = math.degrees(math.acos(cos_w)) / 360.0
+
+    def utc(jd):
+        return datetime(2000, 1, 1, 12, tzinfo=timezone.utc) + timedelta(days=jd - 2451545.0)
+    return utc(transit - w), utc(transit + w)
+
+
+def sun_bonus_mask(t0, n, lat=None, lon=None) -> list[bool]:
+    """Per step: the whole quarter lies between sunrise and sunset at the
+    bonus reference point (PLANT tariff.sun_bonus_lat/lon, the supplier's
+    location, not the site's)."""
+    lat = float(PLANT["tariff"]["sun_bonus_lat"] if lat is None else lat)
+    lon = float(PLANT["tariff"]["sun_bonus_lon"] if lon is None else lon)
+    days, mask = {}, []
+    for t in step_times(t0, n):
+        u = t.astimezone(timezone.utc)
+        d = u.date()
+        if d not in days:
+            days[d] = _sun_events(d, lat, lon)
+        ev = days[d]
+        mask.append(ev is not None and ev[0] <= u and u + timedelta(minutes=STEP_MIN) <= ev[1])
+    return mask
+
+
+SUN_BONUS_MAX_STEP_KWH = 6.0     # above the 17,25 kW fuse for a quarter: a counter jump, not export
+
+
+def sun_bonus_count(st: dict | None, now: datetime, export_kwh: float, tz: str) -> dict:
+    """One step of the per-calendar-year sun-bonus counter. `st` is the last
+    state {year, used_kwh, last_kwh, last_ts}; `export_kwh` the meter's
+    cumulative export now. The export since the last reading counts in
+    proportion to how much of that interval lies on bonus quarters, so a
+    reading late by a minute or a restart gap still splits right. A counter
+    that runs backwards or jumps more than a fuse can carry is re-anchored
+    without counting. The year is the local calendar year; a new one starts
+    the count at zero."""
+    st = dict(st or {})
+    year = now.astimezone(ZoneInfo(tz)).year
+    if st.get("year") != year:
+        st["used_kwh"] = 0.0 if st.get("year") is not None else float(st.get("used_kwh") or 0.0)
+        st["year"] = year
+    last_kwh, last_ts = st.get("last_kwh"), st.get("last_ts")
+    st["last_kwh"], st["last_ts"] = float(export_kwh), now.isoformat()
+    if last_kwh is None or last_ts is None:
+        return st
+    t1 = datetime.fromisoformat(last_ts)
+    delta = float(export_kwh) - float(last_kwh)
+    span = (now - t1).total_seconds()
+    quarters = span / (STEP_MIN * 60.0)
+    if delta <= 0 or span <= 0 or delta > SUN_BONUS_MAX_STEP_KWH * max(1.0, quarters):
+        return st
+    u1 = t1.astimezone(timezone.utc)
+    q0 = u1 - timedelta(minutes=u1.minute % STEP_MIN, seconds=u1.second, microseconds=u1.microsecond)
+    n = int((now - q0).total_seconds() // (STEP_MIN * 60)) + 1
+    on = 0.0
+    for t, m in zip(step_times(q0, n), sun_bonus_mask(q0, n)):
+        a, b = max(t, t1), min(t + timedelta(minutes=STEP_MIN), now)
+        if m and b > a:
+            on += (b - a).total_seconds()
+    st["used_kwh"] = round(float(st.get("used_kwh") or 0.0) + delta * on / span, 4)
+    return st
 
 
 def pv_series(t0, n, detailed_today, detailed_tomorrow, detailed_day3=None,
@@ -78,7 +186,11 @@ def pv_series(t0, n, detailed_today, detailed_tomorrow, detailed_day3=None,
 # rest of the system wants. Handing EMHASS one combined series with
 # compute_curtailment on tells the solver it can shed ~2,8 kWp it cannot touch,
 # so every plan overstates its ability to dodge a negative price, and
-# pv_potential's repair inflates an array that was never suppressed.
+# pv_potential's repair inflates an array that was never suppressed. (The
+# repair still runs on the hybrid's half only. The LP's freedom to shed the
+# Growatt is accepted since 2026-10-12, see MICRO_IN_LOAD below: it never
+# bound in 36 days and the netting that denied it cost far more under the
+# 0.18.5 clip.)
 #
 # Solcast is registered as two sites and the Growatt sits inside the ESE one, so
 # the split is geometry rather than a fit: micro = ESE x share. Measured over
@@ -89,6 +201,20 @@ def pv_series(t0, n, detailed_today, detailed_tomorrow, detailed_day3=None,
 # 2026-09-03 the WNW string ran 3.533 W while the Growatt sat at 416 W, a ratio
 # no shared plane could produce.
 GROWATT_SHARE = float(PLANT["pv"]["micro_share"])   # the reference plant's microinverter is a Growatt; 0 = none
+
+
+# How the Growatt reaches the LP (the site's ruling 2026-10-12). EMHASS 0.18.5
+# (installed 2026-10-10) clips a negative load_power_forecast to 0 W before the
+# solve (upstream #1135, unconditional), so the negative-load convention above
+# deleted the Growatt's output above house load from every sunny plan: 3 to
+# 8 kWh of surplus a day in the archive, while the freedom the split denied the
+# LP never bound (no planned curtailment step in the 36 days it was live, and
+# at most 0,44 EUR over 40 days had the LP curtailed the whole micro on every
+# negative-price step). False hands the LP the whole sun and the whole load and
+# keeps the Growatt series for the binary aux cut only; True is the legacy
+# netting for an add-on up to 0.18.1 or the library solver. A run pins either
+# with micro_in_load on its inputs (the golden cases pin True).
+MICRO_IN_LOAD = bool(PLANT["pv"]["micro_in_load"])
 
 
 # The planner's production number is a P50:P10 MIX (2026-09-07). Not a
@@ -112,7 +238,8 @@ def pv_mix(p50_w, p10_w, mix: float) -> list[float]:
 
 
 def pv_split(pv_total_w, pv_ese_w, share: float) -> tuple[list[float], list[float]]:
-    """(main_w, micro_w): the curtailable half and the must-take half.
+    """(main_w, micro_w): the hybrid's half and the microinverter's half. In
+    the field the second is must-take; how the LP hears it is MICRO_IN_LOAD.
 
     The two ALWAYS sum to the combined series. The ESE reading decides only how
     the total is divided, never how big it is, so a stale or mismatched site
@@ -238,20 +365,35 @@ def load_profile(day_series: dict, tz: str) -> dict:
     return {k: _median(v) for k, v in buckets.items()}
 
 
-def load_series(t0, n, tz, day_series, now_w=None) -> tuple[list | None, dict]:
+def load_series(t0, n, tz, day_series, now_w=None, exclude_days=None, exclude_now_w=None) -> tuple[list | None, dict]:
     """Same-clock-time load forecast, W per step, for the whole horizon.
 
     Returns (values, info); values is None when there is too little history,
     and the caller then omits load_power_forecast so EMHASS falls back to its
     own method. Every horizon day repeats the same wall-clock profile, so D+2
-    is shaped like D+1."""
+    is shaped like D+1.
+
+    exclude_days: the same shape as day_series for a load the solve models
+    on its own (the AC circuits once the heat topology is sent); its
+    same-clock profile is subtracted slot by slot, floored at zero, and
+    exclude_now_w comes off the live reading in the first-step mix.
+    info["excluded_mean_w"] (mean W removed) is present only when an
+    exclusion is requested, so the default path's info is unchanged."""
     days = {d: v for d, v in (day_series or {}).items() if v}
     info = {"ref_days": len(days), "missing_slots": 0}
+    if exclude_days or exclude_now_w:
+        info["excluded_mean_w"] = 0.0
     if len(days) < LOAD_MIN_REF_DAYS:
         return None, info
     profile = load_profile(days, tz)
     if not profile:
         return None, info
+    ex_days = {d: v for d, v in (exclude_days or {}).items() if v}
+    if ex_days:
+        ex = load_profile(ex_days, tz)
+        if ex:
+            info["excluded_mean_w"] = round(sum(ex.values()) / len(ex), 1)
+            profile = {k: max(v - ex.get(k, 0.0), 0.0) for k, v in profile.items()}
     fallback = _median(list(profile.values()))
     out, missing = [], 0
     for t in step_times(t0, n):
@@ -260,6 +402,38 @@ def load_series(t0, n, tz, day_series, now_w=None) -> tuple[list | None, dict]:
             v, missing = fallback, missing + 1
         out.append(round(max(v, 0.0), 1))
     if now_w is not None and out:
-        out[0] = round(LOAD_MIX_ALPHA * out[0] + (1.0 - LOAD_MIX_ALPHA) * max(float(now_w), 0.0), 1)
+        live = max(float(now_w) - float(exclude_now_w or 0.0), 0.0)
+        out[0] = round(LOAD_MIX_ALPHA * out[0] + (1.0 - LOAD_MIX_ALPHA) * live, 1)
     info["missing_slots"] = missing
     return out, info
+
+
+def sun_bonus_step_file(path: str, now: datetime, export_kwh, tz: str, seed_used_kwh=None) -> dict:
+    """The wrapper's one call per quarter for the sun-bonus counter: load the
+    state file, step it with the meter's cumulative export (None: no reading,
+    no step), save, and return it with cap_kwh, remaining_kwh and active_now
+    (the quarter holding `now` is a bonus quarter). `seed_used_kwh` replaces
+    this year's count, for a backfill. A missing or unreadable file starts at
+    zero and anchors on the first reading."""
+    try:
+        with open(path) as f:
+            st = json.load(f)
+    except (OSError, ValueError):
+        st = None
+    if seed_used_kwh is not None:
+        st = dict(st or {}, used_kwh=round(float(seed_used_kwh), 4),
+                  year=now.astimezone(ZoneInfo(tz)).year)
+    if export_kwh is not None:
+        st = sun_bonus_count(st, now, float(export_kwh), tz)
+    st = dict(st or {})
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(st, f)
+    os.replace(tmp, path)
+    cap = float(PLANT["tariff"]["sun_bonus_cap_kwh"])
+    used = float(st.get("used_kwh") or 0.0)
+    u = now.astimezone(timezone.utc)
+    q = u - timedelta(minutes=u.minute % STEP_MIN, seconds=u.second, microseconds=u.microsecond)
+    return dict(st, used_kwh=used, cap_kwh=cap, remaining_kwh=round(max(0.0, cap - used), 3),
+                active_now=bool(sun_bonus_mask(q, 1)[0]))

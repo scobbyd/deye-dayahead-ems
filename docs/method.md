@@ -22,10 +22,17 @@ Every lane solves ONE plan at 00:00 local of day D:
   lanes: the ladder measures PV and load knowledge only;
 - with the plant's own stress costs (the quadratic loss coefficients priced
   at the horizon's mean price) and the relaxed rebalance knobs;
-- with the lane's PV column as the LP's curtailable PV and the lane's load
-  column minus the microinverter as the LP's load. The microinverter is
-  must-take: negative load, never through the hybrid's bridge. After the solve
-  it is put back into both PV and load so the rows read gross.
+- with the microinverter handed to the LP as the live planner hands it
+  (`pv.micro_in_load` in `plant.json`). Default, gross lists: the lane's PV
+  column plus the microinverter as the LP's PV, the lane's load column as the
+  LP's load; the LP may then curtail the microinverter's share, which the
+  binary export cut makes real on the days it fires. Legacy netting
+  (`micro_in_load` true, for an EMHASS add-on up to 0.18.1 or the library
+  solver): the lane's PV column as the curtailable PV and the load column
+  minus the microinverter as the load, the microinverter as negative load.
+  EMHASS 0.18.5 and later clip a negative load to 0 W before the solve, which
+  is why gross is the default. Either way the microinverter never crosses the
+  hybrid's bridge in the settlement, and after the solve the rows read gross.
 
 The LP's plant is `plant.json`: capacity, charge and discharge power, the
 inverter's AC input and output maximum (12 kW on the reference), the grid

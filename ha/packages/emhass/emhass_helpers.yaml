@@ -26,6 +26,13 @@ input_boolean:
   emhass_salderen:
     name: EMHASS salderen in force
     icon: mdi:scale-balance
+  # the supplier Zonnebonus: +10 % on a positive feed-in rate in every quarter
+  # wholly between sunrise and sunset (Utrecht), battery export included,
+  # 7.500 kWh per calendar year. The planner drops the bonus once
+  # pyscript.emhass_zonnebonus has no kWh left. Frozen into each plan's tariff.
+  emhass_zonnebonus:
+    name: EMHASS Zonnebonus
+    icon: mdi:white-balance-sunny
   # Loss map v2 (an internal design note): the
   # measured plant on every solve and the writer's bus -> port conversion.
   # Off = the June model. One toggle is the switch and the rollback.
@@ -87,10 +94,12 @@ input_number:
     unit_of_measurement: EUR/kWh
     mode: box
     icon: mdi:transmission-tower-export
-  # Fraction of the ESE Solcast site that is the Growatt. It is must-take: the
-  # Deye's strings throttle, the gen port does not, so the solver must not be
-  # told it can curtail this part. Seeded at 0,288 from 2026-09-01..04 measured
-  # on uncurtailed steps; refit it if panels move. 0 stands the split down.
+  # Fraction of the ESE Solcast site that is the Growatt: the lane the binary
+  # Growatt cut switches off on a negative-price day. How the LP hears it is
+  # the plant setting pv.micro_in_load (gross PV since 2026-10-12; EMHASS 0.18.5
+  # clips the negative-load netting that used to carry it). Seeded at 0,288
+  # from 2026-09-01..04 measured on uncurtailed steps; refit it if panels move.
+  # 0 stands the lane down, so the cut can never fire.
   emhass_growatt_share:
     name: EMHASS Growatt share of the ESE array
     min: 0
@@ -100,9 +109,9 @@ input_number:
     icon: mdi:solar-panel
   # The shortest stretch at the top that counts toward the rebalancing budget
   # (emhasscore/rebalance.py, 2026-10-03): a stretch of bank voltage at or above
-  # 56,0 V counts once it has lasted this long, so a half-hour touch does
-  # nothing. The clock is the age of the newest 8 h of counted top time. 1,0 h
-  #; the core's default when the helper is unset is the same.
+  # 56,0 V counts once it has lasted this long. The clock is the age of the
+  # newest 8 h of counted top time. 0 since 2026-10-10: every quarter at
+  # the top counts (1,0 h before); the core's default when unset is the same.
   emhass_rebalance_dwell_h:
     name: EMHASS rebalance minimum stretch at the top
     min: 0
@@ -213,6 +222,15 @@ input_number:
     step: 0.01
     mode: box
     icon: mdi:battery-10
+  # The writer's SOC-floor kill (emhass_writer.py, SOC_FLOOR). It sits under
+  # the planner's floor above, so a plan that lands on its floor does not trip it.
+  emhass_soc_kill:
+    name: EMHASS SOC discharge block
+    min: 0
+    max: 0.5
+    step: 0.01
+    mode: box
+    icon: mdi:battery-alert-variant-outline
   emhass_soc_max:
     name: EMHASS SOC ceiling
     min: 0.5

@@ -26,6 +26,31 @@
 # None of these actions touches a sensor.emhass_da_* entity (check.sh actions).
 
 automation:
+  # The Nord Pool integration polls hourly, at the minute of the last HA start
+  # (01:02 start -> :02), so a publication a few minutes after a poll reached
+  # the tomorrow flag up to an hour late (2026-10-10: in by 13:48, flag off
+  # until 14:02). The flag gates emhass_plan_on_prices and the EMS charts'
+  # known-price boundary. Poll every 15 minutes in the publication window
+  # until it is on (2026-10-10). Not gated on the planner: the charts
+  # read the flag too.
+  - id: nordpool_tomorrow_poll
+    alias: "Nord Pool - poll for tomorrow's prices in the publication window"
+    mode: single
+    trigger:
+      - trigger: time_pattern
+        minutes: "/15"
+    condition:
+      - condition: time
+        after: "12:55:00"
+        before: "15:00:00"
+      - condition: state
+        entity_id: binary_sensor.nord_pool_nl_tomorrow_price_available
+        state: "off"
+    action:
+      - action: homeassistant.update_entity
+        target:
+          entity_id: sensor.nord_pool_nl_last_updated
+
   - id: emhass_plan_on_prices
     alias: "EMHASS - plan when tomorrow's prices publish"
     mode: single

@@ -235,6 +235,7 @@ The `plant` attribute of `sensor.emhass_writer` shows the file in force
 | `baseline` | the register state the writer returns the inverter to | must: it is your inverter's resting state |
 | `grid.cap_w` | the grid connection, W each way | must |
 | `pv.micro_share`, `pv.micro_max_w` | the AC-coupled microinverter: its share of Solcast site `A`, its nameplate. 0 and 0 when you have none | must |
+| `pv.micro_in_load` | how the microinverter reaches the LP. `false` (default): the whole sun in the PV list and the whole load in the load list; the LP may curtail the microinverter's share, and the binary export cut makes that real on the days it fires. `true`: the legacy netting, main-only PV and the microinverter as negative load, for an EMHASS add-on up to 0.18.1 or the library solver. EMHASS 0.18.5 and later clip a negative load to 0 W before the solve (upstream #1135), which deletes the microinverter's output above house load from every sunny plan under the netting | may leave |
 | `pv.p10_mix`, `pv.curtail_soc_pct` | Solcast P10 weight in the planning PV; the SOC at which the Deye starts holding the main array back | may leave |
 | `pv.strings` | tilt, azimuth, kWp, scale per string, for the backtest's pvlib model | must, for the backtest |
 | `pv.solcast_sites` | your Solcast rooftop ids. The planner fetches site `A` per half hour for the microinverter split | must |

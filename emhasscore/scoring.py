@@ -10,9 +10,10 @@ from datetime import date
 from zoneinfo import ZoneInfo
 
 from .grid import expected_steps, _parse_ts, STEP_H
-from .series import price_series, tariff
+from .series import price_series, tariff_frame
 from .objective import (
     build_payload,
+    lp_lists,
     ETA_BRIDGE,
     GRID_CAP_W,
     Q_BRIDGE,
@@ -198,16 +199,15 @@ def _hindsight_prices(doc: dict, t0, n: int, np_rows):
         n_pred = 1
     if n_pred:                       # a held or predicted step is not hindsight
         return None
-    tf = doc["tariff"]
-    return tariff(da, tf["energy_tax"], tf["supplier_fee"], tf["btw_pct"], tf["feedin_fee"])
+    return tariff_frame(da, doc["tariff"], t0, n)
 
 
-def _hindsight_payload(doc: dict, t0, n: int, pv_window_w, load_window_w, mic, buy, sell) -> dict:
+def _hindsight_payload(doc: dict, t0, n: int, pv_window_w, load_window_w, mic, buy, sell, in_load=None) -> dict:
     """The replaced inputs on the plan of record's OWN objective."""
     soc_final = float(doc.get("soc_final") or SOC_FINAL_TARGET)
-    payload = build_payload(t0, n, float(doc["soc_init"]), soc_final,
-                            [round(max(0.0, float(p) - float(m)), 1) for p, m in zip(pv_window_w, mic)], buy, sell)
-    payload["load_power_forecast"] = [round(float(v) - float(m), 1) for v, m in zip(load_window_w, mic)]
+    pv_lp, load_lp = lp_lists(pv_window_w, load_window_w, mic, in_load)
+    payload = build_payload(t0, n, float(doc["soc_init"]), soc_final, pv_lp, buy, sell)
+    payload["load_power_forecast"] = load_lp
     # The plan's own objective, so the only difference between the lanes is the
     # forecasts: its stress costs and SOC knobs, not ones recomputed here.
     plan_payload = doc.get("payload") or {}
@@ -222,7 +222,8 @@ def _hindsight_payload(doc: dict, t0, n: int, pv_window_w, load_window_w, mic, b
     return payload
 
 
-def _hindsight_solve(base_url: str, payload: dict, timeout: int, t0, n: int, mic, out: dict, tries: int = 2):
+def _hindsight_solve(base_url: str, payload: dict, timeout: int, t0, n: int, mic, out: dict, tries: int = 2,
+                     in_load=None):
     """Solve, verify, restamp onto the plan's grid and go back to gross. Returns
     the rows, or None with out carrying the status (and message).
 
@@ -252,7 +253,7 @@ def _hindsight_solve(base_url: str, payload: dict, timeout: int, t0, n: int, mic
         out.pop("status", None)
         out.pop("message", None)
         out["retries"] = attempt
-        return rows_to_gross(restamp(rows, t0, n), [float(m) for m in mic])
+        return rows_to_gross(restamp(rows, t0, n), [float(m) for m in mic], in_load=in_load)
     return None
 
 
@@ -280,9 +281,10 @@ def _hindsight_settle(rows, doc: dict, day: date, tz: str, mic, day_actuals: dic
 
 def hindsight_day(archive_dir: str, base_url: str, day_iso: str, tz: str, np_rows,
                   window: dict, day_actuals: dict,
-                  capacity_kwh: float, lambda_frac: float, timeout: int = 180) -> dict:
+                  capacity_kwh: float, lambda_frac: float, timeout: int = 180, micro_in_load=None) -> dict:
     """The 20/20 lane: the plan of record's OWN solve, re-run with the forecasts
-    replaced by what actually happened.
+    replaced by what actually happened. `micro_in_load` pins how the Growatt
+    reaches the LP (see lp_lists); None takes the plant's convention.
 
     Matched horizon (2026-09-05). This used to solve 00:00 to 24:00 of the
     scored day with soc_final pinned at SOC_FINAL_TARGET, while the plan lane
@@ -335,16 +337,16 @@ def hindsight_day(archive_dir: str, base_url: str, day_iso: str, tz: str, np_row
         out["status"] = "no_prices"
         return out
     buy, sell = prices
-    # THE GROWATT IS MUST-TAKE HERE TOO (2026-09-07). The plan lane hands the LP
-    # main-only PV and the Growatt as negative load; the ceiling used to get gross
-    # PV and so believed it could curtail the gen port, a lever no controller has.
-    # Measured Growatt output leaves the PV list and the effective load alike, and
-    # the rows go back to gross before slicing, exactly as run_plan does.
+    # THE GROWATT REACHES THE LP AS IT DOES IN THE PLAN LANE (2026-09-07, convention
+    # per plant since 2026-10-12): the measured Growatt output is the split, the
+    # lists follow lp_lists, and the rows go back to gross before slicing, exactly
+    # as run_plan does. Under the legacy netting it leaves the PV list and the
+    # effective load alike; on gross lists both stay whole.
     mic = list(window.get("micro_w") or [])
     if len(mic) != n:
         mic = [0.0] * n
-    payload = _hindsight_payload(doc, t0, n, pv_window_w, load_window_w, mic, buy, sell)
-    rows = _hindsight_solve(base_url, payload, timeout, t0, n, mic, out)
+    payload = _hindsight_payload(doc, t0, n, pv_window_w, load_window_w, mic, buy, sell, micro_in_load)
+    rows = _hindsight_solve(base_url, payload, timeout, t0, n, mic, out, in_load=micro_in_load)
     if rows is None:
         return out
     status, hs, rep = _hindsight_settle(rows, doc, day, tz, mic, day_actuals, capacity_kwh, lambda_frac)

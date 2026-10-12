@@ -1,4 +1,5 @@
-"""EMHASS shadow planner: thin pyscript wrapper.
+"""EMHASS planner: thin pyscript wrapper. This is the LIVE planner; "shadow" in the
+file name and in input_boolean.emhass_shadow_enabled is historical and stays.
 
 Reads HA state and the tariff helpers, calls the Nord Pool action, hands
 plain data to the native module emhass_core (task.executor, off the event
@@ -19,6 +20,7 @@ Services
   pyscript.emhass_fit / emhass_tune        forecast-model-fit / -tune on the UPS-port load
   pyscript.emhass_health                   healthz + config drift -> binary_sensor.emhass_addon_healthy
   pyscript.emhass_rehydrate                rebuild the plan slices from the archive (runs at startup)
+  pyscript.emhass_zonnebonus_seed(used_kwh)  set this year's bonus-eligible export after a backfill
 
 The shadow scoreboard (emhass_score_day, scores.csv, sensor.emhass_score,
 sensor.emhass_gap_30d, sensor.emhass_ladder, the emhass:planned, replayed,
@@ -48,6 +50,9 @@ ARCHIVE = "/config/emhass/plans"
 AB_DIR = "/config/emhass/ab"
 LADDER = "/config/emhass/ladder.csv"          # the ladder: actual / hindsight / omni2, cash per day
 REBALANCE = "/config/emhass/rebalance.json"   # the settled rebalancing clock (core.rebalance_step)
+ZONNEBONUS = "/config/emhass/zonnebonus.json" # the sun-bonus kWh counter, per calendar year (core.sun_bonus_step_file)
+ZONNEBONUS_SENSOR = "sensor.emhass_zonnebonus_remaining"
+P1_EXPORT_TOTAL = "sensor.p1_energy_export_total"   # kWh, cumulative fiscal export (tariff 1 + 2)
 WRITER_DIR = "/config/emhass/writer"           # the writer's tick archive, one file per day
 WRITER_ANCHOR = "/config/emhass/writer/anchor.json"   # the real pack at the live switch (core.write_anchor)
 REPO_CFG = "/config/emhass/config.json"
@@ -78,6 +83,19 @@ ACTUAL_CURTAIL = ENTITIES["curtailed"]                  # 0/1; a 15-min mean is 
 ACTUAL_MICRO = ENTITIES["micro"]             # W, the must-take half (never curtailed)
 ACTUAL_SOC = ENTITIES["soc"]                           # % pack state of charge
 ACTUAL_BATT_V = ENTITIES["batt_voltage"]                # V at the DC port: the rebalancing clock's top time
+# The heat topology (thermal.py). Read at solve time, frozen into the plan.
+THERMAL_ENABLED = "input_boolean.heating_emhass_enabled"
+AC_CIRCUITS = {"living": "sensor.input_8", "upstairs": "sensor.input_6"}   # IoTaWatt outdoor units by zone, W
+ZONE_SENSORS = {"living": "sensor.env4_temperature", "bedroom": "sensor.env3_temperature", "study": "sensor.env1_temperature"}
+WEATHER_FC = "sensor.heating_weather_forecast"            # Met.no hourly forecast, attribute `forecast`
+OUTDOOR_NOW = "sensor.outdoor_temperature"
+# The series core.day_actuals and core.window_actuals read, by the key they
+# return them under (imp and exp, the meter's kW halves, come back as grid_w).
+DAY_SERIES = {"pv_w": ACTUAL_PV, "load_w": ACTUAL_LOAD, "imp": ACTUAL_GRID_IMP, "exp": ACTUAL_GRID_EXP,
+              "batt_dc_w": ACTUAL_BATT, "soc_pct": ACTUAL_SOC, "curtailed": ACTUAL_CURTAIL, "micro_w": ACTUAL_MICRO,
+              "batt_v": ACTUAL_BATT_V}
+WINDOW_SERIES = {"pv_w": ACTUAL_PV, "imp": ACTUAL_GRID_IMP, "exp": ACTUAL_GRID_EXP, "batt_dc_w": ACTUAL_BATT,
+                 "curtailed": ACTUAL_CURTAIL, "soc_pct": ACTUAL_SOC, "micro_w": ACTUAL_MICRO}
 
 
 def _now():
@@ -89,6 +107,17 @@ def _num(entity_id, default):
         return float(state.get(entity_id))
     except Exception:
         return default
+
+
+def _log_notes(notes):
+    """Log the core's (level, text) notes, in order."""
+    for level, text in notes:
+        if level == "debug":
+            log.debug(text)
+        elif level == "info":
+            log.info(text)
+        else:
+            log.warning(text)
 
 
 def _attr(entity_id, name):
@@ -127,33 +156,15 @@ def _soc_anchor(day, act, live=None):
     return task.executor(core.soc_anchor_for_day, task.executor(core.read_anchor, WRITER_ANCHOR), day, midnight)
 
 
-def _measured(act, prefix="actual_", live=None):
-    """THE VIRTUAL PACK IS RETIRED IN LIVE MODE (2026-09-26): the settled
-    chain's past steps take the measured pack power (DC, + discharge), the
-    fiscal meter (W, + import) and the SOC from the recorder. Outside live
-    mode, or without the series, {} and the simulation stands. With
-    prefix="prev_" the same three lanes for yesterday's slice; `live`
-    overrides the mode-now test for a past day."""
-    if not (_writer_live() if live is None else live) or not act:
-        return {}
-    batt, soc, grid = act.get("batt_dc_w"), act.get("soc_pct"), act.get("grid_w")   # grid_w: _actuals_15min's P1 net, W
-    if batt is None or soc is None or grid is None:
-        return {}
-    return {prefix + "batt_w": batt, prefix + "grid_w": grid, prefix + "soc_pct": soc}
-
-
-def _yesterday_lanes(prev, yday):
-    """Yesterday's anchor and measured lanes for the display slice, so a live
-    day keeps the real pack after the midnight rollover (2026-09-27: the first
-    live day went back to the virtual pack at 00:13). The anchor is the live
-    switch step when the writer went live that day, else yesterday's real
-    midnight SOC."""
-    live = _day_was_live(yday)
-    out = dict(_measured(prev, prefix="prev_", live=live))
-    anchor = _soc_anchor(yday, prev, live=live)
-    if anchor is not None:
-        out["prev_soc_anchor"] = anchor
-    return out
+def _day_record(day, act, live=None):
+    """The day's measurements as one core.DayActuals: the recorder series, and
+    in live mode the anchor (_soc_anchor) and the measured pack, meter and SOC
+    (THE VIRTUAL PACK IS RETIRED IN LIVE MODE, the site 2026-09-26). `live`
+    overrides the mode-now test for a past day: yesterday keeps the real pack
+    after the midnight rollover (2026-09-27: the first live day went back to
+    the virtual pack at 00:13)."""
+    live = _writer_live() if live is None else live
+    return core.DayActuals.of(act, live, _soc_anchor(day, act, live=live))
 
 
 REBALANCE_TOP_HOURS = "sensor.emhass_rebalance_top_hours"
@@ -162,13 +173,15 @@ REBALANCE_CLOCK = "sensor.emhass_rebalance_clock"
 
 def _publish_rebalance(state_doc, now):
     """The rebalancing clock as two plottable sensors (2026-10-03, the Battery
-    tab's balance tiles): counted hours at the top in the last 30 days, and
-    the clock in days with its schedule phase."""
+    tab's balance tiles): counted hours at full in the last 30 days (at the
+    top of the bank voltage until 2026-10-10), and the clock in days with its
+    schedule phase."""
     p = core.rebalance.published(state_doc, now)
     common = {"phase": p["phase"], "budget_start": p["budget_start"], "stretches": p["stretches"],
               "last_stretch_end": p["last_stretch_end"], "budget_h": core.REBALANCE_BUDGET_H,
-              "top_v": core.REBALANCE_TOP_V, "latch_since": p["latch_since"], "released": p["released"],
-              "release_hours_48h": p["release_hours"], "release_h": core.REBALANCE_RELEASE_H}
+              "full_level_pct": core.REBALANCE_FULL_LEVEL * 100.0, "latch_since": p["latch_since"], "released": p["released"],
+              "release_hours": p["release_hours"], "release_h": core.REBALANCE_RELEASE_H,
+              "release_window_h": core.REBALANCE_RELEASE_WINDOW_H}
     state.set(REBALANCE_TOP_HOURS, p["top_hours"], new_attributes=dict(common, **{
         "friendly_name": "EMHASS balanced, 30 d", "unit_of_measurement": "h", "state_class": "measurement",
         "icon": "mdi:battery-sync"}))
@@ -197,33 +210,64 @@ def _pack_temp_latch():
 
 
 def _knobs():
-    """The live knob layer: every helper in core.LIVE_KNOBS, None when unreadable
-    so the core falls back to its constant. input_datetime reads as 'HH:MM:SS'."""
-    out = {}
+    """The live knob layer: every helper in core.LIVE_KNOBS, parsed by
+    core.parse_knobs, None when unreadable so the core falls back to its constant."""
+    raw = {}
     for name, (default, eid) in core.LIVE_KNOBS.items():
         try:
-            raw = state.get(eid)
+            raw[name] = state.get(eid)
         except Exception:              # pyscript raises NameError on an entity that does not exist yet
-            raw = None
-        if raw in (None, "unknown", "unavailable", ""):
-            out[name] = None
-        elif eid.startswith("input_datetime."):
-            out[name] = str(raw)[:5]
-        elif eid.startswith("input_boolean."):
-            out[name] = 1.0 if raw == "on" else 0.0
-        else:
-            try:
-                out[name] = float(raw)
-            except Exception:
-                out[name] = None
-    return out
+            raw[name] = None
+    return core.parse_knobs(raw)
 
 
 def _tariff():
     return {"energy_tax": _num("input_number.emhass_energy_tax_eur_kwh", 0.11),
             "supplier_fee": _num("input_number.emhass_supplier_fee_eur_kwh", 0.02),
             "btw_pct": _num("input_number.emhass_btw_pct", 21.0),
-            "feedin_fee": _num("input_number.emhass_feedin_fee_eur_kwh", 0.0)}
+            "feedin_fee": _num("input_number.emhass_feedin_fee_eur_kwh", 0.0),
+            "sun_bonus": _sun_bonus_on()}
+
+
+def _sun_bonus_on():
+    """The Zonnebonus checkbox, and this year's bonus kWh not used up. An
+    unknown counter (before the first quarter after a restart) reads as not
+    used up: the cap is far off for most of a year."""
+    try:
+        if state.get("input_boolean.emhass_zonnebonus") != "on":
+            return False
+    except Exception:          # pyscript raises NameError on an entity that does not exist yet
+        return False
+    return _num(ZONNEBONUS_SENSOR, 1.0) > 0.0
+
+
+def _zonnebonus_publish(st):
+    state.set(ZONNEBONUS_SENSOR, st["remaining_kwh"], new_attributes={
+        "friendly_name": "EMHASS Zonnebonus remaining", "icon": "mdi:white-balance-sunny",
+        "unit_of_measurement": "kWh", "state_class": "measurement",
+        "used_kwh": round(st["used_kwh"], 3), "cap_kwh": st["cap_kwh"], "year": st.get("year"),
+        "active_now": st["active_now"], "last_ts": st.get("last_ts")})
+
+
+def _zonnebonus_step(seed_used_kwh=None, read_meter=True):
+    kwh = _num(P1_EXPORT_TOTAL, None) if read_meter else None
+    st = task.executor(core.sun_bonus_step_file, ZONNEBONUS, _now(), kwh, TZ_NAME, seed_used_kwh)
+    _zonnebonus_publish(st)
+    return st
+
+
+@time_trigger("cron(0,15,30,45 * * * *)")
+def _zonnebonus_cron():
+    task.sleep(20)             # past the boundary, so the P1 counter has its new reading
+    _zonnebonus_step()
+
+
+@service(supports_response="optional")
+def emhass_zonnebonus_seed(used_kwh):
+    """Set this calendar year's bonus-eligible export (kWh), e.g. from a
+    backfill; the counter then carries on from the meter's reading now."""
+    st = _zonnebonus_step(seed_used_kwh=float(used_kwh))
+    return {k: st.get(k) for k in ("year", "used_kwh", "remaining_kwh", "cap_kwh", "last_kwh", "last_ts")}
 
 
 def _nordpool(day):
@@ -276,7 +320,7 @@ def _load_history_days(today, n_days=None):
     from the recorder's 5-minute means. Today itself is left out: its future
     steps would come back as the gap-hold of the last real value and would drag
     the wall-clock profile sideways. Returns {} when the fetch fails, which
-    makes run_plan leave the load to EMHASS."""
+    makes run_plan leave the load to EMHASS. Gappy days: core.load_history_days."""
     n_days = n_days or core.LOAD_REF_DAYS
     first = today - timedelta(days=n_days)
     a = datetime.combine(first, datetime.min.time(), tzinfo=TZ).astimezone(timezone.utc)
@@ -286,16 +330,138 @@ def _load_history_days(today, n_days=None):
     except Exception as e:
         log.warning(f"emhass: load history fetch failed: {e}")
         return {}
-    rows = (stats or {}).get(ACTUAL_LOAD) or []
-    out = {}
-    for k in range(n_days):
-        day = first + timedelta(days=k)
-        vals, gaps = task.executor(core.fifteen_min_series, day, TZ_NAME, rows)
-        if gaps <= core.MAX_PV_GAPS:
-            out[day] = vals
-        else:
-            log.debug(f"emhass: load history skips {day}: {gaps} gap steps")
+    out, notes = task.executor(core.load_history_days, today, n_days, TZ_NAME, (stats or {}).get(ACTUAL_LOAD) or [])
+    _log_notes(notes)
     return out
+
+
+def _history_days(entity_id, today, n_days=None):
+    """{date: W per 15-minute step} for the last n complete days of any power
+    entity, from the recorder's 5-minute means (the load history's shape)."""
+    n_days = n_days or core.LOAD_REF_DAYS
+    first = today - timedelta(days=n_days)
+    a = datetime.combine(first, datetime.min.time(), tzinfo=TZ).astimezone(timezone.utc)
+    b = datetime.combine(today, datetime.min.time(), tzinfo=TZ).astimezone(timezone.utc)
+    try:
+        stats = task.executor(statistics_during_period, hass, a, b, {entity_id}, "5minute", None, {"mean"})
+    except Exception as e:
+        log.warning(f"emhass: history fetch failed for {entity_id}: {e}")
+        return {}
+    out, notes = task.executor(core.load_history_days, today, n_days, TZ_NAME, (stats or {}).get(entity_id) or [])
+    _log_notes(notes)
+    return out
+
+
+def _ac_history_by_zone(today):
+    """Each zone's AC circuit history, same shape as the load history. run_plan
+    subtracts a zone's circuit only when the topology sends that zone."""
+    out = {}
+    for zone, e in AC_CIRCUITS.items():
+        out[zone] = _history_days(e, today)
+    return out
+
+
+def _text(entity_id, default):
+    try:
+        v = state.get(entity_id)
+        return default if v in (None, "unknown", "unavailable") else str(v)
+    except Exception:
+        return default
+
+
+def _living_sched():
+    return {"mode": _text("input_select.heating_mode", "auto"),
+            "holiday_c": _num("input_number.heating_target_holiday", 11.0),
+            "night_floor_c": 10.0,
+            "slots": {s: _text(f"input_datetime.heating_slot_{s}_start", d)[:5]
+                      for s, d in (("morning", "07:00"), ("day", "09:00"), ("evening", "17:00"), ("night", "23:00"))},
+            "targets": {dt: {s: _num(f"input_number.heating_target_{dt}_{s}", 18.0) for s in ("morning", "day", "evening")}
+                        for dt in ("weekday", "weekend")},
+            "away": _text("sensor.heating_away", "false") == "true",
+            "away_offset_k": _num("input_number.heating_target_presence_away_offset", -3.0)}
+
+
+def _upstairs_sched(living):
+    return {"day_c": _num("input_number.heating_upstairs_target_day", 19.0),
+            "night_c": _num("input_number.heating_upstairs_target_night", 17.0),
+            "slots": {"morning": living["slots"]["morning"], "night": living["slots"]["night"]},
+            "mode": living["mode"], "holiday_c": living["holiday_c"],
+            "away": living["away"], "away_offset_k": living["away_offset_k"]}
+
+
+def _mean(values):
+    vals = [v for v in values if v is not None]
+    return round(sum(vals) / len(vals), 2) if vals else None
+
+
+def _forecast_points():
+    """(ISO time, degrees C) points: the hourly forecast, then two points per
+    later day from the optional daily forecast (the night low at 04:00 local,
+    the day high at 14:00 local), so a horizon past the hourly span is covered."""
+    fc = _attr(WEATHER_FC, "forecast") or []
+    if not isinstance(fc, list):
+        fc = []
+    points = [(f.get("datetime"), f.get("temperature")) for f in fc
+              if isinstance(f, dict) and f.get("datetime") and f.get("temperature") is not None]
+    last_date = None
+    try:
+        last_date = datetime.fromisoformat(str(points[-1][0])).astimezone(TZ).date() if points else None
+    except ValueError:
+        pass
+    if last_date is None:
+        return points
+    for d in _attr(WEATHER_FC, "forecast_daily") or []:
+        try:
+            day = datetime.fromisoformat(str(d.get("datetime"))).astimezone(TZ).date()
+            low, high = d.get("templow"), d.get("temperature")
+        except (ValueError, AttributeError):
+            continue
+        if day <= last_date or low is None or high is None:
+            continue
+        for hour, v in ((4, low), (14, high)):
+            points.append((datetime.combine(day, datetime.min.time(), tzinfo=TZ).replace(hour=hour).isoformat(), v))
+    return points
+
+
+def _thermal_inp():
+    """The heat topology's inputs (core.heat_topology), or disabled. A failure
+    here (a broken thermal.json, a malformed forecast attribute) is logged and
+    reads as disabled with the error: the battery solve runs without the topology."""
+    if _text(THERMAL_ENABLED, "off") != "on":
+        return {"enabled": False}
+    try:
+        return _thermal_inp_read()
+    except Exception as e:
+        log.warning(f"emhass: thermal inputs failed, solving without the topology: {e!r}")
+        return {"enabled": False, "error": repr(e)}
+
+
+def _thermal_inp_read():
+    living = _living_sched()
+    return {"enabled": True, "constants": core.load_thermal(),
+            "band_k": _num("input_number.heating_bank_band_k", 3.0),
+            "caps": {"hp_living_w": _num("input_number.heating_hp_living_cap_w", 1450.0),
+                     "hp_multi_w": _num("input_number.heating_hp_multi_cap_w", 2200.0)},
+            "startup_ct": {"hp": _num("input_number.heating_hp_startup_ct", 1.0),
+                           "pellet": _num("input_number.heating_pellet_startup_ct", 10.0)},
+            "pellet": {"available": _text("input_boolean.heating_pellet_available", "off") == "on",
+                       "cost_ct_kwh": _num("input_number.heating_pellet_cost_per_kwh", 8.0)},
+            "living": {"start_c": _num(ZONE_SENSORS["living"], None), "sched": living,
+                       "ceiling_c": _num("input_number.heating_bank_ceiling_c", None)},
+            "upstairs": {"enabled": _text("input_boolean.heating_upstairs_enabled", "off") == "on",
+                         "start_c": _mean([_num(ZONE_SENSORS["bedroom"], None), _num(ZONE_SENSORS["study"], None)]),
+                         "sched": _upstairs_sched(living)},
+            "weather": {"points": _forecast_points(), "now_c": _num(OUTDOOR_NOW, None)}}
+
+
+THERMAL_BRIEF = ("sent", "reason", "fallback", "clamped", "upstairs", "living_ceiling_c")
+
+
+def _thermal_brief(th):
+    """The thermal summary for the log line: never the outdoor array."""
+    if not isinstance(th, dict):
+        return th
+    return {k: th.get(k) for k in THERMAL_BRIEF if k in th}
 
 
 _PLAN_BUSY = {"since": None}       # set while emhass_plan_day is solving; the A/B waits on it
@@ -320,53 +486,26 @@ def _plan_day(dry_run=False):
         now = _now()
     today = now.date()
     t0, _n = core.horizon(now, TZ_NAME)
-    # Measured series first, because soc_init now depends on them. CLOSING THE
-    # CHAIN (2026-09-06): the next solve starts from the SETTLED SOC - what the
-    # pack would actually be holding after the plan's own commands met the real
-    # sun and load - and not from the previous plan's SOC_opt, which is what it
-    # PREDICTED. Chaining off the prediction is why an hourly re-solve never
-    # noticed the pack falling behind: it was re-solving a fiction, correctly.
+    # Measured series first, because soc_init depends on them: the solve starts
+    # from the SETTLED SOC (closing the chain, 2026-09-06), or from the real
+    # pack in live mode. core.plan_soc decides, with the archive reads.
     act = _actuals_15min(today, core._slot(now))
-    anchor = _soc_anchor(today, act)
-    measured = _measured(act)
-    settled = task.executor(core.virtual_day, ARCHIVE, today, TZ_NAME, now,
-                            act.get("pv_w"), act.get("load_w"), act.get("curtailed"),
-                            act.get("pv_peak_w"), act.get("micro_w"), soc_anchor=anchor, **measured)
-    s_now = (settled or {}).get("soc_now_pct")
-    v_soc, v_src = (None, None) if s_now is not None else task.executor(core.virtual_soc_at, ARCHIVE, t0)
-    if s_now is not None:
-        soc, soc_source = float(s_now), "settled"
-    elif v_soc is not None:
-        soc, soc_source = v_soc * 100.0, "virtual"
-    else:
-        soc = _num(ACTUAL_SOC, None)
-        if soc is None:
-            _last_run("plan", False, 0, f"chain broken and {ACTUAL_SOC} unavailable")
-            return {"ok": False, "message": f"chain broken and {ACTUAL_SOC} unavailable"}
-        had_plans = bool(task.executor(core.list_plans, ARCHIVE))
-        soc_source = "reanchored" if had_plans else "real"
-        if had_plans:
-            log.warning("emhass: virtual SOC chain broken (no archived plan covers %s); reanchored on the real pack", t0.isoformat())
-    # LIVE MODE PLANS FROM THE REAL PACK (spec 2026-09-26, section 3.6). The
-    # writer executes this plan on the inverter, so the solve must start from
-    # what the pack actually holds, not from the settled virtual chain (which
-    # stood at 100 % while the real pack read 82 % on go-live day). The
-    # virtual chain keeps settling for the display slices either way; in
-    # live mode its drift is the writer's own execution error.
-    if _writer_live():
-        real = _num(ACTUAL_SOC, None)
-        if real is not None:
-            soc, soc_source = float(real), "real"
-        else:
-            log.warning("emhass: writer live but %s unavailable; planning from the %s SOC", ACTUAL_SOC, soc_source)
+    rec = _day_record(today, act)
+    settled = task.executor(core.virtual_day, ARCHIVE, today, TZ_NAME, now, rec)
+    src = task.executor(core.plan_soc, ARCHIVE, t0, (settled or {}).get("soc_now_pct"), _num(ACTUAL_SOC, None),
+                        _writer_live(), ACTUAL_SOC)
+    _log_notes(src["notes"])
+    if src["error"]:
+        _last_run("plan", False, 0, src["error"])
+        return {"ok": False, "message": src["error"]}
+    soc, soc_source = src["soc_pct"], src["soc_source"]
     inp = {"now": now.isoformat(), "tz": TZ_NAME, "base_url": BASE, "archive_dir": ARCHIVE, "dry_run": bool(dry_run),
            "np_today": _nordpool(today), "np_tomorrow": _nordpool(today + timedelta(days=1)),
            "epex": _attr(ENTITIES["epex"], "forecast") or [],
            "solcast_today": _attr(ENTITIES["solcast_today"], "detailedForecast") or [],
            "solcast_tomorrow": _attr(ENTITIES["solcast_tomorrow"], "detailedForecast") or [],
            "solcast_day3": _attr(ENTITIES["solcast_day3"], "detailedForecast") or [],
-           "soc_pct": soc, "soc_source": soc_source, "tariff": _tariff(),
-           "soc_anchor": anchor, **measured}
+           "soc_pct": soc, "soc_source": soc_source, "tariff": _tariff()}
     # The curtailable half only. pv_series merges the three ESE lists, so the
     # whole span goes in one of them.
     inp["solcast_ese_today"] = _solcast_site(
@@ -376,14 +515,15 @@ def _plan_day(dry_run=False):
     # Unreadable helpers fall back to the core constants.
     _pack_temp_latch()
     inp["knobs"] = _knobs()
-    # The rebalancing clock (rebalance.py, 2026-10-03): today's settled quarters
-    # of the BANK VOLTAGE are folded into /config/emhass/rebalance.json every
-    # tick; a quarter at or above REBALANCE_TOP_V is time at the top, a stretch
-    # counts from the dwell knob on, and the clock is the age of the newest
-    # REBALANCE_BUDGET_H hours of it. No state on record reads as overdue.
+    # The rebalancing clock (rebalance.py): today's settled quarters of the
+    # inverter SOC are folded into /config/emhass/rebalance.json every tick; a
+    # quarter at or above REBALANCE_FULL_LEVEL is time at full, and the clock is
+    # the age of the newest REBALANCE_BUDGET_H (one quarter) of it, so reaching
+    # 100 % resets it (2026-10-10; the bank voltage 2026-10-03..10-10).
+    # No state on record reads as overdue.
     inp["rebalance"] = task.executor(core.rebalance_step, REBALANCE, (settled or {}).get("slice_start"),
-                                     act.get("batt_v"), int((settled or {}).get("n_past") or 0),
-                                     core.REBALANCE_TOP_V, inp["knobs"].get("rebalance_dwell_h"), now)
+                                     act.get("soc_pct"), int((settled or {}).get("n_past") or 0),
+                                     core.REBALANCE_FULL_LEVEL * 100.0, inp["knobs"].get("rebalance_dwell_h"), now)
     _publish_rebalance(inp["rebalance"], now)
     # The running day's hours for the period charts (2026-09-17): the settled
     # slice's past steps, written to the hourly sidecar and imported now, so
@@ -391,43 +531,45 @@ def _plan_day(dry_run=False):
     # row replaces them. Skipped on a dry run.
     if settled and not dry_run:
         _write_today_hours(settled, today)
-    # Measured PV and load for today, fetched above because soc_init depends on
-    # them. They also feed the display slice, so the chart shows what the virtual
-    # pack ran against rather than what the plan forecast.
-    inp["actual_pv_w"], inp["actual_load_w"] = act.get("pv_w"), act.get("load_w")
-    # The curtailment mask rides along: virtual_day substitutes POTENTIAL PV over
-    # the past, the same basis the ladder's replay lane settles on, so the
-    # charts and the ledger cannot disagree on a curtailed day.
-    inp["curtailed"], inp["pv_peak_w"] = act.get("curtailed"), act.get("pv_peak_w")
-    # The must-take half, so the repair scales the strings and not the Growatt.
-    inp["micro_w"] = act.get("micro_w")
+    # Today's record, fetched above because soc_init depends on it, also feeds
+    # the display slice, so the chart shows what the virtual pack ran against
+    # rather than what the plan forecast. The curtailment mask rides along:
+    # virtual_day substitutes POTENTIAL PV over the past, the same basis the
+    # ladder's replay lane settles on, so the charts and the ledger cannot
+    # disagree on a curtailed day; the must-take half, so the repair scales the
+    # strings and not the Growatt. run_plan takes them as flat inp keys.
+    inp.update(rec.to_inp("actual_"))
     # Yesterday too, for the display slice that fills the charts' 24 h look-back
     # (2026-09-04). Every step of it is in the past, so it is measured PV
     # and load throughout; the recorder's 5-minute window reaches back ~10 days.
-    prev = _actuals_15min(today - timedelta(days=1))
-    inp["prev_pv_w"], inp["prev_load_w"] = prev.get("pv_w"), prev.get("load_w")
-    inp["prev_curtailed"], inp["prev_pv_peak_w"] = prev.get("curtailed"), prev.get("pv_peak_w")
-    inp["prev_micro_w"] = prev.get("micro_w")
-    inp.update(_yesterday_lanes(prev, today - timedelta(days=1)))
+    yday = today - timedelta(days=1)
+    prev = _actuals_15min(yday)
+    inp.update(_day_record(yday, prev, _day_was_live(yday)).to_inp("prev_"))
     # Own same-clock load shape, unless the ML switch is on: passing
     # load_power_forecast flips EMHASS to load_forecast_method 'list', which
     # would silently override the mlforecaster the switch exists to enable.
     if state.get("input_boolean.emhass_ml_enabled") != "on":
         inp["load_days"] = _load_history_days(today)
         inp["load_now_w"] = _num(ACTUAL_LOAD, None)
+    # The heat topology and each zone's AC circuit history (subtracted from the
+    # load profile only for the zones the topology actually sends; planning decides).
+    inp["thermal"] = _thermal_inp()
+    if inp["thermal"].get("enabled") and "load_days" in inp:
+        inp["ac_days_by_zone"] = _ac_history_by_zone(today)
+        inp["ac_now_w_by_zone"] = {zone: _num(e, 0.0) for zone, e in AC_CIRCUITS.items()}
     res = task.executor(core.run_plan, inp)
     keys = ("ok", "message", "t0", "n", "n_predicted_steps", "pv_gap_steps", "optim_status", "cost_eur",
             "seconds", "archive_path", "prices_predicted", "soc_source", "load_source", "load_ref_days",
             "pv_split", "pv_micro_kwh", "pv_ese_gap_steps", "aux_cut_active", "aux_cut_ratio",
             "aux_cut_curtail_kwh", "aux_cut_aux_kwh", "aux_cut_steps",
-            "pv_p10_mix", "pv_p50_kwh", "pv_mixed_kwh", "knobs", "days_since_full")
+            "pv_p10_mix", "pv_p50_kwh", "pv_mixed_kwh", "knobs", "days_since_full", "thermal", "load_excluded_w")
     summary = {k: res.get(k) for k in keys}
     if not res.get("ok"):
         log.error(f"emhass: plan failed: {res.get('message')}")
         _last_run("plan-dry-run" if dry_run else "plan", False, res.get("seconds", 0), res.get("message"),
                   horizon_start=res.get("t0"), horizon_steps=res.get("n"),
                   n_predicted_steps=res.get("n_predicted_steps"), optim_status=res.get("optim_status"),
-                  soc_source=soc_source)
+                  soc_source=soc_source, thermal=res.get("thermal"))
         return summary
     if not dry_run:
         _set_slice("sensor.emhass_plan_yesterday", res.get("yesterday"), "EMHASS plan yesterday")
@@ -443,8 +585,8 @@ def _plan_day(dry_run=False):
               pv_gap_steps=res["pv_gap_steps"], optim_status=res["optim_status"], cost_eur=res["cost_eur"],
               soc_source=soc_source, load_source=res.get("load_source"),
               load_ref_days=res.get("load_ref_days"), aux_cut_active=res.get("aux_cut_active"),
-              aux_cut_ratio=res.get("aux_cut_ratio"))
-    log.info(f"emhass: plan ok {summary}")
+              aux_cut_ratio=res.get("aux_cut_ratio"), thermal=res.get("thermal"))
+    log.info(f"emhass: plan ok {dict(summary, thermal=_thermal_brief(summary.get('thermal')))}")
     return summary
 
 
@@ -452,38 +594,19 @@ def _actuals_15min(day, gap_upto=None):
     """The day's measured series as W per 15-minute step, from the recorder's
     5-minute means: {pv_w, load_w} feed the virtual day and the display slices,
     {pv_w, grid_w, batt_dc_w} the ladder's replay. Any series with more than MAX_PV_GAPS
-    held steps is left out of the dict rather than returned - a lane built on
-    gap-holds is worse than no lane, and each lane then fails on its own. The
-    recorder keeps 5-minute statistics ~10 days, plenty for scoring yesterday."""
-    ids = {ACTUAL_PV, ACTUAL_LOAD, ACTUAL_GRID_IMP, ACTUAL_GRID_EXP, ACTUAL_BATT, ACTUAL_SOC,
-           ACTUAL_CURTAIL, ACTUAL_MICRO, ACTUAL_BATT_V}
+    held steps is left out (core.day_actuals). A day the curtailment sensor does
+    not cover takes the fallback mask. The recorder keeps 5-minute statistics
+    ~10 days, plenty for scoring yesterday."""
     a = datetime.combine(day, datetime.min.time(), tzinfo=TZ).astimezone(timezone.utc)
     b = a + timedelta(days=2)                    # cover DST long days too
     try:
-        stats = task.executor(statistics_during_period, hass, a, b, ids, "5minute", None,
+        stats = task.executor(statistics_during_period, hass, a, b, set(DAY_SERIES.values()), "5minute", None,
                               {"mean", "max"})
     except Exception as e:
         log.warning(f"emhass: actuals statistics fetch failed: {e}")
         return {}
-    got = {}
-    for key, eid in (("pv_w", ACTUAL_PV), ("load_w", ACTUAL_LOAD), ("imp", ACTUAL_GRID_IMP),
-                     ("exp", ACTUAL_GRID_EXP), ("batt_dc_w", ACTUAL_BATT), ("soc_pct", ACTUAL_SOC),
-                     ("curtailed", ACTUAL_CURTAIL), ("micro_w", ACTUAL_MICRO), ("batt_v", ACTUAL_BATT_V)):
-        vals, gaps = task.executor(core.fifteen_min_series, day, TZ_NAME, (stats or {}).get(eid), gap_upto)
-        if gaps > core.MAX_PV_GAPS:
-            log.warning(f"emhass: actuals too gappy for {day}: {eid} {gaps} steps")
-        else:
-            got[key] = vals
-    # The 5-minute PEAK of the array inside each step, which is the only thing
-    # that separates a throttled array from a cloudy one - see core.pv_potential.
-    pk, pk_gaps = task.executor(core.fifteen_min_series, day, TZ_NAME,
-                                (stats or {}).get(ACTUAL_PV), gap_upto, "max", "max")
-    if pk_gaps <= core.MAX_PV_GAPS:
-        got["pv_peak_w"] = pk
-    imp, exp = got.pop("imp", None), got.pop("exp", None)
-    if imp is not None and exp is not None:
-        # the P1 reader reports kW; everything else in the pipeline is W, + = import
-        got["grid_w"] = [round((imp[i] - exp[i]) * 1000.0, 1) for i in range(len(imp))]
+    got, notes = task.executor(core.day_actuals, day, TZ_NAME, stats, DAY_SERIES, gap_upto)
+    _log_notes(notes)
     if got.get("curtailed") is None and got.get("soc_pct") is not None:
         midnight = datetime.combine(day, datetime.min.time(), tzinfo=TZ)
         got["curtailed"] = _fallback_mask(midnight, len(got["soc_pct"]), got["soc_pct"])
@@ -491,10 +614,10 @@ def _actuals_15min(day, gap_upto=None):
 
 
 def _export_off(t0, n):
-    """1,0 per step where switch.inverter_export_surplus was OFF at the step start.
-    The switch keeps no statistics, only states, so this reads its history rather
-    than the recorder's 5-minute rolls. None when nothing is recorded for the
-    window, which is the caller's signal to drop back to the SOC half alone."""
+    """1,0 per step where switch.inverter_export_surplus was OFF at the step start
+    (core.export_off). The switch keeps no statistics, only states, so this reads
+    its history rather than the recorder's 5-minute rolls. None when nothing is
+    recorded for the window."""
     a = t0.astimezone(timezone.utc)
     b = a + timedelta(minutes=core.STEP_MIN * n)
     try:
@@ -505,82 +628,37 @@ def _export_off(t0, n):
         return None
     # A list comprehension, not a generator expression: pyscript's AST walker
     # raises NotImplementedError on ast_generatorexp (see reference_pyscript_patterns).
-    pts = [(st.last_changed.timestamp(), st.state)
-           for st in (hist or {}).get(ACTUAL_EXPORT_SW, []) if st.state in ("on", "off")]
-    pts.sort()
-    if not pts:
-        return None
-    out, j, cur = [], 0, pts[0][1]
-    for i in range(n):
-        ts = (a + timedelta(minutes=core.STEP_MIN * i)).timestamp()
-        while j < len(pts) and pts[j][0] <= ts:
-            cur = pts[j][1]
-            j += 1
-        out.append(1.0 if cur == "off" else 0.0)
-    return out
+    pts = [(st.last_changed.timestamp(), st.state) for st in (hist or {}).get(ACTUAL_EXPORT_SW, [])]
+    return task.executor(core.export_off, t0, n, pts)
 
 
 def _fallback_mask(t0, n, soc_pct):
-    """Curtailment mask for a window that predates sensor.pv_curtailment_active
-    (which only started recording at 14:00 on 2026-09-05).
-
-    BOTH halves of the site's rule, not just SOC. The SOC-only version was loose by
-    design, on the argument that pv_potential's max(measured, scaled) guard would
-    neutralise a mask that over-fired. 09-05 disproved that: SOC sat above 95 %
-    from the small hours, the fallback flagged the whole day, and with Solcast
-    running high the guard never bit - five steps were credited with sun while
-    the array was demonstrably free, peaking at 1,4x the ceiling it was supposedly
-    held back from. So the fallback now reads the export switch's own history and
-    applies the same two conditions the live sensor does; only a window with no
-    recorded switch state at all falls back to SOC alone."""
+    """Curtailment mask for a window that predates sensor.pv_curtailment_active:
+    both halves of the site's rule on the export switch's history, SOC alone when
+    the switch has no recorded state (core.fallback_mask)."""
     off = _export_off(t0, n)
-    m = min(n, len(soc_pct))
     if off is None:
         log.warning(f"emhass: no export-switch history at {t0}, curtailment mask is SOC-only")
-        return [1.0 if float(soc_pct[i]) > core.PV_CURTAIL_SOC_PCT else 0.0 for i in range(m)]
-    return [1.0 if (float(soc_pct[i]) > core.PV_CURTAIL_SOC_PCT and off[i] >= 0.5) else 0.0
-            for i in range(m)]
+    return task.executor(core.fallback_mask, soc_pct, off, n)
 
 
 def _window_actuals(t0, n):
-    """{pv_w, grid_w, batt_dc_w} as W per step over n steps from t0, crossing
-    whatever calendar days the plan's horizon spans. No load series: the 20/20
-    lane runs on core.effective_load, which is built from these three and so
-    never touches the contested load entity."""
+    """{pv_w, grid_w, batt_dc_w, ...} as W per step over n steps from t0, crossing
+    whatever calendar days the plan's horizon spans (core.window_actuals). None
+    when a required series is too gappy; a gappy curtailment series takes the
+    fallback mask."""
     a = t0.astimezone(timezone.utc)
     b = a + timedelta(minutes=core.STEP_MIN * n)
-    ids = {ACTUAL_PV, ACTUAL_GRID_IMP, ACTUAL_GRID_EXP, ACTUAL_BATT, ACTUAL_CURTAIL, ACTUAL_SOC,
-           ACTUAL_MICRO}
     try:
-        stats = task.executor(statistics_during_period, hass, a, b, ids, "5minute", None,
+        stats = task.executor(statistics_during_period, hass, a, b, set(WINDOW_SERIES.values()), "5minute", None,
                               {"mean", "max"})
     except Exception as e:
         log.warning(f"emhass: hindsight window fetch failed: {e}")
         return None
-    got = {}
-    for key, eid in (("pv_w", ACTUAL_PV), ("imp", ACTUAL_GRID_IMP),
-                     ("exp", ACTUAL_GRID_EXP), ("batt_dc_w", ACTUAL_BATT),
-                     ("curtailed", ACTUAL_CURTAIL), ("soc_pct", ACTUAL_SOC),
-                     ("micro_w", ACTUAL_MICRO)):
-        vals, gaps = task.executor(core.window_series, t0, n, (stats or {}).get(eid))
-        if gaps > core.MAX_PV_GAPS:
-            if key == "curtailed":
-                got[key] = None           # fall back to the SOC-only mask below
-                continue
-            if key == "micro_w":
-                got[key] = None           # no must-take series: repair the whole array, as before
-                continue
-            log.warning(f"emhass: hindsight window too gappy: {eid} {gaps} of {n} steps")
-            return None
-        got[key] = vals
-    if got.get("curtailed") is None:
+    got, notes = task.executor(core.window_actuals, t0, n, stats, WINDOW_SERIES)
+    _log_notes(notes)
+    if got is not None and got.get("curtailed") is None:
         got["curtailed"] = _fallback_mask(t0, n, got["soc_pct"])
-    pk, pk_gaps = task.executor(core.window_series, t0, n, (stats or {}).get(ACTUAL_PV),
-                                None, "max", "max")
-    if pk_gaps <= core.MAX_PV_GAPS:
-        got["pv_peak_w"] = pk
-    imp, exp = got.pop("imp"), got.pop("exp")
-    got["grid_w"] = [round((imp[i] - exp[i]) * 1000.0, 1) for i in range(n)]
     return got
 
 
@@ -591,8 +669,8 @@ def _ladder_inputs(day):
     act = _actuals_15min(day)
     # A day the writer drove is the real pack in the ledger (2026-09-27): the
     # actual rung takes the live anchor and the measured lanes.
-    live = _day_was_live(day)
-    marks = {"anchor": _soc_anchor(day, act, live=live), "measured": bool(live and _measured(act, live=live))}
+    rec = _day_record(day, act, _day_was_live(day))
+    marks = {"anchor": rec.soc_anchor, "measured": rec.measured}
     w = task.executor(core.ladder_windows, ARCHIVE, day.isoformat(), TZ_NAME)
     if not w:
         return {"day": act, "win1": None, "win2": None, **marks}
@@ -635,13 +713,10 @@ def _import_ladder_earned():
     hour rows from ladder_hours.csv where the live archive replayed the day,
     the day's value at 00:00 for the imported history. Re-imported whole each
     time, like the emhass:* lanes, so a re-scored day keeps every later sum."""
-    series = task.executor(core.ladder_earned_series, LADDER, TZ_NAME)
-    data, total = [], 0.0
-    for iso, v in series:
-        total += v
-        data.append({"start": datetime.fromisoformat(iso), "state": round(v, 4), "sum": round(total, 4)})
-    if not data:
+    rows = task.executor(core.ladder_earned_rows, LADDER, TZ_NAME)
+    if not rows:
         return
+    data = [dict(r, start=datetime.fromisoformat(r["start"])) for r in rows]
     meta = {"mean_type": StatisticMeanType.NONE, "has_sum": True, "name": "EMHASS ladder earned (what we ran)",
             "source": "emhass", "statistic_id": LADDER_EARNED, "unit_class": None, "unit_of_measurement": "EUR"}
     async_add_external_statistics(hass, meta, data)
@@ -683,10 +758,7 @@ def emhass_today_hours():
     now = _now()
     today = now.date()
     act = _actuals_15min(today, core._slot(now))
-    settled = task.executor(core.virtual_day, ARCHIVE, today, TZ_NAME, now,
-                            act.get("pv_w"), act.get("load_w"), act.get("curtailed"),
-                            act.get("pv_peak_w"), act.get("micro_w"), soc_anchor=_soc_anchor(today, act),
-                            **_measured(act))
+    settled = task.executor(core.virtual_day, ARCHIVE, today, TZ_NAME, now, _day_record(today, act))
     if not settled:
         return {"status": "no_chain"}
     _write_today_hours(settled, today)
@@ -694,13 +766,12 @@ def emhass_today_hours():
 
 
 def _import_ladder_shadow():
-    series = task.executor(core.ladder_shadow_series, LADDER)
+    series = task.executor(core.ladder_shadow_rows, LADDER)
     for key, sid, unit, name in SHADOW_STATS:
         rows = series.get(key) or []
         if not rows:
             continue
-        data = [{"start": datetime.fromisoformat(iso), "mean": round(v, 4), "min": round(v, 4), "max": round(v, 4)}
-                for iso, v in rows]
+        data = [dict(r, start=datetime.fromisoformat(r["start"])) for r in rows]
         meta = {"mean_type": StatisticMeanType.ARITHMETIC, "has_sum": False, "name": name, "source": "emhass",
                 "statistic_id": sid, "unit_class": None, "unit_of_measurement": unit}
         async_add_external_statistics(hass, meta, data)
@@ -751,7 +822,7 @@ def emhass_ladder(start=None, end=None, rungs=None, reprice=False):
     """Walk the ladder (actual, hindsight, omni2 + the two nowcast halves) over [start, end], end
     default yesterday, start default four days before it. `rungs` is a comma
     list to run a subset. Rungs already ok on a day are not re-solved; pass a
-    fresh CSV to rebuild. Shares the plan lock: run it off the :13/:43 minutes."""
+    fresh CSV to rebuild. Shares the plan lock: run it off the :13/:28/:43/:58 minutes."""
     task.unique("emhass_plan_day")
     e = datetime.fromisoformat(str(end)).date() if end else (_now().date() - timedelta(days=1))
     s = datetime.fromisoformat(str(start)).date() if start else e - timedelta(days=3)
@@ -796,14 +867,14 @@ def _off_refresh_minute():
     """Never post ad-hoc solves while a plan may be solving: the add-on has one
     opt_res_latest, and a solve landing between production's POST and its GET
     would hand it the wrong plan (or fail it as misaligned). Two sources of a
-    plan: the :13/:43 refresh (:05/:35 until 2026-09-08), and the startup
+    plan: the :13/:28/:43/:58 refresh (:13/:43 until 2026-09-27, :05/:35 until 2026-09-08), and the startup
     rehydrate 120 s after a pyscript reload when the add-on holds a stray solve
     (it re-plans; on 2026-09-07 that re-plan killed the first live A/B run
     through the shared lock). So: step off the refresh minutes, then wait while
     a plan is actually running."""
-    m = _now().minute
-    if m % 30 in (11, 12, 13, 14, 15):
-        task.sleep(60 * ((16 - m % 30) % 30))
+    wait = core.refresh_wait_s(_now().minute)
+    if wait:
+        task.sleep(wait)
     waited = 0
     while _PLAN_BUSY["since"] is not None and waited < 300:
         task.sleep(5)
@@ -816,19 +887,6 @@ def _ab_store(label, payload):
 
 def _ab_load(label):
     return task.executor(core.ab_load, AB_DIR, label)
-
-
-def _ab_totals(days):
-    keys = ("declined_10_17_kwh", "declined_day_kwh", "growatt_cut_kwh", "import_day_kwh", "import_06_18_kwh",
-            "export_day_kwh", "cash_eur", "soc_term_eur", "total_eur")
-    ok = [d for d in days if d.get("status") == "ok"]
-    # list comprehensions, never generator expressions: pyscript's AST walker has
-    # no ast_generatorexp (see reference_pyscript_patterns); this bit on 09-07
-    tot = {k: round(sum([float(d["summary"][k] or 0.0) for d in ok]), 3) for k in keys}
-    soc17 = [d["summary"]["soc_17h_pct"] for d in ok if d["summary"].get("soc_17h_pct") is not None]
-    tot["soc_17h_mean_pct"] = round(sum(soc17) / len(soc17), 1) if soc17 else None
-    tot["days_ok"] = len(ok)
-    return tot
 
 
 @service(supports_response="optional")
@@ -870,22 +928,16 @@ def emhass_ab(start, end=None, label="ab", overrides=None, from_live=False, cade
             base_days.append(b)
         log.info(f"emhass: ab {label} {d}: {r['status']} " + (str(r.get("summary")) if r["status"] == "ok" else str(r.get("message"))))
         d += timedelta(days=1)
-    tot, base_tot = _ab_totals(days), (_ab_totals(base_days) if baseline else None)
-    delta = ({k: (round(tot[k] - base_tot[k], 3) if isinstance(tot.get(k), (int, float)) and isinstance(base_tot.get(k), (int, float)) else None)
-              for k in tot} if baseline else None)
-    result = {"label": label, "start": str(start), "end": last.isoformat(), "overrides": ov, "from_live": bool(from_live),
-              "cadence_min": int(cadence_min), "settle": str(settle), "ran_at": _now().isoformat(timespec="seconds"),
-              "seconds": round((_now() - t_all).total_seconds(), 1), "totals": tot, "baseline_totals": base_tot,
-              "delta": delta, "days": days, "baseline_days": base_days}
+    head = {"label": label, "start": str(start), "end": last.isoformat(), "overrides": ov, "from_live": bool(from_live),
+            "cadence_min": int(cadence_min), "settle": str(settle), "ran_at": _now().isoformat(timespec="seconds"),
+            "seconds": round((_now() - t_all).total_seconds(), 1)}
+    result, slim = task.executor(core.ab_result, head, days, base_days, bool(baseline))
     path = _ab_store(label, result)
-    slim = {k: v for k, v in result.items() if k not in ("days", "baseline_days")}
-    slim["days"] = [{"day": x["day"], "status": x["status"], "summary": x.get("summary"),
-                     "executed": x.get("executed"), "solves": x.get("solves"), "notes": x.get("notes")} for x in days]
-    slim["baseline_days"] = [{"day": x["day"], "status": x["status"], "summary": x.get("summary")} for x in base_days]
     slim.update(friendly_name="EMHASS A/B last run", icon="mdi:ab-testing", path=path)
     state.set("sensor.emhass_ab_last", label, new_attributes=slim)
-    ok = all([x["status"] == "ok" for x in days])
-    _last_run("ab", ok, result["seconds"], f"{label} {start}..{last}: {tot['days_ok']}/{len(days)} days ok")
+    tot = result["totals"]
+    _last_run("ab", tot["days_ok"] == len(days), result["seconds"],
+              f"{label} {start}..{last}: {tot['days_ok']}/{len(days)} days ok")
     emhass_plan_day()                                     # the add-on's latest result is a past-day solve: restore the live horizon
     return slim
 
@@ -894,7 +946,7 @@ def emhass_ab(start, end=None, label="ab", overrides=None, from_live=False, cade
 def emhass_ab_apply(label=None):
     """Push a stored A/B variant's overrides into the live helpers. Default: the
     label of the last run. Raw runtime keys and diagnostics are reported as
-    skipped; the next :13/:43 solve runs on the new values."""
+    skipped; the next :13/:28/:43/:58 solve runs on the new values."""
     task.unique("emhass_plan_day")
     label = label or state.get("sensor.emhass_ab_last")
     stored = _ab_load(label) if label not in (None, "unknown", "unavailable") else None
@@ -960,15 +1012,10 @@ def emhass_rehydrate():
     add-on's last plan if it is still fresh, run health."""
     _act = _actuals_15min(_now().date(), core._slot(_now()))
     _prev = _actuals_15min(_now().date() - timedelta(days=1))
+    yday = _now().date() - timedelta(days=1)
     res = task.executor(core.rehydrate, ARCHIVE, TZ_NAME, _now().isoformat(),
                         _num("input_number.emhass_plan_stale_hours", 26.0),
-                        _act.get("pv_w"), _act.get("load_w"),
-                        _prev.get("pv_w"), _prev.get("load_w"),
-                        _act.get("curtailed"), _prev.get("curtailed"),
-                        _act.get("pv_peak_w"), _prev.get("pv_peak_w"),
-                        _act.get("micro_w"), _prev.get("micro_w"),
-                        soc_anchor=_soc_anchor(_now().date(), _act), **_measured(_act),
-                        **_yesterday_lanes(_prev, _now().date() - timedelta(days=1)))
+                        _day_record(_now().date(), _act), _day_record(yday, _prev, _day_was_live(yday)))
     _set_slice("sensor.emhass_plan_yesterday", res.get("yesterday"), "EMHASS plan yesterday")
     _set_slice("sensor.emhass_plan_today", res.get("today"), "EMHASS plan today")
     _set_slice("sensor.emhass_plan_next_day", res.get("next_day"), "EMHASS plan next day")
@@ -993,6 +1040,7 @@ def emhass_rehydrate():
 
 @time_trigger("startup")
 def _emhass_startup():
+    _zonnebonus_step(read_meter=False)     # republish the counter; the next quarter steps it
     task.sleep(120)            # let the add-on, recorder and Nord Pool settle after a restart
     emhass_rehydrate()
 

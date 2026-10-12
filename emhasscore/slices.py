@@ -10,6 +10,7 @@ from .objective import CAPACITY_KWH, ETA_C, ETA_D, loss_adjustment, step_cost, S
 from .deye import clamp_write, DEYE_CLAMP_DEADBAND_A, SETTLE_MARGIN, integrate_soc, settle_step, soc_dwell_h, wanted_clamp
 from .archive import ARCHIVE_REACH, iter_organic_plans, load_plan, newest_plan_for_day, plan_for_day, plan_heads
 from .repair import pv_potential
+from .actuals import DayActuals
 
 
 def compact_slice(sl: dict, doc: dict) -> dict:
@@ -133,12 +134,11 @@ def _anchor_soc(docs: list, starts: list, key0: float) -> float | None:
 
 
 def _repair_past_pv(starts: list, now: datetime, rows_in_force: list, micro_in_force: list,
-                    p50_in_force: list, actual_pv_w: list | None, curtailed: list | None,
-                    pv_peak_w: list | None, actual_micro_w: list | None
-                    ) -> tuple[list, list, dict | None, list]:
+                    p50_in_force: list, act: DayActuals) -> tuple[list, list, dict | None, list]:
     """The measured past on the potential basis. Returns (pv_meas_w, pv_pot_w,
     pv_repair, micro_at), each list per step and None where there is no
     measurement or the step is not in the past."""
+    actual_pv_w, curtailed, pv_peak_w, actual_micro_w = act.pv_w, act.curtailed, act.pv_peak_w, act.micro_w
     n = len(starts)
     # Potential PV over the past, from each step's own plan-in-force forecast
     # (P_PV is the raw Solcast input echoed back; EMHASS reports whatever it
@@ -196,20 +196,19 @@ def _measured_at(series, i: int):
 
 
 def _integrate_day(starts: list, now: datetime, rows_in_force: list, micro_in_force: list,
-                   cut_in_force: list, pv_pot_w: list, micro_at: list, actual_load_w: list | None,
+                   cut_in_force: list, pv_pot_w: list, micro_at: list, act: DayActuals,
                    soc: float, capacity_kwh: float, eta_c: float, eta_d: float,
-                   margin: bool = SETTLE_MARGIN, deadband_a: float = DEYE_CLAMP_DEADBAND_A,
-                   soc_anchor: tuple | None = None,
-                   actual_batt_w: list | None = None, actual_grid_w: list | None = None,
-                   actual_soc_pct: list | None = None) -> dict:
+                   margin: bool = SETTLE_MARGIN, deadband_a: float = DEYE_CLAMP_DEADBAND_A) -> dict:
     """Walk the day through the virtual Deye from `soc`, one settled step at a
-    time. `soc_anchor` = (step, soc_pct) resets the pack ENTERING that step:
+    time. `act.soc_anchor` = (step, soc_pct) resets the pack ENTERING that step:
     the real pack at the moment the writer went live (spec 3.6, 2026-09-26),
     so the chain from there on measures the writer's execution error and not
     the virtual pack's history. Returns the per-step lanes under their output names (p_batt_w,
     soc_pct, p_grid_w, p_pv_w, p_load_w, pv_fc_w, load_fc_w, buy, sell,
     cost_eur, pv_curtail_w; None on a step nothing covers) plus n_past,
     clamped_steps and `measured` (per step: the meter settled it)."""
+    actual_load_w, soc_anchor = act.load_w, act.soc_anchor
+    actual_batt_w, actual_grid_w, actual_soc_pct = act.batt_w, act.grid_w, act.soc_pct
     p_batt, soc_pct, p_grid, p_pv, p_load, buy, sell, cost = [], [], [], [], [], [], [], []
     measured = []
     pv_fc, load_fc, pv_curtail, clamp_a = [], [], [], []
@@ -312,15 +311,10 @@ def _integrate_day(starts: list, now: datetime, rows_in_force: list, micro_in_fo
 
 
 
-def virtual_day(archive_dir: str, day: date, tz: str, now: datetime,
-                actual_pv_w: list | None = None, actual_load_w: list | None = None,
-                curtailed: list | None = None, pv_peak_w: list | None = None,
-                actual_micro_w: list | None = None,
+def virtual_day(archive_dir: str, day: date, tz: str, now: datetime, act: DayActuals | None = None,
                 capacity_kwh: float = CAPACITY_KWH,
                 eta_c: float = ETA_C, eta_d: float = ETA_D, margin: bool = SETTLE_MARGIN,
-                soc_start_pct: float | None = None, soc_anchor: tuple | None = None,
-                actual_batt_w: list | None = None, actual_grid_w: list | None = None,
-                actual_soc_pct: list | None = None) -> dict | None:
+                soc_start_pct: float | None = None) -> dict | None:
     """Reconstruct what the shadow EMS actually ran (the past part of `day`)
     and currently intends (the rest of it), one step at a time, instead of
     plan_for_day's single plan frozen before midnight. rolled_slices freezes
@@ -347,7 +341,8 @@ def virtual_day(archive_dir: str, day: date, tz: str, now: datetime,
     the caller then re-anchors on the real pack, same as virtual_soc_at's
     other callers.
 
-    actual_pv_w / actual_load_w, when given, replace the plan's own PV and
+    `act` (DayActuals, None for none) carries the day's measurements. Its
+    pv_w / load_w, when given, replace the plan's own PV and
     load forecast for steps already in the past (step_start < now); future
     steps always use the plan's forecast, even when actuals are supplied.
 
@@ -382,6 +377,8 @@ def virtual_day(archive_dir: str, day: date, tz: str, now: datetime,
     `margin` replays the writer's insurance clamp (settle_step); since
     2026-09-12 every settled lane carries it (deye.SETTLE_MARGIN).
     """
+    act = act if act is not None else DayActuals()
+    soc_anchor = act.soc_anchor
     midnight = local_midnight(day, tz)
     n = expected_steps(day, tz)
     starts = step_times(midnight, n)
@@ -393,7 +390,7 @@ def virtual_day(archive_dir: str, day: date, tz: str, now: datetime,
     # `soc_start_pct` overrides the archive's anchor: the ladder chains the
     # executed lane through its own settled pack instead of the live one, which
     # rehydrates re-anchor at every restart (seams of up to 8 % on 09-03..09-07).
-    # `soc_anchor` (step, soc_pct) is the LIVE anchor: the real pack at the
+    # `act.soc_anchor` (step, soc_pct) is the LIVE anchor: the real pack at the
     # moment the writer went live, or at midnight on a live day (spec 3.6). At
     # step 0 it is simply the start; later it resets the walk mid-day.
     if soc_anchor is not None and int(soc_anchor[0]) == 0:
@@ -404,14 +401,11 @@ def virtual_day(archive_dir: str, day: date, tz: str, now: datetime,
     soc_start_pct = round(soc * 100, 2)
 
     pv_meas_w, pv_pot_w, pv_repair, micro_at = _repair_past_pv(
-        starts, now, rows_in_force, micro_in_force, p50_in_force,
-        actual_pv_w, curtailed, pv_peak_w, actual_micro_w)
+        starts, now, rows_in_force, micro_in_force, p50_in_force, act)
 
     lanes = _integrate_day(starts, now, rows_in_force, micro_in_force, cut_in_force, pv_pot_w, micro_at,
-                           actual_load_w, soc, capacity_kwh, eta_c, eta_d, margin=margin,
-                           soc_anchor=soc_anchor, actual_batt_w=actual_batt_w, actual_grid_w=actual_grid_w,
-                           actual_soc_pct=actual_soc_pct)
-    measured = actual_batt_w is not None and actual_grid_w is not None and actual_soc_pct is not None
+                           act, soc, capacity_kwh, eta_c, eta_d, margin=margin)
+    measured = act.measured
     soc_pct, n_past = lanes["soc_pct"], lanes["n_past"]
 
     sources = sorted(used_ts, key=lambda t: datetime.fromisoformat(t), reverse=True)
@@ -459,21 +453,11 @@ def virtual_day(archive_dir: str, day: date, tz: str, now: datetime,
             "dwell_95_h": soc_dwell_h(soc_pct[:n_past]),
             # the writer's standing charge clamp per step, and how many times it was rewritten
             "clamp_a": lanes["clamp_a"], "clamp_writes": lanes["clamp_writes"],
-            "actuals_used": actual_pv_w is not None or actual_load_w is not None}
+            "actuals_used": act.pv_w is not None or act.load_w is not None}
 
 
 def rolled_slices(archive_dir: str, now: datetime, tz: str,
-                  actual_pv_w: list | None = None, actual_load_w: list | None = None,
-                  prev_pv_w: list | None = None, prev_load_w: list | None = None,
-                  curtailed: list | None = None, prev_curtailed: list | None = None,
-                  pv_peak_w: list | None = None, prev_pv_peak_w: list | None = None,
-                  micro_w: list | None = None, prev_micro_w: list | None = None,
-                  soc_anchor: tuple | None = None,
-                  actual_batt_w: list | None = None, actual_grid_w: list | None = None,
-                  actual_soc_pct: list | None = None,
-                  prev_soc_anchor: tuple | None = None,
-                  prev_batt_w: list | None = None, prev_grid_w: list | None = None,
-                  prev_soc_pct: list | None = None) -> dict:
+                  act: DayActuals | None = None, prev: DayActuals | None = None) -> dict:
     """The three display slices. NOT plan_for_day, which is the scoring
     selector: it takes only a plan made before the day's midnight covering the
     whole day, so today's chart froze on last night's solve and every hourly
@@ -504,45 +488,33 @@ def rolled_slices(archive_dir: str, now: datetime, tz: str,
     curtailable share only). None when no Optimal plan covers the whole day,
     which is every solve made without a day-3 Solcast list.
 
+    `act` is today's DayActuals and `prev` yesterday's; None for none.
+
     YESTERDAY KEEPS THE REAL PACK (2026-09-27): in live mode yesterday takes
-    its own anchor (`prev_soc_anchor`) and its own measured pack, meter and
-    SOC lanes (`prev_batt_w`, `prev_grid_w`, `prev_soc_pct`), exactly as today
-    does. Without them the first live day went back to the virtual pack at the
+    its own anchor and its own measured pack, meter and SOC lanes (`prev`'s
+    soc_anchor, batt_w, grid_w, soc_pct), exactly as today does. Without
+    them the first live day went back to the virtual pack at the
     00:13 rollover: 10 % at the floor all evening where the real pack had
     sold from 96 % to 18 %, and the ledger scored that."""
     today = now.astimezone(ZoneInfo(tz)).date()
-    vd = virtual_day(archive_dir, today, tz, now, actual_pv_w, actual_load_w, curtailed, pv_peak_w,
-                     micro_w, soc_anchor=soc_anchor, actual_batt_w=actual_batt_w, actual_grid_w=actual_grid_w,
-                     actual_soc_pct=actual_soc_pct)
+    vd = virtual_day(archive_dir, today, tz, now, act)
     if vd is None:                                   # chain broken: last night's plan is better than nothing
         found = plan_for_day(archive_dir, today, tz)
         vd = compact_slice(found[1], found[0]) if found else None
     yday = today - timedelta(days=1)
-    prev = virtual_day(archive_dir, yday, tz, now, prev_pv_w, prev_load_w, prev_curtailed,
-                       prev_pv_peak_w, prev_micro_w, soc_anchor=prev_soc_anchor, actual_batt_w=prev_batt_w,
-                       actual_grid_w=prev_grid_w, actual_soc_pct=prev_soc_pct)
-    if prev is None:
+    yd = virtual_day(archive_dir, yday, tz, now, prev)
+    if yd is None:
         found = plan_for_day(archive_dir, yday, tz)
-        prev = compact_slice(found[1], found[0]) if found else None
+        yd = compact_slice(found[1], found[0]) if found else None
     nxt = newest_plan_for_day(archive_dir, today + timedelta(days=1), tz)
     aft = newest_plan_for_day(archive_dir, today + timedelta(days=2), tz)
-    return {"yesterday": prev, "today": vd,
+    return {"yesterday": yd, "today": vd,
             "next_day": compact_slice(nxt[1], nxt[0]) if nxt else None,
             "day_after": compact_slice(aft[1], aft[0]) if aft else None}
 
 
 def rehydrate(archive_dir: str, tz: str, now_iso: str, stale_hours: float,
-              actual_pv_w: list | None = None, actual_load_w: list | None = None,
-              prev_pv_w: list | None = None, prev_load_w: list | None = None,
-              curtailed: list | None = None, prev_curtailed: list | None = None,
-              pv_peak_w: list | None = None, prev_pv_peak_w: list | None = None,
-              micro_w: list | None = None, prev_micro_w: list | None = None,
-              soc_anchor: tuple | None = None,
-              actual_batt_w: list | None = None, actual_grid_w: list | None = None,
-              actual_soc_pct: list | None = None,
-              prev_soc_anchor: tuple | None = None,
-              prev_batt_w: list | None = None, prev_grid_w: list | None = None,
-              prev_soc_pct: list | None = None) -> dict:
+              act: DayActuals | None = None, prev: DayActuals | None = None) -> dict:
     """Everything the wrapper needs to rebuild its states after an HA restart.
 
     The must-take series ride along since 2026-09-07: without them the today
@@ -551,11 +523,7 @@ def rehydrate(archive_dir: str, tz: str, now_iso: str, stale_hours: float,
     replaced it, the exact inconsistency the 09-06 repair-the-curtailable-half
     fix removed from the plan path."""
     now = datetime.fromisoformat(now_iso).astimezone(ZoneInfo(tz))
-    out = rolled_slices(archive_dir, now, tz, actual_pv_w, actual_load_w, prev_pv_w, prev_load_w,
-                        curtailed, prev_curtailed, pv_peak_w, prev_pv_peak_w, micro_w, prev_micro_w,
-                        soc_anchor=soc_anchor, actual_batt_w=actual_batt_w, actual_grid_w=actual_grid_w,
-                        actual_soc_pct=actual_soc_pct, prev_soc_anchor=prev_soc_anchor, prev_batt_w=prev_batt_w,
-                        prev_grid_w=prev_grid_w, prev_soc_pct=prev_soc_pct)
+    out = rolled_slices(archive_dir, now, tz, act, prev)
     # Freshness is "how old is the newest plan the EMS actually ran", so it reads
     # the same organic list as the reconstruction. The old form took the newest
     # FILE, which after a replay run is a doc carrying its source's pre-midnight

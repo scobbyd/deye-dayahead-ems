@@ -39,7 +39,9 @@ def emhass_get(base_url: str, path: str, timeout: int = 30) -> tuple[int, object
 
 def solve(base_url: str, payload: dict, timeout: int = 180) -> dict:
     """POST naive-mpc-optim (one retry after 30 s), require last-run ok and newer
-    than the request, then fetch the plan rows."""
+    than the request, then fetch the plan rows. A failed POST carries its HTTP
+    status (400: the add-on rejected the model, infeasible included; 0: no
+    answer or a timeout)."""
     requested = datetime.now(timezone.utc) - timedelta(seconds=2)
     t_start = _time.monotonic()
     status, body = emhass_post(base_url, "naive-mpc-optim", payload, timeout)
@@ -47,7 +49,7 @@ def solve(base_url: str, payload: dict, timeout: int = 180) -> dict:
         _time.sleep(30)
         status, body = emhass_post(base_url, "naive-mpc-optim", payload, timeout)
         if status not in (200, 201):
-            return {"ok": False, "message": f"naive-mpc-optim HTTP {status}: {body[:200]}",
+            return {"ok": False, "status": status, "message": f"naive-mpc-optim HTTP {status}: {body[:200]}",
                     "seconds": round(_time.monotonic() - t_start, 1)}
     st, lr = emhass_get(base_url, "/api/v1/last-run")
     seconds = round(_time.monotonic() - t_start, 1)

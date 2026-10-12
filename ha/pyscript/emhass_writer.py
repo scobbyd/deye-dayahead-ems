@@ -43,7 +43,7 @@ STATUS = "sensor.emhass_writer"
 HEARTBEAT = "sensor.emhass_writer_heartbeat"
 MEMORY = "sensor.emhass_writer_memory"   # the phantom guard's memory (recorder-excluded)
 SOC = ENTITIES["soc"]
-SOC_FLOOR = "input_number.emhass_soc_min"   # fraction; the planner's floor is the kill's floor
+SOC_FLOOR = "input_number.emhass_soc_kill"   # fraction; the kill's own floor, under the planner's emhass_soc_min
 PACK_TEMP_MEAN = "sensor.emhass_pack_temp_1h"   # the heat backstop reads the live 1 h mean, not the ramp's latch
 HEAT_CUT_C = "input_number.emhass_heat_cut_c"
 HEAT_CUT_KW = "input_number.emhass_heat_cut_kw"   # 0 = backstop off

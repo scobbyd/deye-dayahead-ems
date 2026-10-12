@@ -1,4 +1,4 @@
-"""The rebalancing clock: how long ago the pack last had its budget of time at the top.
+"""The rebalancing clock: how long ago the pack was last full.
 
 History. Until 2026-09-15 `days_since_full` read the plan-of-record chain and
 reset the instant a plan touched full. From 2026-09-15 the clock counted one
@@ -12,9 +12,10 @@ The clock since 2026-10-03:
     the bank voltage at or above REBALANCE_TOP_V live (the PACE packs bleed
     their high cells only in the knee), the SOC at or above REBALANCE_FULL_LEVEL
     for a pack known only by its SOC (the replay's virtual pack);
-  - a STRETCH counts only once it has lasted REBALANCE_DWELL_H (live knob
-    rebalance_dwell_h, 1 h): a half-hour touch of the top does nothing for the
-    cells and must not reset anything;
+  - a STRETCH counts once it has lasted REBALANCE_DWELL_H (live knob
+    rebalance_dwell_h). 0 since 2026-10-10: the packs bleed from the
+    first minute in the knee, so every settled quarter at the top counts. It
+    was 1 h from 2026-10-03, on the idea that a short touch does nothing;
   - the CLOCK is the age of the newest REBALANCE_BUDGET_H hours of counted top
     time, looking back from now across as many stretches as it takes. Summer
     tops of 1 to 4 h a day keep it at a few days; in winter one long night
@@ -27,9 +28,18 @@ The clock since 2026-10-03:
     REBALANCE_PULL_DAY (or reads overdue) it stays at least REBALANCE_PULL_DAY
     plus the days since it latched, so the end target, the surplus-off and the
     pull hold and the pull keeps stepping up, until REBALANCE_RELEASE_H of
-    counted top time fall inside the last REBALANCE_RELEASE_WINDOW_H. The
-    release is a balance: from then on the clock reads at most the time since
-    it, so older stretches cannot drag it straight back past day 14.
+    counted top time fall inside the last REBALANCE_RELEASE_WINDOW_H. Since
+    2026-10-10 that is the whole budget inside 3,5 days: the debt 75 %
+    paid, the clock back from day 14 to 3,5. The clock then reads its own
+    value (3,5 d or less), not a reset to zero; `released` is a record only.
+
+Since 2026-10-10 the live series is the inverter SOC again and the
+budget is one quarter (REBALANCE_BUDGET_H): the clock is the days since the
+newest settled quarter at full, so reaching 100 % resets it and the latch lets
+go there. Pack 3's full-charge voltage was aligned on 10-09, so all three packs
+now flag full at the same top and the inverter SOC reaches 100; the BMS then
+ends the charge and the bank relaxes, so voltage time measured nothing the BMS
+acts on. All the site keeps is the pull to 100 % at least once in two weeks.
 
 The state is a small dict the caller persists (the wrapper in
 /config/emhass/rebalance.json, the replay walk in its state.json):
@@ -46,6 +56,8 @@ bridge two half-stretches.
 """
 from __future__ import annotations
 
+import json
+import os
 from datetime import datetime, timedelta
 
 from .grid import STEP_MIN
@@ -82,8 +94,8 @@ def update(state: dict | None, slice_start: str | datetime, series: list, n_past
            dwell_h: float = REBALANCE_DWELL_H, lookback_d: float = REBALANCE_LOOKBACK_D,
            step_min: int = STEP_MIN) -> dict:
     """Fold a settled slice into the clock. series[k] is the quarter ending at
-    slice_start + (k + 1) steps (a 15-minute mean: the bank voltage live, the
-    SOC % in the replay); only the first `n_past` are settled. A quarter at or
+    slice_start + (k + 1) steps (a 15-minute mean of the SOC %; the bank
+    voltage live 2026-10-03..10-10); only the first `n_past` are settled. A quarter at or
     above `level` is time at the top; None (an unsettled hole) ends a stretch.
     Returns the new state."""
     st = load_state(state)
@@ -134,12 +146,10 @@ def _days(a: datetime, b: datetime) -> float:
 
 def raw_days(state: dict | None, now: datetime, budget_h: float = REBALANCE_BUDGET_H) -> float | None:
     """The budget clock before the latch: days since the newest `budget_h` hours
-    of counted top time began, at most the days since the last release; None
-    when neither exists."""
+    of counted top time began; None when the lookback does not hold them.
+    (2026-10-03..10-10 it was also capped at the days since the last release.)"""
     t = budget_start(state, budget_h)
-    rel = _parse(load_state(state)["released"])
-    ds = [_days(x, now) for x in (t, rel) if x is not None]
-    return min(ds) if ds else None
+    return _days(t, now) if t is not None else None
 
 
 def days_since(state: dict | None, now: datetime, budget_h: float = REBALANCE_BUDGET_H) -> float | None:
@@ -168,7 +178,7 @@ def hours_within(state: dict | None, now: datetime, window_h: float = REBALANCE_
 def latch(state: dict | None, now: datetime, release_h: float = REBALANCE_RELEASE_H,
           window_h: float = REBALANCE_RELEASE_WINDOW_H, budget_h: float = REBALANCE_BUDGET_H) -> dict:
     """One latch step at `now`: a latched pull releases once `release_h` of
-    counted top time lie inside the last `window_h` (the release is a balance);
+    counted top time lie inside the last `window_h` (the debt mostly paid);
     an unlatched clock latches at REBALANCE_PULL_DAY or when overdue."""
     st = load_state(state)
     if st["latch_since"] is not None:
@@ -216,3 +226,31 @@ def published(state: dict | None, now: datetime, budget_h: float = REBALANCE_BUD
             "last_stretch_end": st["runs"][-1][1] if st["runs"] else None,
             "latch_since": st["latch_since"], "released": st["released"],
             "release_hours": hours_within(state, now)}
+
+
+def rebalance_step(path: str, slice_start, series: list | None, n_past: int, level: float,
+                   dwell_h: float | None = None, now=None) -> dict:
+    """The wrapper's one call per tick for the rebalancing clock: load the
+    state file, fold today's settled quarters of `series` (the SOC's 15-minute
+    means live since 2026-10-10) into it at `level`, save, return the state for
+    inp["rebalance"]. With `now` the pull latch steps too (`latch`). A missing
+    or unreadable file starts empty, which the schedule reads as overdue."""
+    state = None
+    try:
+        with open(path) as f:
+            state = json.load(f)
+    except (OSError, ValueError):
+        state = None
+    if series is not None and slice_start:
+        state = update(state, slice_start, series, int(n_past or 0), level,
+                       dwell_h=float(dwell_h) if dwell_h is not None else REBALANCE_DWELL_H)
+    else:
+        state = load_state(state)
+    if now is not None:
+        state = latch(state, now)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f)
+    os.replace(tmp, path)
+    return state

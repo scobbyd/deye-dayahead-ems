@@ -44,7 +44,7 @@ load are never negative.
 | `batt_dc_w` | W | + = discharge, - = charge | yes | | the pack's DC-side power. The settlement moves it to the AC node through the bridge efficiency (x eta discharging, / eta charging) |
 | `soc_pct` | % | 0..100 | yes | | the pack's state of charge. Each ladder day starts its plan from the value on the first quarter of the local day |
 | `da_eur_kwh` | EUR/kWh | | yes | | the day-ahead auction price for the quarter, bare: no fee, no tax, no VAT (the tariff adds those). Negative values are real and matter |
-| `micro_w` | W | >= 0 | no | 0 | AC-coupled microinverter on the gen port. Must-take PV: the LP sees it as negative load, the hybrid bridge never carries it |
+| `micro_w` | W | >= 0 | no | 0 | AC-coupled microinverter on the gen port. Must-take in the field: the hybrid bridge never carries it. How the LP hears it is `pv.micro_in_load` (gross PV by default; negative load under the legacy netting) |
 | `soc_max_pct` | % | | no | NaN | hourly maximum of the SOC, held on the four quarters. Only the fallback curtailment mask reads it |
 | `suspect` | bool | | no | False | True on every quarter of an hour where the strings may have been held back. The reference rule: hourly SOC maximum at or above 95 % AND a negative price in the hour. The settlement's curtailment mask |
 | `plant` | text | | no | `measured` | `measured` on quarters the recorded plant is the one you are pricing; `modelled` where the record belongs to an older plant. The ladder summarises the two as separate blocks and never mixes them |

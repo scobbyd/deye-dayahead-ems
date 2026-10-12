@@ -164,7 +164,7 @@ automation:
             {{ state_attr('sensor.emhass_writer', 'intent') }}). Baseline restored.
 
   # SOC-FLOOR BACKSTOP. The writer's ceiling holds the discharge clamp at 0 A
-  # while the real SOC is under the planner's floor (emhasscore/writer.py,
+  # while the real SOC is under input_number.emhass_soc_kill (emhasscore/writer.py,
   # soc_floor_tripped), in every mode. This covers a dead writer: the dead man
   # above restores the baseline (discharge 240 A), so this runs 30 s after it
   # in the same 5-minute cycle and takes the clamp back to 0 A. It only ever
@@ -186,7 +186,7 @@ automation:
       - condition: template
         value_template: >
           {% set soc = states('sensor.inverter_battery') | float(-1) %}
-          {% set floor = states('input_number.emhass_soc_min') | float(0) * 100 %}
+          {% set floor = states('input_number.emhass_soc_kill') | float(0) * 100 %}
           {{ soc >= 0 and floor > 0 and soc < floor
              and states('number.inverter_battery_max_discharging_current') | float(0) > 0 }}
     action:
@@ -200,7 +200,7 @@ automation:
           title: "Battery SOC floor: discharge stopped (backstop)"
           message: >
             SOC {{ states('sensor.inverter_battery') }} % against a floor of
-            {{ (states('input_number.emhass_soc_min') | float(0) * 100) | round(0) }} % and no writer tick
+            {{ (states('input_number.emhass_soc_kill') | float(0) * 100) | round(0) }} % and no writer tick
             since {{ states('sensor.emhass_writer_heartbeat') }}. Discharge clamp set to 0 A. Check pyscript.
 
   # HEAT BACKSTOP without a writer. The writer's ceiling caps charge and

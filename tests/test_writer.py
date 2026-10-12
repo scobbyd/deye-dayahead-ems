@@ -584,13 +584,13 @@ def test_virtual_day_soc_anchor_resets_the_pack_at_a_step_and_at_zero_equals_soc
     from datetime import date
     now = F.local(2026, 9, 6, 0, 0)
     base = core.virtual_day(F.PLANS, date(2026, 9, 5), F.TZ, now)
-    anchored = core.virtual_day(F.PLANS, date(2026, 9, 5), F.TZ, now, soc_anchor=(40, 90.0))
+    anchored = core.virtual_day(F.PLANS, date(2026, 9, 5), F.TZ, now, core.DayActuals(soc_anchor=(40, 90.0)))
     assert anchored["soc_pct"][:40] == base["soc_pct"][:40]
     assert anchored["soc_start_pct"] == base["soc_start_pct"]
     assert abs(anchored["soc_pct"][40] - 90.0) < 8.0                       # 90 % entering step 40, one step of flow after
     assert anchored["soc_pct"][40] != base["soc_pct"][40]
     assert anchored["soc_anchor"] == [40, 90.0] and base["soc_anchor"] is None
-    at_zero = core.virtual_day(F.PLANS, date(2026, 9, 5), F.TZ, now, soc_anchor=(0, 50.0))
+    at_zero = core.virtual_day(F.PLANS, date(2026, 9, 5), F.TZ, now, core.DayActuals(soc_anchor=(0, 50.0)))
     by_start = core.virtual_day(F.PLANS, date(2026, 9, 5), F.TZ, now, soc_start_pct=50.0)
     assert at_zero["soc_pct"] == by_start["soc_pct"] and at_zero["soc_start_pct"] == 50.0
 
@@ -678,7 +678,7 @@ def test_virtual_day_takes_the_measured_pack_meter_and_soc_over_the_past_in_live
     soc = [60.0 + 0.1 * i for i in range(n)]
     batt[10] = None                                                     # one gap: settlement stands there
     live = core.virtual_day(F.PLANS, date(2026, 9, 5), F.TZ, now,
-                            actual_batt_w=batt, actual_grid_w=grid, actual_soc_pct=soc)
+                            core.DayActuals(batt_w=batt, grid_w=grid, soc_pct=soc))
     assert live["soc_source"] == "measured" and base["soc_source"] == "virtual"
     for i in range(past):
         if i == 10 or base["p_batt_w"][i] is None:
@@ -691,7 +691,7 @@ def test_virtual_day_takes_the_measured_pack_meter_and_soc_over_the_past_in_live
     assert abs(live["soc_pct"][past] - soc[past - 1]) < 8.0             # and walks on from the measured pack
     assert live["soc_pct"][past] != base["soc_pct"][past]
     # rolled_slices and rehydrate carry the same three lanes through to the today slice
-    rs = core.rolled_slices(F.PLANS, now, F.TZ, actual_batt_w=batt, actual_grid_w=grid, actual_soc_pct=soc)
+    rs = core.rolled_slices(F.PLANS, now, F.TZ, core.DayActuals(batt_w=batt, grid_w=grid, soc_pct=soc))
     assert rs["today"]["soc_source"] == "measured" and rs["today"]["p_batt_w"][0] == batt[0]
 
 
@@ -707,7 +707,7 @@ def test_virtual_day_charges_the_loss_back_only_where_no_meter_settled():
     batt = [1000.0] * n; grid = [-2000.0] * n; soc = [60.0] * n
     batt[10] = None
     live = core.virtual_day(F.PLANS, date(2026, 9, 5), F.TZ, now,
-                            actual_batt_w=batt, actual_grid_w=grid, actual_soc_pct=soc)
+                            core.DayActuals(batt_w=batt, grid_w=grid, soc_pct=soc))
     assert base["measured"] == "0" * n
     m = live["measured"]
     assert len(m) == n and m[10] == "0" and set(m[past:]) == {"0"}
@@ -1090,15 +1090,15 @@ def test_rolled_slices_and_rehydrate_carry_yesterdays_anchor_and_measured_lanes(
     batt = [500.0 + 10.0 * i for i in range(n)]
     grid = [-1000.0 + 5.0 * i for i in range(n)]
     soc = [60.0 + 0.1 * i for i in range(n)]
-    rs = core.rolled_slices(F.PLANS, now, F.TZ, prev_soc_anchor=(40, 90.0),
-                            prev_batt_w=batt, prev_grid_w=grid, prev_soc_pct=soc)
+    rs = core.rolled_slices(F.PLANS, now, F.TZ, prev=core.DayActuals(soc_anchor=(40, 90.0),
+                            batt_w=batt, grid_w=grid, soc_pct=soc))
     y = rs["yesterday"]
     assert y["date"] == "2026-09-05" and y["soc_source"] == "measured" and y["soc_anchor"] == [40, 90.0]
     assert y["p_batt_w"][0] == batt[0] and y["p_grid_w"][50] == grid[50] and y["soc_pct"][95] == soc[95]
     assert base["yesterday"]["soc_source"] == "virtual" and base["yesterday"]["soc_anchor"] is None
     assert rs["today"] == base["today"]                                    # today is untouched by yesterday's lanes
-    rh = core.rehydrate(F.PLANS, F.TZ, now.isoformat(), 26.0, prev_soc_anchor=(40, 90.0),
-                        prev_batt_w=batt, prev_grid_w=grid, prev_soc_pct=soc)
+    rh = core.rehydrate(F.PLANS, F.TZ, now.isoformat(), 26.0, prev=core.DayActuals(soc_anchor=(40, 90.0),
+                        batt_w=batt, grid_w=grid, soc_pct=soc))
     assert rh["yesterday"]["soc_source"] == "measured" and rh["yesterday"]["soc_anchor"] == [40, 90.0]
     assert rh["yesterday"]["p_batt_w"][0] == batt[0]
 
@@ -1294,7 +1294,7 @@ def test_the_soc_floor_backstop_runs_after_the_dead_man_and_only_lowers_the_disc
     assert dead["trigger"][0]["minutes"] == back["trigger"][0]["minutes"] == "/5"
     assert "seconds" not in dead["trigger"][0] and back["trigger"][0]["seconds"] == 30
     conds = " ".join(c.get("value_template", "") for c in back["condition"])
-    assert "emhass_writer_heartbeat" in conds and "input_number.emhass_soc_min" in conds
+    assert "emhass_writer_heartbeat" in conds and "input_number.emhass_soc_kill" in conds
     writes = [a for a in back["action"] if a.get("action") == "number.set_value"]
     assert writes == [{"action": "number.set_value",
                        "target": {"entity_id": core.WRITER_ENTITY["battery_max_discharging_current"]},

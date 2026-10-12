@@ -51,7 +51,7 @@ DEFAULTS = {
         "eta_bridge": 0.989,           # measured DC<->AC bridge efficiency
         "q_port_kw_per_kw2": 0.0042,   # quadratic loss on the battery port (stress pricing)
         "q_bridge_kw_per_kw2": 0.0005, # quadratic loss on the AC bridge (stress pricing)
-        "standby_load_w": 90.0,        # the inverter's own draw that the load register does not see
+        "standby_load_w": 72.0,        # the inverter's own draw that the load register does not see: 97 W measured standby (2026-10-09) - ~25 W UPS-register over-read at idle
         "grid_charge_ac_max_w": 11300.0,   # grid-only charge ceiling at the AC side (loss map v2)
         "eta_v2": {                    # loss map v2 linear parts (the physics_v2 knob)
             "dc_ac": 0.981, "ac_dc": 0.990, "charge": 0.977, "discharge": 0.977,
@@ -87,6 +87,10 @@ DEFAULTS = {
     },
     "pv": {
         "micro_share": 0.288,          # AC-coupled microinverter share of the first forecast site (0 = none)
+        "micro_in_load": False,        # how the microinverter reaches the LP. False: gross PV and the whole load (EMHASS
+                                       # 0.18.5+ clips a negative load to 0 W, upstream #1135). True: main-only PV and the
+                                       # microinverter as NEGATIVE load, the convention of add-ons up to 0.18.1 and of
+                                       # the library solver. A run can pin either (micro_in_load on the inputs).
         "micro_max_w": 3000.0,         # microinverter nameplate (0 = none)
         "p10_mix": 0.20,               # weight of the P10 forecast in the planning PV (0..1)
         "curtail_soc_pct": 95.0,       # SOC where the hybrid starts holding the main array back
@@ -105,6 +109,14 @@ DEFAULTS = {
         "supplier_fee": 0.019,
         "btw_pct": 21.0,
         "feedin_fee": 0.019,
+        # The supplier's sun bonus (the supplier Zonnebonus): a positive feed-in
+        # rate earns this much extra on every quarter that lies wholly between
+        # sunrise and sunset at the supplier's reference point (Utrecht).
+        # input_boolean.emhass_zonnebonus switches it on.
+        "sun_bonus_pct": 10.0,
+        "sun_bonus_lat": 52.0907,
+        "sun_bonus_lon": 5.1214,
+        "sun_bonus_cap_kwh": 7500.0,   # bonus-eligible export per calendar year
     },
     # Every hardware and household entity the wrappers read. The emhass_*
     # helpers and sensors the packages create keep their names and are not

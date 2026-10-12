@@ -56,6 +56,7 @@
   "pv": {
     "micro_share": 0.288,
     "micro_max_w": 3000.0,
+    "micro_in_load": false,
     "p10_mix": 0.20,
     "curtail_soc_pct": 95.0,
     "strings": {

@@ -77,12 +77,26 @@ def test_resume_rejects_wrong_header(df, tmp_path):
         ladder.run(df, "2026-06-10", "2026-06-10", ["P0"], str(out), solver=stub)
 
 
-def test_payload_is_main_pv_and_net_load(df):
-    """The frame's PV columns are main-string already: the LP gets them as is,
-    the microinverter leaves the load list only, and rows_to_gross puts it back."""
+def test_payload_is_gross_pv_and_the_load_by_default(df):
+    """The frame's PV columns are main-string: the LP gets main plus the
+    microinverter and the load as measured, the plant's convention since
+    EMHASS 0.18.5 clips a negative load (2026-10-12)."""
     day = date(2026, 6, 10)
     stub = F.StubSolver(F.local(2026, 6, 10, 0, 0))
     ladder.run_day(df, day, "P0", stub, ladder.LIVE_TARIFF)
+    t0, n, win = ladder._horizon(df, day, 1)
+    p = stub.calls[0]
+    assert p["pv_power_forecast"] == [round(round(max(0.0, v), 1) + round(m, 1), 1) for v, m in zip(win["pv_pot_main_w"], win["micro_w"])]
+    assert p["load_power_forecast"] == [round(l, 1) for l in win["load_w"]]
+    assert min(p["load_power_forecast"]) >= 0
+
+
+def test_payload_legacy_convention_is_main_pv_and_net_load(df):
+    """Pinned per run: main-string PV as is, the microinverter leaves the load
+    list only, and rows_to_gross puts it back."""
+    day = date(2026, 6, 10)
+    stub = F.StubSolver(F.local(2026, 6, 10, 0, 0))
+    ladder.run_day(df, day, "P0", stub, ladder.LIVE_TARIFF, micro_in_load=True)
     t0, n, win = ladder._horizon(df, day, 1)
     p = stub.calls[0]
     assert p["pv_power_forecast"] == [round(v, 1) for v in win["pv_pot_main_w"]]

@@ -21,11 +21,12 @@ from .objective import bus_to_port_w, is_v2, ETA_C_V2, ETA_D_V2
 from .plant import PLANT
 
 
-# The plan refreshes at :13 and :43 and a tick runs at :00, :15, :30 and :45
-# (+20 s). plan_ts is the solve START, so the :13 plan is 47 min 20 s old at
-# the :00:20 tick when the :43 solve is lost (Infeasible, add-on timeout):
-# 60 minutes tolerates exactly that one missed refresh (review 2026-09-26;
-# 45 did not), and older than that the writer holds the baseline.
+# The plan refreshes at :13, :28, :43 and :58 and a tick runs at :00, :15, :30
+# and :45 (+20 s). plan_ts is the solve START, so the :13 plan is 47 min 20 s
+# old at the :00:20 tick when the :28, :43 and :58 solves are all lost
+# (Infeasible, add-on timeout): 60 minutes tolerates three missed refreshes in
+# a row (review 2026-09-26, when the refresh was :13 and :43 and 45 did not
+# survive one miss), and older than that the writer holds the baseline.
 WRITER_STALE_MIN = 60.0
 
 

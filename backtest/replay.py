@@ -274,8 +274,11 @@ class Walk:
         if prev_end is None and today > self.start:
             raise RuntimeError(f"no settled SOC for {today - timedelta(days=1)}: "
                                 f"chain broken before {tick.isoformat()}")
-        vd = virtual_day(self.archive, today, self.tz, tick, act["pv_w"], act["load_w"], act["curtailed"],
-                         act["pv_peak_w"], act["micro_w"], capacity_kwh=self.hw["capacity_kwh"], soc_start_pct=prev_end)
+        from emhasscore.actuals import DayActuals
+        rec = DayActuals(pv_w=act["pv_w"], load_w=act["load_w"], curtailed=act["curtailed"],
+                         pv_peak_w=act["pv_peak_w"], micro_w=act["micro_w"])
+        vd = virtual_day(self.archive, today, self.tz, tick, rec, capacity_kwh=self.hw["capacity_kwh"],
+                         soc_start_pct=prev_end)
         if not vd:
             return None
         self._fold_rebalance(vd, tick)
@@ -347,8 +350,11 @@ class Walk:
         prev_end = self.state["soc_end_pct"].get((day - timedelta(days=1)).isoformat())
         if prev_end is None and day > self.start:
             raise RuntimeError(f"no settled SOC for {day - timedelta(days=1)}: cannot settle {day}")
-        vd = virtual_day(self.archive, day, self.tz, midnight_next, act["pv_w"], act["load_w"], act["curtailed"],
-                         act["pv_peak_w"], act["micro_w"], capacity_kwh=self.hw["capacity_kwh"], soc_start_pct=prev_end)
+        from emhasscore.actuals import DayActuals
+        rec = DayActuals(pv_w=act["pv_w"], load_w=act["load_w"], curtailed=act["curtailed"],
+                         pv_peak_w=act["pv_peak_w"], micro_w=act["micro_w"])
+        vd = virtual_day(self.archive, day, self.tz, midnight_next, rec, capacity_kwh=self.hw["capacity_kwh"],
+                         soc_start_pct=prev_end)
         if not vd or vd.get("soc_now_pct") is None:
             raise RuntimeError(f"cannot settle {day}: virtual chain broken")
         self.state["soc_end_pct"][day.isoformat()] = float(vd["soc_now_pct"])

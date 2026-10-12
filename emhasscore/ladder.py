@@ -46,13 +46,14 @@ import os
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
+from .actuals import DayActuals
 from .archive import day_slice, iter_organic_plans, plan_for_day
 from .deye import settle_slice
 from .grid import STEP_MIN, _parse_ts, expected_steps, step_index, step_times
 from .objective import CAPACITY_KWH, build_payload, rebalance_schedule, SOC_FINAL_TARGET, stress_costs
 from .repair import effective_load, pv_potential
 from .scoring import _hindsight_solve, lambda_for, replay_day
-from .series import price_series, tariff
+from .series import price_series, tariff_frame
 from .slices import compact_slice, virtual_day
 
 # The three rungs the verdict is made of. A window is complete when all three
@@ -364,6 +365,23 @@ def ladder_earned_series(csv_path: str, tz: str = "Europe/Amsterdam") -> list[tu
     return out
 
 
+def ladder_earned_rows(csv_path: str, tz: str = "Europe/Amsterdam") -> list[dict]:
+    """emhass:ladder_earned_eur as statistics rows: {start (ISO), state, sum},
+    the sum running over the whole series, so a re-import keeps every later sum."""
+    data, total = [], 0.0
+    for iso, v in ladder_earned_series(csv_path, tz):
+        total += v
+        data.append({"start": iso, "state": round(v, 4), "sum": round(total, 4)})
+    return data
+
+
+def ladder_shadow_rows(csv_path: str) -> dict[str, list[dict]]:
+    """The shadow lanes as statistics rows, {lane: [{start (ISO), mean, min,
+    max}]}: one hourly figure each, so min and max are the mean."""
+    return {key: [{"start": iso, "mean": round(v, 4), "min": round(v, 4), "max": round(v, 4)} for iso, v in rows]
+            for key, rows in ladder_shadow_series(csv_path).items()}
+
+
 # ---- horizons --------------------------------------------------------------------
 
 def _midnight(day: date, tz: str) -> datetime:
@@ -474,8 +492,7 @@ def _real_prices(doc: dict, t0: datetime, n: int, np_rows) -> tuple | None:
         return None
     if n_pred:
         return None
-    tf = doc["tariff"]
-    return tariff(da, tf["energy_tax"], tf["supplier_fee"], tf["btw_pct"], tf["feedin_fee"])
+    return tariff_frame(da, doc["tariff"], t0, n)
 
 
 def _prices_to(doc: dict, t0: datetime, n: int, np_rows, cutoff: datetime, view: dict) -> tuple | None:
@@ -555,7 +572,7 @@ def _reprice(ex: dict, day: date, tz: str, np_rows, tf: dict | None) -> dict:
         return ex
     if n_pred:
         return ex
-    buy, sell = tariff(da, tf["energy_tax"], tf["supplier_fee"], tf["btw_pct"], tf["feedin_fee"])
+    buy, sell = tariff_frame(da, tf, _midnight(day, tz), n)
     return dict(ex, buy=list(buy), sell=list(sell))
 
 
@@ -579,10 +596,10 @@ def _run_actual(archive_dir: str, day: date, tz: str, act: dict, capacity_kwh: f
     t0 = _midnight(day, tz)
     lanes = {}
     if measured and act.get("soc_pct") is not None:
-        lanes = {"actual_batt_w": act["batt_dc_w"], "actual_grid_w": act["grid_w"], "actual_soc_pct": act["soc_pct"]}
-    ex = virtual_day(archive_dir, day, tz, t0 + timedelta(days=1), act["pv_w"], act.get("load_w"),
-                     act.get("curtailed"), act.get("pv_peak_w"), act.get("micro_w"), capacity_kwh,
-                     soc_start_pct=soc0, soc_anchor=soc_anchor, **lanes)
+        lanes = {"batt_w": act["batt_dc_w"], "grid_w": act["grid_w"], "soc_pct": act["soc_pct"]}
+    rec = DayActuals(pv_w=act["pv_w"], load_w=act.get("load_w"), curtailed=act.get("curtailed"),
+                     pv_peak_w=act.get("pv_peak_w"), micro_w=act.get("micro_w"), soc_anchor=soc_anchor, **lanes)
+    ex = virtual_day(archive_dir, day, tz, t0 + timedelta(days=1), rec, capacity_kwh, soc_start_pct=soc0)
     if ex is None:
         return {"status": "no_chain", "solves": 0}
     ex = _reprice(ex, day, tz, np_rows, reprice)

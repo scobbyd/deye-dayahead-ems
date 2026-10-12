@@ -139,6 +139,43 @@ def test_tariff_2027_wedge():
     assert sell == [pytest.approx(0.121), pytest.approx(-0.0121)]
 
 
+def test_tariff_sun_bonus_only_on_masked_steps_with_a_positive_rate():
+    # the supplier frame: feed-in fee -0,017 (a bonus), BTW 21.
+    da = [0.10, 0.10, -0.01, -0.02]
+    buy, sell = core.tariff(da, 0.0, 0.017, 21, -0.017, bonus=[False, True, True, True])
+    assert sell[0] == pytest.approx(0.117 * 1.21, abs=1e-5)
+    assert sell[1] == pytest.approx(0.117 * 1.10 * 1.21, abs=1e-5)
+    assert sell[2] == pytest.approx(0.007 * 1.10 * 1.21, abs=1e-5)   # price + 1,7 ct still positive
+    assert sell[3] == pytest.approx(-0.003 * 1.21, abs=1e-5)         # rate below zero: no bonus
+    assert buy == core.tariff(da, 0.0, 0.017, 21, -0.017)[0]
+
+
+def test_solver_buy_never_below_sell():
+    assert core.solver_buy([0.14, 0.14, 0.20], [0.14, 0.155, 0.12]) == [0.14, 0.155, 0.20]
+
+
+def test_sun_bonus_mask_utrecht_quarters_wholly_between_sunrise_and_sunset():
+    # Utrecht 2026-09-26: sunrise ~07:31:32, sunset ~19:30:20 CEST.
+    t0 = local(2026, 9, 26, 0, 0)
+    mask = core.sun_bonus_mask(t0, 96)
+    on = [t.strftime("%H:%M") for t, m in zip(core.step_times(t0, 96), mask) if m]
+    assert on[0] == "07:45" and on[-1] == "19:15" and len(on) == 47
+
+
+def test_sun_events_match_home_assistant_within_a_minute():
+    # HA sun.sun at the home location for 2026-10-06:
+    # next_rising 05:43:46Z, next_setting 17:05:26Z.
+    rise, sset = core._sun_events(date(2026, 10, 6), 50.98, 5.77)
+    assert abs((rise - datetime(2026, 10, 6, 5, 43, 46, tzinfo=timezone.utc)).total_seconds()) < 60
+    assert abs((sset - datetime(2026, 10, 6, 17, 5, 26, tzinfo=timezone.utc)).total_seconds()) < 60
+
+
+def test_sun_bonus_mask_counts_steps_through_utc_on_a_dst_day():
+    t0 = local(2026, 10, 25, 0, 0)                          # 100 steps, clocks go back
+    mask = core.sun_bonus_mask(t0, 100)
+    assert len(mask) == 100 and not mask[0] and any(mask)
+
+
 # ---- pv ----------------------------------------------------------------------
 
 def solcast(day_local, kw=1.0):
@@ -184,6 +221,58 @@ def test_pv_split_share_is_clamped_into_the_unit_interval():
 def test_pv_split_length_mismatch_raises():
     with pytest.raises(ValueError):
         core.pv_split([1.0, 2.0], [1.0], 0.288)
+
+
+# ---- the LP's lists: gross (the add-on clips a negative load) or the legacy netting ----
+
+def test_lp_lists_gross_hands_the_lp_the_whole_sun_and_the_whole_load():
+    pv, load = core.lp_lists([1000.0, 2000.0], [400.0, 300.0], [300.0, 2500.0], in_load=False)
+    assert pv == [1000.0, 2000.0] and load == [400.0, 300.0]
+
+
+def test_lp_lists_legacy_moves_the_growatt_into_negative_load():
+    pv, load = core.lp_lists([1000.0, 2000.0], [400.0, 300.0], [300.0, 2500.0], in_load=True)
+    assert pv == [700.0, 0.0] and load == [100.0, -2200.0]
+
+
+def test_lp_lists_without_a_load_list_sends_the_whole_sun_either_way():
+    """No load list means EMHASS runs its own load method and there is nowhere
+    to put the Growatt: the sun stays whole, or it would silently vanish."""
+    assert core.lp_lists([1000.0], None, [300.0], in_load=False) == ([1000.0], None)
+    assert core.lp_lists([1000.0], None, [300.0], in_load=True) == ([1000.0], None)
+
+
+def test_rows_to_gross_in_gross_mode_touches_only_the_cut_steps():
+    rows = [{"P_PV": 1000.0, "P_Load": 400.0, "P_PV_curtailment": 0.0} for _ in range(3)]
+    out = core.rows_to_gross(rows, [300.0, 300.0, 300.0], [False, True, False], in_load=False)
+    assert out is rows
+    assert [r["P_PV"] for r in rows] == [1000.0, 1300.0, 1000.0]
+    assert [r["P_Load"] for r in rows] == [400.0, 400.0, 400.0]
+    assert [r["P_PV_curtailment"] for r in rows] == [0.0, 300.0, 0.0]
+    # the harvest (available minus declined) is what the LP solved on, on every step
+    assert [r["P_PV"] - r["P_PV_curtailment"] for r in rows] == [1000.0] * 3
+
+
+def test_rows_to_gross_legacy_puts_the_growatt_back_into_both_sides():
+    rows = [{"P_PV": 700.0, "P_Load": 100.0, "P_PV_curtailment": 0.0} for _ in range(2)]
+    core.rows_to_gross(rows, [300.0, 300.0], [False, True], in_load=True)
+    assert [r["P_PV"] for r in rows] == [1000.0, 1000.0]
+    assert [r["P_Load"] for r in rows] == [400.0, 100.0]
+    assert [r["P_PV_curtailment"] for r in rows] == [0.0, 300.0]
+
+
+def test_cut_payload_in_gross_mode_takes_the_growatt_out_of_todays_pv():
+    pay = {"pv_power_forecast": [1000.0, 1000.0, 200.0], "load_power_forecast": [400.0, 400.0, 400.0]}
+    out = core.cut_payload(pay, [400.0, 400.0, 400.0], [300.0, 300.0, 300.0], {1, 2}, in_load=False)
+    assert out["pv_power_forecast"] == [1000.0, 700.0, 0.0]            # never below zero
+    assert out["load_power_forecast"] == [400.0, 400.0, 400.0]
+    assert pay["pv_power_forecast"] == [1000.0, 1000.0, 200.0]         # the uncut payload is untouched
+
+
+def test_cut_payload_legacy_takes_the_growatt_out_of_todays_load():
+    pay = {"pv_power_forecast": [700.0, 700.0], "load_power_forecast": [100.0, 100.0]}
+    out = core.cut_payload(pay, [400.0, 400.0], [300.0, 300.0], {1}, in_load=True)
+    assert out["load_power_forecast"] == [100.0, 400.0] and out["pv_power_forecast"] == [700.0, 700.0]
 
 
 def test_build_payload_shapes_and_length_check():
@@ -559,27 +648,53 @@ def test_run_plan_happy_path_archives_and_rolls(stub, tmp_path):
     assert nd["cost_eur"][0] == pytest.approx(core.step_cost(-500.0, 0.28, 0.10))
 
 
+def test_run_plan_sun_bonus_raises_the_solver_buy_and_archives_the_true_buy(stub, tmp_path):
+    now = datetime.now(Z).replace(hour=14, minute=0, second=4, microsecond=0)
+    t0, n = core.horizon(now, AMS)
+    stub.plan_fn = lambda posts: make_rows(t0, n)
+    inp = plan_inputs(now, tmp_path, stub.url)
+    inp["tariff"] = {"energy_tax": 0.0, "supplier_fee": 0.017, "btw_pct": 21, "feedin_fee": -0.017,
+                     "sun_bonus": True}
+    res = core.run_plan(inp)
+    assert res["ok"], res
+    body = stub.posts[0][1]
+    # 14:15, Nord Pool 0,157: sell (0,157 + 0,017) x 1,10 x 1,21, and the LP's buy raised to it
+    assert body["prod_price_forecast"][0] == pytest.approx(0.174 * 1.10 * 1.21, abs=1e-5)
+    assert body["load_cost_forecast"][0] == body["prod_price_forecast"][0]
+    doc = core.load_plan(res["archive_path"])
+    assert doc["tariff"]["sun_bonus"] is True
+    assert doc["rows"][0]["unit_load_cost"] == pytest.approx(0.174 * 1.21, abs=1e-5)   # the true buy
+    # a night step: no bonus, nothing raised
+    night = [k for k, t in enumerate(core.step_times(t0, n)) if t.hour == 2][0]
+    assert body["prod_price_forecast"][night] == pytest.approx(body["load_cost_forecast"][night])
+
+
 def _scale_solcast(rows, f):
     return [{**r, "pv_estimate": r["pv_estimate"] * f} for r in rows]
 
 
-def _split_inputs(now, tmp_path, url, ese_fraction=0.6, share=0.5):
+def _split_inputs(now, tmp_path, url, ese_fraction=0.6, share=0.5, in_load=None):
     """plan_inputs plus a load profile and an ESE site series, so run_plan has
     everything the split needs. The Growatt then works out to
-    ese_fraction x share of the combined forecast."""
+    ese_fraction x share of the combined forecast. `in_load` pins the LP's
+    convention (True: the legacy netting, False: gross); None takes the plant's."""
     inp = plan_inputs(now, tmp_path, url)
     inp["load_days"] = load_days(now.date() - timedelta(days=1))
     inp["solcast_ese_today"] = _scale_solcast(inp["solcast_today"], ese_fraction)
     inp["solcast_ese_tomorrow"] = _scale_solcast(inp["solcast_tomorrow"], ese_fraction)
     inp["knobs"] = {"growatt_share": share}
+    if in_load is not None:
+        inp["micro_in_load"] = in_load
     return inp
 
 
-def test_run_plan_splits_the_growatt_out_of_pv_and_into_the_load(stub, tmp_path):
+def test_run_plan_legacy_convention_splits_the_growatt_out_of_pv_and_into_the_load(stub, tmp_path):
+    """The convention of add-ons up to 0.18.1, kept for the library solver and
+    pinned per run with micro_in_load: main-only PV, the Growatt as negative load."""
     now = datetime.now(Z).replace(hour=14, minute=0, second=4, microsecond=0)
     t0, n = core.horizon(now, AMS)
     stub.plan_fn = lambda posts: make_rows(t0, n)
-    inp = _split_inputs(now, tmp_path, stub.url)
+    inp = _split_inputs(now, tmp_path, stub.url, in_load=True)
     combined, _ = core.pv_series(t0, n, inp["solcast_today"], inp["solcast_tomorrow"])
     load_only, _ = core.load_series(t0, n, AMS, inp["load_days"], inp.get("load_now_w"))
     res = core.run_plan(inp)
@@ -597,7 +712,7 @@ def test_run_plan_splits_the_growatt_out_of_pv_and_into_the_load(stub, tmp_path)
     assert doc["pv_micro_w"] == pytest.approx(micro)
 
 
-def test_run_plan_archives_the_rows_in_gross_terms(stub, tmp_path):
+def test_run_plan_legacy_convention_archives_the_rows_in_gross_terms(stub, tmp_path):
     """The split is a payload detail, not a change of units. What EMHASS solved
     on is net of the must-take half; what gets archived puts it back into both
     P_PV and P_Load, so the plan's own balance is untouched and every consumer
@@ -605,7 +720,7 @@ def test_run_plan_archives_the_rows_in_gross_terms(stub, tmp_path):
     now = datetime.now(Z).replace(hour=14, minute=0, second=4, microsecond=0)
     t0, n = core.horizon(now, AMS)
     stub.plan_fn = lambda posts: make_rows(t0, n, pv=[1234.0] * n)
-    inp = _split_inputs(now, tmp_path, stub.url)
+    inp = _split_inputs(now, tmp_path, stub.url, in_load=True)
     res = core.run_plan(inp)
     assert res["ok"], res
     doc = core.load_plan(res["archive_path"])
@@ -620,10 +735,50 @@ def test_run_plan_archives_the_rows_in_gross_terms(stub, tmp_path):
         assert float(r["P_PV"]) - float(r["P_Load"]) == pytest.approx(1234.0 - 400.0)
 
 
-def _cut_inputs(now, tmp_path, url, curtail_w):
+def test_run_plan_sends_gross_pv_and_the_profile_by_default(stub, tmp_path):
+    """EMHASS 0.18.5 clips a negative load_power_forecast to 0 W (upstream #1135,
+    no knob), which deleted the Growatt's output above house load from every
+    sunny plan from 2026-10-10 to 10-12. The plant default is therefore GROSS:
+    the whole sun in the PV list, the whole profile in the load list, and the
+    Growatt series kept only for the binary aux cut (2026-10-12)."""
+    now = datetime.now(Z).replace(hour=14, minute=0, second=4, microsecond=0)
+    t0, n = core.horizon(now, AMS)
+    stub.plan_fn = lambda posts: make_rows(t0, n)
+    inp = _split_inputs(now, tmp_path, stub.url)
+    combined, _ = core.pv_series(t0, n, inp["solcast_today"], inp["solcast_tomorrow"])
+    load_only, _ = core.load_series(t0, n, AMS, inp["load_days"], inp.get("load_now_w"))
+    res = core.run_plan(inp)
+    assert res["ok"], res
+    body = stub.posts[0][1]
+    assert body["pv_power_forecast"] == pytest.approx(combined)
+    assert body["load_power_forecast"] == pytest.approx(load_only)
+    assert min(body["load_power_forecast"]) >= 0
+    micro = [round(c * 0.3, 1) for c in combined]                 # 0,6 of the array x 0,5 share, still known
+    assert res["pv_split"] is True
+    assert res["pv_micro_kwh"] == pytest.approx(sum(micro) * core.STEP_H / 1000.0, abs=1e-3)
+    doc = core.load_plan(res["archive_path"])
+    assert doc["micro_in_load"] is False
+    assert doc["pv_micro_w"] == pytest.approx(micro)
+    assert doc["growatt_share"] == 0.5
+
+
+def test_run_plan_gross_mode_archives_the_rows_as_solved(stub, tmp_path):
+    now = datetime.now(Z).replace(hour=14, minute=0, second=4, microsecond=0)
+    t0, n = core.horizon(now, AMS)
+    stub.plan_fn = lambda posts: make_rows(t0, n, pv=[1234.0] * n)
+    inp = _split_inputs(now, tmp_path, stub.url, in_load=False)
+    res = core.run_plan(inp)
+    assert res["ok"], res
+    doc = core.load_plan(res["archive_path"])
+    assert any(m > 0 for m in doc["pv_micro_w"])
+    for r in doc["rows"]:
+        assert float(r["P_PV"]) == 1234.0 and float(r["P_Load"]) == 400.0 and float(r["P_PV_curtailment"]) == 0.0
+
+
+def _cut_inputs(now, tmp_path, url, curtail_w, in_load=True):
     """Split inputs plus a stub whose (uncut) plan declines `curtail_w` on every step
     of today; the second (cut) post echoes zero curtailment."""
-    inp = _split_inputs(now, tmp_path, url, ese_fraction=1.0, share=0.5)
+    inp = _split_inputs(now, tmp_path, url, ese_fraction=1.0, share=0.5, in_load=in_load)
     t0, n = core.horizon(now, AMS)
     today = now.date()
     def plan_fn(posts):
@@ -730,19 +885,52 @@ def test_run_plan_keeps_the_uncut_plan_when_the_cut_solve_fails(stub, tmp_path):
     assert doc["rows"][0]["optim_status"] == "Optimal"                       # the uncut rows were archived
 
 
-def test_run_plan_growatt_can_drive_the_load_negative(stub, tmp_path):
-    """The whole point: at midday the must-take half exceeds the house load, so
-    the load series must be allowed below zero. EMHASS accepts that (probed on
-    the live add-on 2026-09-06); clamping it here would hide the export."""
+def test_run_plan_legacy_convention_lets_the_growatt_drive_the_load_negative(stub, tmp_path):
+    """Under the legacy convention the must-take half exceeds the house load at
+    midday, so the load series goes below zero. Add-ons up to 0.18.1 accepted
+    that (probed live 2026-09-06); 0.18.5 clips it, which is why gross is the
+    plant default now."""
     now = datetime.now(Z).replace(hour=14, minute=0, second=4, microsecond=0)
     t0, n = core.horizon(now, AMS)
     stub.plan_fn = lambda posts: make_rows(t0, n)
-    inp = _split_inputs(now, tmp_path, stub.url, ese_fraction=1.0, share=1.0)
+    inp = _split_inputs(now, tmp_path, stub.url, ese_fraction=1.0, share=1.0, in_load=True)
     res = core.run_plan(inp)
     assert res["ok"], res
     body = stub.posts[0][1]
     assert min(body["load_power_forecast"]) < 0
     assert body["pv_power_forecast"] == [0.0] * n          # all of it is must-take now
+
+
+def test_run_plan_cut_in_gross_mode_moves_the_growatt_out_of_todays_pv(stub, tmp_path):
+    """The binary lever survives the convention change: the cut's second solve
+    takes the Growatt out of today's remaining PV entries (the load is untouched),
+    and the archived cut rows carry it as available AND declined."""
+    now = datetime.now(Z).replace(hour=14, minute=0, second=4, microsecond=0)
+    inp, plan_fn, t0, n = _cut_inputs(now, tmp_path, stub.url, curtail_w=3000.0, in_load=False)
+    stub.plan_fn = plan_fn
+    _aux_kwh, micro, idx = _today_micro_kwh(inp, t0, n, now)
+    combined, _ = core.pv_series(t0, n, inp["solcast_today"], inp["solcast_tomorrow"])
+    load_w, _ = core.load_series(t0, n, AMS, inp["load_days"], inp.get("load_now_w"))
+    res = core.run_plan(inp)
+    assert res["ok"], res
+    assert res["aux_cut_active"] is True and len(stub.posts) == 2
+    p1, p2 = stub.posts[0][1], stub.posts[1][1]
+    assert p1["pv_power_forecast"] == pytest.approx(combined)
+    for k in range(n):
+        if k in idx:
+            assert p2["pv_power_forecast"][k] == pytest.approx(combined[k] - micro[k], abs=0.06)
+        else:
+            assert p2["pv_power_forecast"][k] == pytest.approx(combined[k])
+    assert p2["load_power_forecast"] == pytest.approx(load_w)
+    assert p1["load_power_forecast"] == pytest.approx(load_w)
+    doc = core.load_plan(res["archive_path"])
+    assert doc["micro_cut"] == [k in idx for k in range(n)]
+    for k, r in enumerate(doc["rows"]):
+        if k in idx:
+            assert float(r["P_PV"]) == pytest.approx(micro[k]) and float(r["P_PV_curtailment"]) == pytest.approx(micro[k])
+        else:
+            assert float(r["P_PV"]) == 0.0 and float(r["P_PV_curtailment"]) == 0.0
+        assert float(r["P_Load"]) == 400.0
 
 
 def test_run_plan_without_an_ese_series_sends_the_combined_forecast(stub, tmp_path):
@@ -760,12 +948,13 @@ def test_run_plan_without_an_ese_series_sends_the_combined_forecast(stub, tmp_pa
 
 def test_run_plan_load_exact_w_overrides_the_profile_step_by_step(stub, tmp_path):
     """The replay's omniscient walk hands exact load on named UTC instants; it
-    replaces the profile only on those steps and the Growatt split still nets
-    the micro off it. Live never passes the key, so nothing else moves."""
+    replaces the profile only on those steps and the Growatt split (legacy
+    convention here) still nets the micro off it. Live never passes the key, so
+    nothing else moves."""
     now = datetime.now(Z).replace(hour=14, minute=0, second=4, microsecond=0)
     t0, n = core.horizon(now, AMS)
     stub.plan_fn = lambda posts: make_rows(t0, n)
-    inp = _split_inputs(now, tmp_path, stub.url)
+    inp = _split_inputs(now, tmp_path, stub.url, in_load=True)
     combined, _ = core.pv_series(t0, n, inp["solcast_today"], inp["solcast_tomorrow"])
     load_only, _ = core.load_series(t0, n, AMS, inp["load_days"], inp.get("load_now_w"))
     times = core.step_times(t0, n)
@@ -1143,7 +1332,9 @@ def test_virtual_day_and_settle_slice_honour_the_cut(tmp_path):
         _json.dump(doc, f)
     sl = core.compact_slice(core.day_slice(doc["rows"], day, AMS, 1.0), doc)
     assert sl["micro_cut_w"][i_cut] == 1500.0 and sum(sl["micro_cut_w"]) == 1500.0
-    vd = core.virtual_day(arch, day, AMS, local(2026, 9, 3, 1, 0), [7200.0] * 96, [500.0] * 96, [0.0] * 96, None, [1700.0] * 96)
+    vd = core.virtual_day(arch, day, AMS, local(2026, 9, 3, 1, 0),
+                          core.DayActuals(pv_w=[7200.0] * 96, load_w=[500.0] * 96, curtailed=[0.0] * 96,
+                                          micro_w=[1700.0] * 96))
     assert vd["micro_cut_w"][i_cut] == 1500.0 and vd["micro_cut_w"][i_cut + 1] == 0.0
     assert vd["p_grid_w"][i_cut] == pytest.approx(0.0)                        # cut: no spill
     assert vd["p_grid_w"][i_cut + 1] == pytest.approx(-1200.0)                # not cut: the real spill
@@ -1580,7 +1771,7 @@ def test_virtual_day_grid_uses_actuals_in_the_past_and_forecast_in_the_future(tm
                         p_batt=p_batt, grid=grid_plan)
     now = local(2026, 9, 2, 12, 0)
     actual_pv, actual_load = [1234.0] * 96, [777.0] * 96
-    vd = core.virtual_day(arch, day, AMS, now, actual_pv_w=actual_pv, actual_load_w=actual_load)
+    vd = core.virtual_day(arch, day, AMS, now, core.DayActuals(pv_w=actual_pv, load_w=actual_load))
     i_past = core._slot(local(2026, 9, 2, 6, 0))
     i_future = core._slot(local(2026, 9, 2, 18, 0))
     # the plan's own grid, moved by the load error and against the PV error
@@ -1611,9 +1802,9 @@ def _curtailed_day(tmp_path, now, actual_pv, mask, plan_pv=1000.0, peak=None,
                         pv=[plan_pv] * 96, load=[500.0] * 96,
                         p_batt=[200.0] * 96, grid=[-650.0] * 96,
                         pv_micro_w=micro_plan)
-    return core.virtual_day(arch, day, AMS, now, actual_pv_w=actual_pv,
-                            actual_load_w=[500.0] * 96, curtailed=mask, pv_peak_w=peak,
-                            actual_micro_w=micro_meas)
+    return core.virtual_day(arch, day, AMS, now, core.DayActuals(pv_w=actual_pv,
+                            load_w=[500.0] * 96, curtailed=mask, pv_peak_w=peak,
+                            micro_w=micro_meas))
 
 
 def test_virtual_day_repairs_only_the_curtailable_half(tmp_path):
@@ -1788,7 +1979,8 @@ def test_virtual_day_repairs_to_the_p50_not_to_the_mix(tmp_path):
     actual[i_curt] = 200.0
     mask = [0.0] * 96
     mask[i_curt] = 1.0
-    vd = core.virtual_day(arch, day, AMS, local(2026, 9, 2, 12, 0), actual, [350.0] * 96, mask)
+    vd = core.virtual_day(arch, day, AMS, local(2026, 9, 2, 12, 0),
+                          core.DayActuals(pv_w=actual, load_w=[350.0] * 96, curtailed=mask))
     assert vd["p_pv_w"][i_curt] == pytest.approx(1250.0)          # raw P50, not the 1000 the planner saw
     assert vd["pv_fc_w"][i_curt] == pytest.approx(1000.0)         # the chart's forecast lane is the planner's number
     assert vd["pv_reconstructed_kwh"] == pytest.approx(1.05 * core.STEP_H, abs=1e-3)
@@ -1942,8 +2134,8 @@ def _capped_day(tmp_path, now, actual_pv, actual_load, plan_pv=7203.6, plan_curt
                              "n": n, "tz": AMS, "soc_init": 0.5, "soc_final": 0.5,
                              "optim_status": "Optimal", "n_predicted_steps": 0,
                              "pv_gap_steps": 0, "rows": rows})
-    return core.virtual_day(arch, day, AMS, now, actual_pv_w=[actual_pv] * n,
-                            actual_load_w=[actual_load] * n, margin=margin)
+    return core.virtual_day(arch, day, AMS, now, core.DayActuals(pv_w=[actual_pv] * n,
+                            load_w=[actual_load] * n), margin=margin)
 
 
 def test_curtailed_step_holds_the_grid_setpoint_and_the_array_absorbs_the_error(tmp_path):
@@ -2148,7 +2340,28 @@ def test_hindsight_day_matches_the_plans_horizon_not_the_scored_day(stub, tmp_pa
     assert hs["eur"] == pytest.approx(hs["cash_eur"] + hs["soc_term_eur"] + hs["loss_eur"], abs=1e-3)
 
 
-def test_hindsight_treats_the_growatt_as_must_take_like_the_plan_lane(stub, tmp_path):
+def test_hindsight_legacy_convention_treats_the_growatt_as_negative_load(stub, tmp_path):
+    arch = str(tmp_path / "plans")
+    pt0, pn = hs_plan(arch)
+    stub.plan_fn = hs_echo(pn)
+    win = dict(hs_window(pn), micro_w=[300.0] * pn)
+    hs = core.hindsight_day(arch, stub.url, "2026-09-02", AMS, hs_prices(pt0, pn), win, HS_DAY_ACT, 48.0, 0.9,
+                            micro_in_load=True)
+    assert hs["status"] == "ok"
+    body = stub.posts[0][1]
+    assert body["pv_power_forecast"] == [700.0] * pn                 # 1000 potential minus the Growatt
+    assert body["load_power_forecast"] == [1500.0] * pn              # 1800 effective load minus the Growatt
+    # without a Growatt series the lane is unchanged
+    stub.posts.clear()
+    core.hindsight_day(arch, stub.url, "2026-09-02", AMS, hs_prices(pt0, pn), hs_window(pn), HS_DAY_ACT, 48.0, 0.9,
+                       micro_in_load=True)
+    assert stub.posts[0][1]["pv_power_forecast"] == [1000.0] * pn and stub.posts[0][1]["load_power_forecast"] == [1800.0] * pn
+
+
+def test_hindsight_sends_gross_pv_and_the_effective_load_by_default(stub, tmp_path):
+    """The hindsight lane re-solves through the same add-on, so it follows the
+    plant's convention: the repaired potential with the Growatt inside, and the
+    effective load as measured. Its settlement reads the same gross rows."""
     arch = str(tmp_path / "plans")
     pt0, pn = hs_plan(arch)
     stub.plan_fn = hs_echo(pn)
@@ -2156,12 +2369,8 @@ def test_hindsight_treats_the_growatt_as_must_take_like_the_plan_lane(stub, tmp_
     hs = core.hindsight_day(arch, stub.url, "2026-09-02", AMS, hs_prices(pt0, pn), win, HS_DAY_ACT, 48.0, 0.9)
     assert hs["status"] == "ok"
     body = stub.posts[0][1]
-    assert body["pv_power_forecast"] == [700.0] * pn                 # 1000 potential minus the Growatt
-    assert body["load_power_forecast"] == [1500.0] * pn              # 1800 effective load minus the Growatt
-    # without a Growatt series the lane is unchanged
-    stub.posts.clear()
-    core.hindsight_day(arch, stub.url, "2026-09-02", AMS, hs_prices(pt0, pn), hs_window(pn), HS_DAY_ACT, 48.0, 0.9)
-    assert stub.posts[0][1]["pv_power_forecast"] == [1000.0] * pn and stub.posts[0][1]["load_power_forecast"] == [1800.0] * pn
+    assert body["pv_power_forecast"] == [1000.0] * pn
+    assert body["load_power_forecast"] == [1800.0] * pn
 
 
 def test_hindsight_is_settled_the_same_way_as_the_replayed_lane(stub, tmp_path):
@@ -2482,7 +2691,7 @@ def test_rolled_slices_carries_yesterday_as_a_fully_past_virtual_day(tmp_path):
                         pv=[1000.0] * 96, load=[500.0] * 96, grid=[-650.0] * 96)
     now = local(2026, 9, 2, 12, 0)
     prev_pv, prev_load = [1234.0] * 96, [777.0] * 96
-    r = core.rolled_slices(arch, now, AMS, prev_pv_w=prev_pv, prev_load_w=prev_load)
+    r = core.rolled_slices(arch, now, AMS, prev=core.DayActuals(pv_w=prev_pv, load_w=prev_load))
     y = r["yesterday"]
     assert y["date"] == "2026-09-01" and y["slice_start"].startswith("2026-09-01T00:00")
     assert y["n"] == 96 and y["n_past"] == 96          # every step of it is behind us
@@ -2686,15 +2895,17 @@ def test_run_plan_soc_target_stays_out_when_off_or_past(stub, tmp_path):
     assert "soc_target_timestep" not in stub.posts[1][1]
 
 
-def write_ab_plan(arch, made, pv=1000.0, load=500.0, micro=None, knobs=None, n=None):
+def write_ab_plan(arch, made, pv=1000.0, load=500.0, micro=None, knobs=None, n=None, in_load=True):
     """An archived solve with a payload the A/B can re-run: lists on the horizon,
-    stress keys, the must-take lane, optional knobs."""
+    stress keys, the must-take lane, optional knobs. `in_load` is the convention
+    the document was archived under (True: legacy netting, no key in the doc)."""
     t0, nn = core.horizon(made, AMS)
     n = n or nn
     mic = [micro or 0.0] * n
+    net = (micro or 0.0) if in_load else 0.0
     pay = {"optimization_time_step": 15, "prediction_horizon": n, "soc_init": 0.5, "soc_final": 0.5,
-           "pv_power_forecast": [pv - (micro or 0.0)] * n, "load_cost_forecast": [0.28] * n,
-           "prod_price_forecast": [0.10] * n, "load_power_forecast": [load - (micro or 0.0)] * n,
+           "pv_power_forecast": [pv - net] * n, "load_cost_forecast": [0.28] * n,
+           "prod_price_forecast": [0.10] * n, "load_power_forecast": [load - net] * n,
            "battery_stress_cost": 0.004, "inverter_stress_cost": 0.001, "battery_soc_surplus_cost": 0.005,
            "battery_soc_deficit_threshold": 0.2, "battery_soc_deficit_cost": 0.01}
     rows = make_rows(t0, n, pv=[pv] * n)
@@ -2702,7 +2913,7 @@ def write_ab_plan(arch, made, pv=1000.0, load=500.0, micro=None, knobs=None, n=N
                                          "soc_init": 0.5, "soc_final": 0.5, "optim_status": "Optimal",
                                          "n_predicted_steps": 0, "pv_gap_steps": 0, "payload": pay, "rows": rows,
                                          "pv_micro_w": mic, "growatt_share": 0.288 if micro else None,
-                                         "knobs": knobs or {}})
+                                         "knobs": knobs or {}, **({} if in_load else {"micro_in_load": False})})
     return t0, n
 
 
@@ -2728,14 +2939,15 @@ def test_ab_payload_shifts_and_applies_the_knobs(tmp_path):
     doc = core.load_plan(core.list_plans(arch)[-1])
     doc["pv_p50_w"] = [1000.0] * n
     doc["pv_p10_w"] = [500.0] * n
-    pay, micro, cut_ready, notes, times, kn = core._ab_payload(doc, 2, {}, date(2026, 9, 2), AMS, None)
+    # the legacy convention, pinned: the lists below are asserted net of the Growatt
+    pay, micro, cut_ready, notes, times, kn = core._ab_payload(doc, 2, {}, date(2026, 9, 2), AMS, None, micro_in_load=True)
     assert pay["prediction_horizon"] == n - 2 and len(pay["pv_power_forecast"]) == n - 2 and len(micro) == n - 2
     assert times[0] == t0 + timedelta(minutes=30) and cut_ready is True and notes == []
     assert pay["load_power_forecast"][0] == pytest.approx(200.0)                        # 500 - 300, as archived
     ov = {"stress_scale": 2.0, "soc_final": 0.7, "soc_target": 1.0, "soc_target_at": "17:00",
           "growatt_share": 0.576, "pv_p10_mix": 0.2, "batt_power_max_w": 9000.0, "soc_min": 0.2,
           "weight_battery_discharge": 0.03, "deficit_cost": 0.02, "surplus_base": 0.01}
-    pay, micro, cut_ready, notes, times, kn = core._ab_payload(doc, 0, ov, date(2026, 9, 2), AMS, None)
+    pay, micro, cut_ready, notes, times, kn = core._ab_payload(doc, 0, ov, date(2026, 9, 2), AMS, None, micro_in_load=True)
     assert pay["battery_stress_cost"] == pytest.approx(0.008) and pay["inverter_stress_cost"] == pytest.approx(0.002)
     assert pay["soc_final"] == 0.7 and pay["soc_target"] == 1.0
     assert pay["soc_target_timestep"] == core.soc_target_timestep(t0, n, date(2026, 9, 2), "17:00")
@@ -2748,8 +2960,41 @@ def test_ab_payload_shifts_and_applies_the_knobs(tmp_path):
     assert pay["load_power_forecast"][0] == pytest.approx(500.0 - 540.0)
     assert any("pv_p10_mix" in x for x in notes) and any("growatt_share" in x for x in notes)
     # perfect load foresight replaces the day's load entries
-    pay, *_ = core._ab_payload(doc, 0, {"load": "actual"}, date(2026, 9, 2), AMS, [800.0] * 96)
+    pay, *_ = core._ab_payload(doc, 0, {"load": "actual"}, date(2026, 9, 2), AMS, [800.0] * 96, micro_in_load=True)
     assert pay["load_power_forecast"][0] == pytest.approx(800.0 - 300.0)
+
+
+def test_ab_payload_rebuilds_a_legacy_document_into_gross_lists_by_default(tmp_path):
+    """A document archived under the legacy netting (no micro_in_load key) is
+    read as such, and the walk re-solves it the way the plant does now: the
+    whole sun and the whole load, the Growatt lane still known for the cut."""
+    arch = str(tmp_path / "plans")
+    t0, n = write_ab_plan(arch, local(2026, 9, 2, 10, 5), pv=1000.0, load=500.0, micro=300.0)
+    doc = core.load_plan(core.list_plans(arch)[-1])
+    assert "micro_in_load" not in doc and doc["payload"]["pv_power_forecast"][0] == 700.0
+    pay, micro, cut_ready, notes, times, kn = core._ab_payload(doc, 0, {}, date(2026, 9, 2), AMS, None)
+    assert micro[0] == 300.0 and cut_ready is True
+    assert pay["pv_power_forecast"][0] == pytest.approx(1000.0)
+    assert pay["load_power_forecast"][0] == pytest.approx(500.0)
+    # the share override still moves watts between the two halves of the same total
+    pay, micro, *_ = core._ab_payload(doc, 0, {"growatt_share": 0.576}, date(2026, 9, 2), AMS, None)
+    assert micro[0] == pytest.approx(600.0) and pay["pv_power_forecast"][0] == pytest.approx(1000.0)
+    assert pay["load_power_forecast"][0] == pytest.approx(500.0)
+
+
+def test_ab_payload_reads_a_gross_document_with_a_cut_step(tmp_path):
+    arch = str(tmp_path / "plans")
+    t0, n = write_ab_plan(arch, local(2026, 9, 2, 10, 5), pv=1000.0, load=500.0, micro=300.0, in_load=False)
+    doc = core.load_plan(core.list_plans(arch)[-1])
+    assert doc["micro_in_load"] is False
+    doc["micro_cut"] = [k == 1 for k in range(n)]
+    doc["payload"]["pv_power_forecast"][1] = 700.0           # the cut solve had the Growatt out of that step's PV
+    pay, micro, *_ = core._ab_payload(doc, 0, {}, date(2026, 9, 2), AMS, None)
+    assert pay["pv_power_forecast"][:3] == pytest.approx([1000.0, 1000.0, 1000.0])
+    assert pay["load_power_forecast"][:3] == pytest.approx([500.0, 500.0, 500.0])
+    legacy, *_ = core._ab_payload(doc, 0, {}, date(2026, 9, 2), AMS, None, micro_in_load=True)
+    assert legacy["pv_power_forecast"][:2] == pytest.approx([700.0, 700.0])
+    assert legacy["load_power_forecast"][:2] == pytest.approx([200.0, 200.0])
 
 
 def test_ab_payload_moves_the_archived_target_with_the_shift(tmp_path):
@@ -3647,3 +3892,45 @@ def test_batt_power_limits_bound_the_port_at_the_knob():
     ch, dis = core.batt_power_limits(12250.0)
     assert dis * core.ETA_D == pytest.approx(12250.0, abs=0.1)
     assert ch == 12250.0
+
+
+# ---- sun-bonus counter -------------------------------------------------------
+
+def test_sun_bonus_count_anchors_then_counts_bonus_quarters_only():
+    st = core.sun_bonus_count(None, local(2026, 9, 27, 12, 0, 30), 100.0, AMS)
+    assert st["last_kwh"] == 100.0 and float(st.get("used_kwh") or 0) == 0.0
+    st = core.sun_bonus_count(st, local(2026, 9, 27, 12, 15, 30), 101.5, AMS)   # midday
+    assert st["used_kwh"] == pytest.approx(1.5)
+    st = core.sun_bonus_count(st, local(2026, 9, 27, 23, 0, 30), 102.0, AMS)    # mostly after sunset
+    assert 1.5 < st["used_kwh"] < 2.0
+
+
+def test_sun_bonus_count_night_export_does_not_count():
+    st = core.sun_bonus_count(None, local(2026, 9, 27, 22, 0, 30), 100.0, AMS)
+    st = core.sun_bonus_count(st, local(2026, 9, 27, 22, 15, 30), 103.0, AMS)
+    assert st["used_kwh"] == 0.0 and st["last_kwh"] == 103.0
+
+
+def test_sun_bonus_count_keeps_a_seeded_total_and_resets_on_a_new_year():
+    st = core.sun_bonus_count({"used_kwh": 412.5}, local(2026, 12, 31, 23, 45, 30), 900.0, AMS)
+    assert st["used_kwh"] == 412.5 and st["year"] == 2026
+    st = core.sun_bonus_count(st, local(2027, 1, 1, 0, 0, 30), 900.0, AMS)
+    assert st["used_kwh"] == 0.0 and st["year"] == 2027
+
+
+def test_sun_bonus_count_reanchors_on_a_backwards_or_impossible_jump():
+    st = core.sun_bonus_count(None, local(2026, 9, 27, 12, 0, 30), 100.0, AMS)
+    st = core.sun_bonus_count(st, local(2026, 9, 27, 12, 15, 30), 50.0, AMS)
+    assert float(st.get("used_kwh") or 0) == 0.0 and st["last_kwh"] == 50.0
+    st = core.sun_bonus_count(st, local(2026, 9, 27, 12, 30, 30), 5000.0, AMS)
+    assert float(st.get("used_kwh") or 0) == 0.0 and st["last_kwh"] == 5000.0
+
+
+def test_sun_bonus_step_file_persists_seeds_and_reports_remaining(tmp_path):
+    path = str(tmp_path / "zb.json")
+    st = core.sun_bonus_step_file(path, local(2026, 10, 5, 12, 0, 30), 1000.0, AMS)
+    assert st["remaining_kwh"] == 7500.0 and st["active_now"] is True
+    st = core.sun_bonus_step_file(path, local(2026, 10, 5, 12, 15, 30), 1002.0, AMS, seed_used_kwh=300.0)
+    assert st["used_kwh"] == pytest.approx(302.0) and st["remaining_kwh"] == pytest.approx(7198.0)
+    st = core.sun_bonus_step_file(path, local(2026, 10, 5, 23, 0, 30), None, AMS)
+    assert st["used_kwh"] == pytest.approx(302.0) and st["active_now"] is False

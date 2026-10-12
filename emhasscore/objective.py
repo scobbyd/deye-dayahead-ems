@@ -7,7 +7,7 @@ from datetime import date, datetime, time, timezone
 
 from .grid import stamp_z, STEP_H, STEP_MIN, step_times
 from .plant import PLANT
-from .series import GROWATT_SHARE, PV_P10_MIX
+from .series import GROWATT_SHARE, MICRO_IN_LOAD, PV_P10_MIX
 
 
 CAPACITY_KWH = float(PLANT["battery"]["capacity_kwh"])   # = config.json battery_nominal_energy_capacity / 1000;
@@ -53,7 +53,7 @@ ETA_AC_DC_V2 = float(PLANT["inverter"]["eta_v2"]["ac_dc"])          # bridge rec
 ETA_C_V2 = float(PLANT["inverter"]["eta_v2"]["charge"])              # DC-DC charge a 1,92 % + battery side 0,37 %
 ETA_D_V2 = float(PLANT["inverter"]["eta_v2"]["discharge"])              # DC-DC discharge a 1,93 % + battery side 0,37 %
 GRID_CHARGE_AC_MAX_W = float(PLANT["inverter"]["grid_charge_ac_max_w"])   # grid-only charge: cells 10,92 kW = 11.300 x 0,990 x 0,977
-STANDBY_LOAD_W = float(PLANT["inverter"]["standby_load_w"])         # the Deye's own draw the UPS-load register does not see (~110 W - 22 W bias)
+STANDBY_LOAD_W = float(PLANT["inverter"]["standby_load_w"])         # the Deye's own draw the UPS-load register does not see (97 W standby - ~25 W register over-read, 2026-10-09)
 
 # The battery side, cells <-> port (cable 2,55 mOhm + R_eff/3 + hysteresis):
 # loss_kW = A * P + B * P^2 with P the port power in kW.
@@ -138,33 +138,77 @@ def plan_cost(rows) -> float:
                      for r in rows), 4)
 
 
-def rows_to_gross(rows: list[dict], micro_w, micro_cut=None) -> list[dict]:
-    """Back to GROSS before anything sees these rows, in place. The split is a
-    payload detail, not a change of units: EMHASS solved on main-only PV and a
-    load net of the must-take half, and putting that half back into BOTH P_PV
-    and P_Load restores the site's real quantities while leaving P_PV - P_Load,
-    and so the whole balance, exactly as solved. virtual_day, the replay lane,
-    the scoreboard and the charts then need no migration and no pre/post-split
-    branch. On a CUT step the Growatt was never in the load, so its forecast
-    goes into P_PV (available) and P_PV_curtailment (declined) instead:
-    available minus declined stays the harvest and every balance downstream
-    holds."""
+def micro_netted(in_load=None) -> bool:
+    """The plant's convention for the microinverter unless the caller pins one:
+    True nets it off the load (legacy), False hands the LP gross lists."""
+    return MICRO_IN_LOAD if in_load is None else bool(in_load)
+
+
+def lp_lists(pv_gross_w, load_gross_w, micro_w, in_load=None) -> tuple[list, list | None]:
+    """(pv_power_forecast, load_power_forecast) as the LP is handed them, from
+    the site's GROSS series and the microinverter's share of the sun.
+
+    Gross (in_load False, the plant default since 2026-10-12): the whole sun and
+    the whole load. The LP may then curtail the microinverter's share as well,
+    a freedom the aux cut makes real on the days it fires and that the archive
+    priced at 0,44 EUR over 40 days otherwise. Legacy (True): the microinverter
+    leaves pv_power_forecast and arrives as NEGATIVE load, the only way an
+    add-on up to 0.18.1 (or the library solver) can be told it is must-take;
+    0.18.5 clips that load to 0 W (upstream #1135) and so deletes the sun above
+    house load from the plan, which is why gross is the default. Without a load
+    list EMHASS runs its own load method and there is nowhere to put the
+    microinverter either way, so the sun stays whole."""
+    pv = [round(float(p), 1) for p in pv_gross_w]
+    if load_gross_w is None:
+        return pv, None
+    if not micro_netted(in_load):
+        return pv, [round(float(l), 1) for l in load_gross_w]
+    return ([round(max(float(p) - float(m), 0.0), 1) for p, m in zip(pv_gross_w, micro_w)],
+            [round(float(l) - float(m), 1) for l, m in zip(load_gross_w, micro_w)])
+
+
+def rows_to_gross(rows: list[dict], micro_w, micro_cut=None, in_load=None) -> list[dict]:
+    """Back to GROSS before anything sees these rows, in place. The archive,
+    virtual_day, the replay lane, the scoreboard and the charts read gross rows
+    whatever the LP was handed, so they need no migration and no branch.
+
+    Gross lists (in_load False): the LP already solved on the whole sun and the
+    whole load, so an uncut step is left alone. On a CUT step the Growatt was
+    taken out of the PV list, so its forecast goes back into P_PV (available)
+    and P_PV_curtailment (declined): available minus declined stays the harvest
+    and every balance downstream holds.
+
+    Legacy lists (True): EMHASS solved on main-only PV and a load net of the
+    must-take half; putting that half back into BOTH P_PV and P_Load restores
+    the site's real quantities while leaving P_PV - P_Load, and so the whole
+    balance, exactly as solved. A cut step goes into P_PV and P_PV_curtailment
+    as above."""
+    legacy = micro_netted(in_load)
     for k, (r, m) in enumerate(zip(rows, micro_w)):
+        cut = micro_cut is not None and bool(micro_cut[k])
+        if not legacy and not cut:
+            continue
         r["P_PV"] = round(float(r["P_PV"]) + m, 1)
-        if micro_cut is not None and micro_cut[k]:
+        if cut:
             r["P_PV_curtailment"] = round(float(r.get("P_PV_curtailment") or 0.0) + m, 1)
         else:
             r["P_Load"] = round(float(r["P_Load"]) + m, 1)
     return rows
 
 
-def cut_payload(payload: dict, load_gross_w, micro_w, today_set: set) -> dict:
-    """The second-pass payload of the Growatt cut: the must-take half leaves
-    today's remaining load entries (tomorrow keeps it), everything else as the
-    uncut solve had it."""
+def cut_payload(payload: dict, load_gross_w, micro_w, today_set: set, in_load=None) -> dict:
+    """The second-pass payload of the Growatt cut: the microinverter leaves
+    today's remaining entries (tomorrow keeps it), everything else as the uncut
+    solve had it. Gross lists: it leaves the PV list (never below zero).
+    Legacy lists: it leaves the load list, which goes back to the gross profile
+    on those steps."""
     out = dict(payload)
-    out["load_power_forecast"] = [round(l - (0.0 if k in today_set else m), 1)
-                                  for k, (l, m) in enumerate(zip(load_gross_w, micro_w))]
+    if micro_netted(in_load):
+        out["load_power_forecast"] = [round(l - (0.0 if k in today_set else m), 1)
+                                      for k, (l, m) in enumerate(zip(load_gross_w, micro_w))]
+    else:
+        out["pv_power_forecast"] = [round(max(float(p) - float(m), 0.0), 1) if k in today_set else p
+                                    for k, (p, m) in enumerate(zip(payload["pv_power_forecast"], micro_w))]
     return out
 
 
@@ -282,7 +326,8 @@ REBALANCE_PULL = 0.007          # the pull's ceiling, day 20 on (0,003 until 202
 REBALANCE_PULL_PER_DAY = 0.001
 
 
-REBALANCE_FULL_LEVEL = 0.995    # "at the top" for a pack known only by its SOC (the replay's virtual pack)
+REBALANCE_FULL_LEVEL = 0.995    # "full": a settled quarter whose mean SOC is at or above it (live since 2026-10-10,
+                                # the replay's virtual pack before that)
 
 
 # WHAT COUNTS AS TIME AT THE TOP (2026-10-03). The PACE packs bleed their
@@ -292,13 +337,24 @@ REBALANCE_FULL_LEVEL = 0.995    # "at the top" for a pack known only by its SOC 
 # higher), and the inverter SOC follows the mean. 56,0 V is 3,50 V a cell; the
 # holds float at ~56,6 V, and 55,2 V (3,45 V) matched "every pack's max cell at
 # or above 3,45 V" to 5 of 2.742 minutes over 09-02..10-02 (VM, 15 s).
+#
+# 2026-10-10: the live clock counts the SOC again, not the voltage. Pack 3's
+# full-charge voltage was aligned with packs 1/2 on 10-09 (56,4 V); on the first top
+# after it all three flagged full within a minute, the inverter SOC read 100 and
+# the BMS ended the charge (charge current limit 0 A), so the bank relaxes instead
+# of floating at the top and voltage time no longer measures anything the BMS
+# acts on. What the site keeps: a pull to 100 % at least once in two weeks, reset by
+# reaching it. REBALANCE_TOP_V is no longer read by the clock.
 REBALANCE_TOP_V = 56.0
 
 
-REBALANCE_DWELL_H = 1.0         # a stretch at the top counts only from this long on (the hysteresis)
+REBALANCE_DWELL_H = 0.0         # every settled quarter at the top counts (2026-10-10: the PACE bleed
+                                # needs no warm-up; 1,0 h until then). The hysteresis is the budget and the latch release.
 
 
-REBALANCE_BUDGET_H = 8.0        # the clock is the age of the newest BUDGET hours of counted top time
+REBALANCE_BUDGET_H = 0.25       # the clock is the age of the newest BUDGET hours of counted time at full: one
+                                # settled quarter since 2026-10-10, so reaching 100 % resets it (8 h at the
+                                # top of the bank voltage 2026-10-03..10-10)
 
 
 REBALANCE_LOOKBACK_D = 30.0     # older stretches are dropped; nothing inside it reads as overdue
@@ -306,13 +362,19 @@ REBALANCE_LOOKBACK_D = 30.0     # older stretches are dropped; nothing inside it
 
 # THE PULL LATCHES (2026-10-03). Once the clock reaches REBALANCE_PULL_DAY the
 # pull stays on until the pack has had REBALANCE_RELEASE_H of counted top time
-# inside the last REBALANCE_RELEASE_WINDOW_H, "mostly" a full balance. Without
-# it the pull let go as soon as a short hold plus older stretches made up the
-# budget, and the clock was back at day 12-14 a few days later.
-REBALANCE_RELEASE_H = 6.0
-
-
-REBALANCE_RELEASE_WINDOW_H = 48.0
+# inside the last REBALANCE_RELEASE_WINDOW_H. Without it the pull let go as soon
+# as a short hold plus older stretches made up the budget, and the clock was
+# back at day 12-14 a few days later.
+# 2026-10-10: the clock is a debt that grows a day a day; the latch lets
+# go once the debt is 75 % paid, the clock back from day 14 to 3,5 d. The clock
+# is the age of the newest BUDGET hours, so that is the whole budget inside the
+# last 3,5 days (84 h). It was 6 h in 48 h, which ordinary 1,5-2 h tops never
+# reach, so a latched pull forced one long hold.
+# Since 2026-10-10 the budget is one quarter at full, so the latch lets go at the
+# first settled quarter at 100 % and the clock reads ~0 from there.
+REBALANCE_RELEASE_PAID = 0.75   # share of the debt paid at which the latch lets go
+REBALANCE_RELEASE_H = REBALANCE_BUDGET_H
+REBALANCE_RELEASE_WINDOW_H = (1.0 - REBALANCE_RELEASE_PAID) * REBALANCE_PULL_DAY * 24.0
 
 
 def rebalance_clock_days(days_since_full) -> float:
@@ -478,6 +540,29 @@ LIVE_KNOBS = {
     "temp_stress_slope": (0.5, "input_number.emhass_temp_stress_slope"),     # battery stress_scale per °C (the inverter term keeps the base scale)
     "temp_deadband_c": (2.0, "input_number.emhass_temp_deadband_c"),
 }
+
+
+def parse_knobs(raw: dict) -> dict:
+    """The live knob layer from the helpers' raw states ({knob name: state
+    string}, None for an unreadable entity): every knob of LIVE_KNOBS, None when
+    unreadable or unparseable so knobs() falls back to the constant. An
+    input_datetime reads as 'HH:MM:SS' and keeps 'HH:MM'; an input_boolean is
+    1,0 when 'on', else 0,0."""
+    out = {}
+    for name, (_default, eid) in LIVE_KNOBS.items():
+        v = raw.get(name)
+        if v in (None, "unknown", "unavailable", ""):
+            out[name] = None
+        elif eid.startswith("input_datetime."):
+            out[name] = str(v)[:5]
+        elif eid.startswith("input_boolean."):
+            out[name] = 1.0 if v == "on" else 0.0
+        else:
+            try:
+                out[name] = float(v)
+            except Exception:
+                out[name] = None
+    return out
 
 
 def knobs(inp_knobs: dict | None) -> dict:

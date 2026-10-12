@@ -1,7 +1,7 @@
 # Energy package - EMHASS shadow planner: the 2027 tariff right now.
 #
 # buy  = (day-ahead + energy tax + supplier fee) x (1 + BTW)
-# sell = (day-ahead - feed-in fee) x (1 + BTW)
+# sell = (day-ahead - feed-in fee) x (1 + BTW), x 1,10 on a Zonnebonus quarter
 # Both sides carry BTW so the EUR figures are real money; the plan itself is
 # unaffected by the multiplier. Source: the built-in Nord Pool integration.
 
@@ -37,4 +37,11 @@ template:
           {% set da = states('sensor.nord_pool_nl_current_price') | float(0) %}
           {% set feedin = states('input_number.emhass_feedin_fee_eur_kwh') | float(0) %}
           {% set btw = states('input_number.emhass_btw_pct') | float(21) %}
-          {{ ((da - feedin) * (1 + btw / 100)) | round(5) }}
+          {% set rate = da - feedin %}
+          {# Zonnebonus: +10 % on a positive rate in a sun quarter while kWh are left
+             (pyscript/emhass_shadow.py publishes the counter and active_now) #}
+          {% set zb = is_state('input_boolean.emhass_zonnebonus', 'on')
+                      and state_attr('sensor.emhass_zonnebonus_remaining', 'active_now') == true
+                      and states('sensor.emhass_zonnebonus_remaining') | float(0) > 0
+                      and rate > 0 %}
+          {{ (rate * (1.1 if zb else 1.0) * (1 + btw / 100)) | round(5) }}

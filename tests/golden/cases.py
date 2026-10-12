@@ -102,9 +102,7 @@ def aux_cut_state(core):
 # ---- reconstruction ---------------------------------------------------------------------
 
 def _vd(core, day, now, act=None, archive=F.PLANS):
-    act = act or {}
-    return core.virtual_day(archive, day, F.TZ, now, act.get("pv_w"), act.get("load_w"), act.get("curtailed"),
-                            act.get("pv_peak_w"), act.get("micro_w"))
+    return core.virtual_day(archive, day, F.TZ, now, core.DayActuals.of(act, False))
 
 
 @case
@@ -150,9 +148,7 @@ def _rolled(core, now, archive=F.PLANS):
     today = now.date()
     act = F.actuals_for_day(core, today, core._slot(now))
     prev = F.actuals_for_day(core, today - timedelta(days=1))
-    return core.rolled_slices(archive, now, F.TZ, act.get("pv_w"), act.get("load_w"), prev.get("pv_w"),
-                              prev.get("load_w"), act.get("curtailed"), prev.get("curtailed"),
-                              act.get("pv_peak_w"), prev.get("pv_peak_w"), act.get("micro_w"), prev.get("micro_w"))
+    return core.rolled_slices(archive, now, F.TZ, core.DayActuals.of(act, False), core.DayActuals.of(prev, False))
 
 
 @case
@@ -175,9 +171,8 @@ def rehydrate_0907(core):
     now = NOW_0907
     act = F.actuals_for_day(core, now.date(), core._slot(now))
     prev = F.actuals_for_day(core, now.date() - timedelta(days=1))
-    out = core.rehydrate(F.PLANS, F.TZ, now.isoformat(), 26.0, act.get("pv_w"), act.get("load_w"),
-                         prev.get("pv_w"), prev.get("load_w"), act.get("curtailed"), prev.get("curtailed"),
-                         act.get("pv_peak_w"), prev.get("pv_peak_w"), act.get("micro_w"), prev.get("micro_w"))
+    out = core.rehydrate(F.PLANS, F.TZ, now.isoformat(), 26.0, core.DayActuals.of(act, False),
+                         core.DayActuals.of(prev, False))
     # the today slice after a restart is the same slice the plan path serves
     out["same_as_rolled"] = out["today"] == _rolled(core, now)["today"] and out["yesterday"] == _rolled(core, now)["yesterday"]
     out["stale"] = core.rehydrate(F.PLANS, F.TZ, F.local(2026, 9, 9).isoformat(), 26.0)["plan_fresh"]
@@ -244,7 +239,11 @@ def _plan_inp(core, now, archive, dry_run=True, days_ahead=2, ese=True, load=Tru
            "solcast_day3": F.solcast_from_doc(doc, today + timedelta(days=2)) if days_ahead == 2 else [],
            "soc_pct": 68.3, "soc_source": "settled",
            "tariff": {"energy_tax": 0.0, "supplier_fee": 0.019, "btw_pct": 21.0, "feedin_fee": 0.019},
-           "knobs": {k: None for k in core.LIVE_KNOBS}}
+           "knobs": {k: None for k in core.LIVE_KNOBS},
+           # the expected files were built under the legacy netting (main-only PV,
+           # the Growatt as negative load); the plant default moved to gross lists
+           # on 2026-10-12, so the pin names its convention
+           "micro_in_load": True}
     if ese:
         share = float(doc.get("growatt_share") or 0.288)
         # the ESE site as a fixed 0,6 of the array, so micro = 0,6 x share x total
@@ -371,12 +370,14 @@ def hindsight_day_0905(core):
         d += timedelta(days=1)
     stub = F.StubSolver(F.local(2026, 9, 7, 14, 45))
     with F.patched_solve(core.hindsight_day, stub):
-        ok = core.hindsight_day(F.PLANS, "http://stub", "2026-09-05", F.TZ, np_rows, win, act, 48.2, 0.9)
-        no_prices = core.hindsight_day(F.PLANS, "http://stub", "2026-09-05", F.TZ, F.nordpool(day), win, act, 48.2, 0.9)
-        no_win = core.hindsight_day(F.PLANS, "http://stub", "2026-09-05", F.TZ, np_rows, {}, act, 48.2, 0.9)
-        no_plan = core.hindsight_day(F.PLANS, "http://stub", "2026-09-10", F.TZ, np_rows, win, act, 48.2, 0.9)
+        # legacy netting, the convention the expected file was built under
+        ok = core.hindsight_day(F.PLANS, "http://stub", "2026-09-05", F.TZ, np_rows, win, act, 48.2, 0.9, micro_in_load=True)
+        no_prices = core.hindsight_day(F.PLANS, "http://stub", "2026-09-05", F.TZ, F.nordpool(day), win, act, 48.2, 0.9,
+                                       micro_in_load=True)
+        no_win = core.hindsight_day(F.PLANS, "http://stub", "2026-09-05", F.TZ, np_rows, {}, act, 48.2, 0.9, micro_in_load=True)
+        no_plan = core.hindsight_day(F.PLANS, "http://stub", "2026-09-10", F.TZ, np_rows, win, act, 48.2, 0.9, micro_in_load=True)
     with F.patched_solve(core.hindsight_day, F.StubSolver(F.local(2026, 9, 7, 14, 45), status="Infeasible")):
-        bad = core.hindsight_day(F.PLANS, "http://stub", "2026-09-05", F.TZ, np_rows, win, act, 48.2, 0.9)
+        bad = core.hindsight_day(F.PLANS, "http://stub", "2026-09-05", F.TZ, np_rows, win, act, 48.2, 0.9, micro_in_load=True)
     posted = [{k: v for k, v in p.items() if not isinstance(v, list)} | {"lists": {k: len(v) for k, v in p.items() if isinstance(v, list)}}
               for p in stub.calls]
     return {"ok": ok, "no_prices": no_prices, "no_window": no_win, "no_plan": no_plan, "not_optimal": bad,
@@ -419,7 +420,8 @@ def ab_payload(core):
                                ("raw", doc, 0, {"battery_stress_cost": 0.5, "soc_target": 0.8}),
                                ("load_actual", doc, 0, {"load": "actual"}),
                                ("pre_split_mix", old, 0, {"pv_p10_mix": 0.6, "growatt_share": 0.5})):
-        pay, micro, ready, notes, times, kn = core._ab_payload(d, shift, ov, date(2026, 9, 7), F.TZ, act.get("load_w"))
+        pay, micro, ready, notes, times, kn = core._ab_payload(d, shift, ov, date(2026, 9, 7), F.TZ, act.get("load_w"),
+                                                               micro_in_load=True)      # the pinned legacy netting
         out[name] = {"payload": _pay_summary(pay), "micro": micro, "cut_ready": ready, "notes": notes,
                      "times": [times[0], times[-1], len(times)], "knobs": kn}
     return out
@@ -429,7 +431,8 @@ def _walk(core, day, overrides, cadence=30, settle="closed", act=None):
     act = act if act is not None else F.actuals_for_day(core, day)
     stub = F.StubSolver(F.local(2026, 9, 7, 14, 45))
     with F.patched_solve(core.ab_walk, stub):
-        out = core.ab_walk(F.PLANS, "http://stub", day.isoformat(), F.TZ, overrides, act, cadence, settle, 48.2)
+        out = core.ab_walk(F.PLANS, "http://stub", day.isoformat(), F.TZ, overrides, act, cadence, settle, 48.2,
+                           micro_in_load=True)                                           # the pinned legacy netting
     out["stub_calls"] = len(stub.calls)
     return out
 
@@ -466,14 +469,16 @@ def ab_walk_failures(core):
            "partial_day_no_actuals": _walk(core, date(2026, 9, 7), {}, act=F.actuals_for_day(core, date(2026, 9, 7)))}
     bad = F.StubSolver(F.local(2026, 9, 7, 14, 45), status="Infeasible")
     with F.patched_solve(core.ab_walk, bad):
-        out["not_optimal"] = core.ab_walk(F.PLANS, "http://stub", day.isoformat(), F.TZ, {}, act, 30, "closed", 48.2)
+        out["not_optimal"] = core.ab_walk(F.PLANS, "http://stub", day.isoformat(), F.TZ, {}, act, 30, "closed", 48.2,
+                                          micro_in_load=True)
 
     def foreign(base_url, payload, timeout=180):
         r = F.StubSolver(F.local(2026, 9, 7, 14, 45))(base_url, payload, timeout)
         r["rows"] = r["rows"][:-1]
         return r
     with F.patched_solve(core.ab_walk, foreign):
-        out["foreign_solve"] = core.ab_walk(F.PLANS, "http://stub", day.isoformat(), F.TZ, {}, act, 30, "closed", 48.2)
+        out["foreign_solve"] = core.ab_walk(F.PLANS, "http://stub", day.isoformat(), F.TZ, {}, act, 30, "closed", 48.2,
+                                            micro_in_load=True)
     return out
 
 
@@ -714,8 +719,9 @@ def syn_virtual_day_dst(core):
 
 
 def _rolled_syn(core, now, act):
-    return core.rolled_slices(F.SYN_PLANS, now, F.TZ, act["pv_w"], act["load_w"], None, None, act["curtailed"], None,
-                              act["pv_peak_w"], None, act["micro_w"], None)
+    rec = core.DayActuals(pv_w=act["pv_w"], load_w=act["load_w"], curtailed=act["curtailed"],
+                          pv_peak_w=act["pv_peak_w"], micro_w=act["micro_w"])
+    return core.rolled_slices(F.SYN_PLANS, now, F.TZ, rec, None)
 
 
 @case
@@ -776,7 +782,7 @@ def syn_ab_walk_no_plans(core):
            "micro_w": [round(mic[r["timestamp"]] * 0.95, 1) for r in rows], "curtailed": [0.0] * len(rows)}
     stub = F.StubSolver(F.local(2026, 10, 27, 10, 0))
     with F.patched_solve(core.ab_walk, stub):
-        out = core.ab_walk(F.SYN_PLANS, "http://stub", "2026-10-26", F.TZ, {}, act, 60, "closed", 48.2)
+        out = core.ab_walk(F.SYN_PLANS, "http://stub", "2026-10-26", F.TZ, {}, act, 60, "closed", 48.2, micro_in_load=True)
     out["stub_calls"] = len(stub.calls)
     return out
 
@@ -791,7 +797,7 @@ def syn_ab_walk_cut(core):
     with F.patched_solve(core.ab_walk, stub):
         out = core.ab_walk(F.SYN_PLANS, "http://stub", "2026-10-25", F.TZ,
                            {"soc_max": 0.3, "aux_cut_on_ratio": 0.5, "aux_cut_on_min_kwh": 0.1, "aux_cut_off_min_kwh": 0.05},
-                           act, 60, "closed", 48.2)
+                           act, 60, "closed", 48.2, micro_in_load=True)
     out["stub_calls"] = len(stub.calls)
     return out
 
@@ -840,6 +846,7 @@ def syn_ab_walk_dst(core):
     act = _syn_actuals()
     stub = F.StubSolver(F.local(2026, 10, 26, 10, 0))
     with F.patched_solve(core.ab_walk, stub):
-        out = core.ab_walk(F.SYN_PLANS, "http://stub", "2026-10-25", F.TZ, {"soc_target": 0.9}, act, 60, "closed", 48.2)
+        out = core.ab_walk(F.SYN_PLANS, "http://stub", "2026-10-25", F.TZ, {"soc_target": 0.9}, act, 60, "closed", 48.2,
+                           micro_in_load=True)
     out["stub_calls"] = len(stub.calls)
     return out

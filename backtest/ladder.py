@@ -5,12 +5,15 @@ what each one knew.
 Every lane solves ONE plan at 00:00 local of day D from the measured SOC at
 that step, soc_final 0,5 at the horizon end, real 15-minute day-ahead prices
 for the whole horizon (price knowledge is held equal across lanes), the
-plant's own stress costs and the relaxed rebalance knobs, and the Growatt as
-must-take exactly as the live planner and the hindsight lane hand it to
-EMHASS: main-string PV in the PV list, the Growatt as negative load, and
-rows_to_gross after the solve. The frame's PV columns are all MAIN-string
-already (pv_pot_main_w, fc_pv_*_main_w), so nothing is subtracted from them;
-only the load list loses micro_w.
+plant's own stress costs and the relaxed rebalance knobs, and the
+microinverter exactly as the live planner and the hindsight lane hand it to
+EMHASS (lp_lists, the plant's convention or the one pinned per run): gross
+lists by default since 2026-10-12 (main plus the microinverter in the PV
+list, the load as measured), or the legacy netting (main-string PV, the
+microinverter as negative load), and rows_to_gross after the solve. The
+frame's PV columns are all MAIN-string (pv_pot_main_w, fc_pv_*_main_w), so
+the microinverter is ADDED to them for the gross lists and nothing is
+subtracted from them for the legacy ones.
 
 Settlement is the hindsight lane's (scoring._hindsight_settle) with one
 argument changed: replay_day's curtailment repair runs on the day's TRUE
@@ -96,7 +99,7 @@ from emhasscore import objective, scoring
 from emhasscore.archive import day_slice
 from emhasscore.deye import ETA_C, ETA_D
 from emhasscore.grid import expected_steps, STEP_H
-from emhasscore.objective import (CAPACITY_KWH, ETA_BRIDGE, P_NOM_INV_KW, SOC_MAX, SOC_MIN, build_payload,
+from emhasscore.objective import (CAPACITY_KWH, ETA_BRIDGE, P_NOM_INV_KW, SOC_MAX, SOC_MIN, build_payload, lp_lists,
                                   rebalance_schedule, restamp, rows_to_gross, step_cost, stress_costs)
 from emhasscore.plant import PLANT
 from emhasscore.series import tariff as tariff_frame
@@ -257,11 +260,12 @@ def _settle(rows, doc: dict, day: date, mic, act: dict, cap: bool = True,
     return "ok", hs, rep
 
 
-def plan_payload(df, day: date, lane: str, tariff=LIVE_TARIFF):
+def plan_payload(df, day: date, lane: str, tariff=LIVE_TARIFF, micro_in_load=None):
     """(t0, n, mic, payload) for one lane's plan at 00:00 local of `day`, or
     None when the frame lacks a value the lane needs somewhere in the horizon.
-    The PV list is the lane's main-string column as is; the load list is the
-    lane's load column minus the Growatt; the pack starts at the measured SOC
+    The lists follow lp_lists from the lane's main-string column plus the
+    microinverter and the lane's load column (`micro_in_load` pins the
+    convention; None takes the plant's); the pack starts at the measured SOC
     of the first step and is pinned to SOC_FINAL at the horizon end."""
     spec = LANES[lane]
     t0, n, win = _horizon(df, day, spec["days"])
@@ -269,8 +273,9 @@ def plan_payload(df, day: date, lane: str, tariff=LIVE_TARIFF):
     if win[need].isna().any().any():
         return None
     mic = [round(float(v), 1) for v in win["micro_w"]]
-    pv = [round(max(0.0, float(p)), 1) for p in _pv_list(win, spec, day)]
-    load = [round(float(v) - m, 1) for v, m in zip(win[spec["load"]], mic)]
+    main = [round(max(0.0, float(p)), 1) for p in _pv_list(win, spec, day)]
+    pv, load = lp_lists([round(p + m, 1) for p, m in zip(main, mic)], [float(v) for v in win[spec["load"]]], mic,
+                        micro_in_load)
     buy, sell = tariff_frame([float(v) for v in win["da_eur_kwh"]], **tariff)
     soc_init = round(float(win["soc_pct"].iloc[0]) / 100.0, 4)
     payload = build_payload(t0, n, soc_init, SOC_FINAL, pv, buy, sell)
@@ -281,7 +286,7 @@ def plan_payload(df, day: date, lane: str, tariff=LIVE_TARIFF):
 
 
 def run_day(df, day: date, lane: str, solver, tariff=LIVE_TARIFF, cap: bool = True,
-            capacity_kwh: float | None = None) -> dict:
+            capacity_kwh: float | None = None, micro_in_load=None) -> dict:
     """One lane's plan for `day`, solved and settled; the CSV row as a dict.
     `capacity_kwh` is the settled pack's size (default the plant's); the LP's
     own pack is the solver's (hardware.patch_solver for a sweep).
@@ -289,13 +294,14 @@ def run_day(df, day: date, lane: str, solver, tariff=LIVE_TARIFF, cap: bool = Tr
     Every PV column in the frame is MAIN-string only (pv_main_w is the Deye's
     own string sensor, pv_pot_main_w its potential, the fc_pv_*_main_w are
     the first Solcast site less the microinverter's share plus the other
-    sites, or the main plant model), so the LP's PV list is the lane's column
-    as is and the microinverter leaves the load list only; subtracting
-    micro_w from the PV list as well would have handed the LP main minus
-    micro and rows_to_gross would only have restored main."""
+    sites, or the main plant model). The lane's column plus micro_w is the
+    gross sun lp_lists starts from: on gross lists the LP gets exactly that
+    and the load as measured, under the legacy netting it gets the column as
+    is and the microinverter leaves the load list only. `micro_in_load` pins
+    the convention; None takes the plant's."""
     capacity_kwh = float(capacity_kwh) if capacity_kwh is not None else float(CAPACITY_KWH)
     out = {"day": day.isoformat(), "lane": lane, "n": _steps(day, LANES[lane]["days"]), "status": "", "message": ""}
-    built = plan_payload(df, day, lane, tariff)
+    built = plan_payload(df, day, lane, tariff, micro_in_load)
     if built is None:
         out["status"] = "no_data"
         return out
@@ -311,7 +317,7 @@ def run_day(df, day: date, lane: str, solver, tariff=LIVE_TARIFF, cap: bool = Tr
         out["status"] = "not_optimal"
         out["message"] = f"{len(rows)} rows, {rows[0].get('optim_status') if rows else 'none'}"
         return out
-    rows = rows_to_gross(restamp(rows, t0, n), mic)
+    rows = rows_to_gross(restamp(rows, t0, n), mic, in_load=micro_in_load)
     act = _day_actuals(df, day)
     status, hs, rep = _settle(rows, _doc(t0, n, payload["soc_init"], tariff), day, mic, act, cap, capacity_kwh)
     out["status"] = status
